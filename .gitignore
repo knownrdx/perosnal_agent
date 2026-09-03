@@ -1,0 +1,41 @@
+# Secrets and runtime state - never commit these.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+.secret_key
+
+# The agent's sandboxed workspace: downloads, uploads, task output, sessions.
+/data/
+data/
+*.sqlite
+*.sqlite3
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Deployment artefacts
+*.tar.gz
+ag*.tar.gz
+
+# Go build output
+bridges/*/bin/
+/tmp/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp

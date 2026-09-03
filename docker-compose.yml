@@ -1,0 +1,178 @@
+name: personal-ai-agent
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agent}
+      POSTGRES_DB: ${POSTGRES_DB:-agent}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agent} -d ${POSTGRES_DB:-agent}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    expose:
+      - "5432"
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  # Local model server. Only needed when LLM_PROVIDER=ollama.
+  # If you only use Claude/ChatGPT, start with:  docker compose up -d --scale ollama=0
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama:/root/.ollama
+    expose:
+      - "11434"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 20g
+          cpus: "6.0"
+
+  # OmniRoute: OpenAI-compatible gateway to many providers (incl. free tiers).
+  # This is the DEFAULT model source when no personal API key is configured.
+  omniroute:
+    image: diegosouzapw/omniroute:latest
+    restart: unless-stopped
+    stop_grace_period: 40s
+    environment:
+      OMNIROUTE_MEMORY_MB: ${OMNIROUTE_MEMORY_MB:-2048}
+    volumes:
+      - omniroute-data:/app/data
+    expose:
+      - "20128"
+    # Dashboard on the host loopback only: http://127.0.0.1:20128
+    ports:
+      - "127.0.0.1:${OMNIROUTE_PORT:-20128}:20128"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:20128/health >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+          cpus: "2.0"
+
+  # WhatsApp bridge (Go + whatsmeow). Enable with WHATSAPP_ENABLED=true.
+  whatsapp-bridge:
+    build: ./bridges/whatsapp
+    restart: unless-stopped
+    environment:
+      BRIDGE_PORT: "8081"
+      BRIDGE_TOKEN: ${BRIDGE_TOKEN:?BRIDGE_TOKEN must be set}
+      WORKSPACE_DIR: /data
+      WA_STORE_PATH: /session/whatsapp.db
+      WA_DOWNLOAD_MEDIA: ${WA_DOWNLOAD_MEDIA:-true}
+      AGENT_WEBHOOK_URL: http://agent:8080/webhooks/whatsapp
+    volumes:
+      - ./data:/data
+      - wa_session:/session
+    expose:
+      - "8081"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8081/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
+
+  # Microsoft Teams bridge (Go + Graph API). Enable with TEAMS_ENABLED=true.
+  teams-bridge:
+    build: ./bridges/teams
+    restart: unless-stopped
+    environment:
+      BRIDGE_PORT: "8082"
+      BRIDGE_TOKEN: ${BRIDGE_TOKEN:?BRIDGE_TOKEN must be set}
+      WORKSPACE_DIR: /data
+      TEAMS_TENANT_ID: ${TEAMS_TENANT_ID:-}
+      TEAMS_CLIENT_ID: ${TEAMS_CLIENT_ID:-}
+      TEAMS_CLIENT_SECRET: ${TEAMS_CLIENT_SECRET:-}
+      TEAMS_DEFAULT_CHAT: ${TEAMS_DEFAULT_CHAT:-}
+      AGENT_WEBHOOK_URL: http://agent:8080/webhooks/teams
+    volumes:
+      - ./data:/data
+    expose:
+      - "8082"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8082/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+
+  agent:
+    build:
+      context: .
+      args:
+        INSTALL_BROWSER: ${INSTALL_BROWSER:-false}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # The container ALWAYS binds 8080 internally; API_PORT only chooses the
+      # host port below. Keeping them separate avoids a broken port mapping.
+      API_PORT: "8080"
+      API_HOST: "0.0.0.0"
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://agent:agent@postgres:5432/agent}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OMNIROUTE_BASE_URL: ${OMNIROUTE_BASE_URL:-http://omniroute:20128/v1}
+      WHATSAPP_BRIDGE_URL: http://whatsapp-bridge:8081
+      TEAMS_BRIDGE_URL: http://teams-bridge:8082
+      WORKSPACE_DIR: /data
+      # Chromium needs a bigger /dev/shm than Docker's 64 MB default, or pages
+      # crash on navigation. Set here rather than in the Dockerfile because it
+      # is a runtime concern.
+      ENABLE_BROWSER_TOOLS: ${ENABLE_BROWSER_TOOLS:-false}
+    shm_size: "1gb"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/data
+    # Loopback only. Put a reverse proxy in front if you ever need remote access.
+    # Left side = host port (API_PORT), right side = fixed container port.
+    ports:
+      - "127.0.0.1:${API_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+          cpus: "2.0"
+
+volumes:
+  pgdata:
+  ollama:
+  wa_session:
+  omniroute-data:
