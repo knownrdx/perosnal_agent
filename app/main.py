@@ -59,9 +59,33 @@ class Application:
         if cron:
             self.settings.briefing_cron = cron
 
+    def _check_workspace_writable(self) -> None:
+        """Fail loudly at boot if the workspace is not writable.
+
+        A bind-mounted volume keeps the host's ownership, so a container running
+        as a non-root user can end up unable to write anything. Every download,
+        report and temp file then fails at the moment of use, which looks like a
+        mysterious tool bug hours later. Better to say so on the first line of
+        the log.
+        """
+        probe = self.settings.workspace / ".write_probe"
+        try:
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+        except OSError as exc:
+            log.error(
+                "workspace_not_writable",
+                extra={
+                    "workspace": str(self.settings.workspace),
+                    "error": str(exc)[:200],
+                    "fix": "chown -R 10001:10001 data (on the host)",
+                },
+            )
+
     async def startup(self) -> None:
         settings = self.settings
         settings.ensure_workspace()
+        self._check_workspace_writable()
         init_engine()
         await create_all()
         await self._restore_runtime_settings()

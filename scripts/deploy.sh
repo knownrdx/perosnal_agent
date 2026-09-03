@@ -40,6 +40,12 @@ fi
 
 mkdir -p data/{downloads,uploads,tasks,temp,output}
 
+# The container runs as uid 10001 (non-root); a bind mount keeps the host's
+# ownership, so without this the agent cannot write a single file into its own
+# workspace - downloads, output and temp all fail with EACCES.
+chown -R 10001:10001 data 2>/dev/null || \
+  info "could not chown data/ (not root?) - the agent may fail to write files"
+
 info "building and starting containers"
 docker compose up -d --build
 
