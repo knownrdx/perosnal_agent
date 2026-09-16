@@ -339,3 +339,79 @@ def test_otpbot_requires_auth(client):
     assert client.post("/api/otpbot/config", json={}).status_code == 401
     assert client.get("/api/otpbot/status").status_code == 401
     assert client.post("/api/otpbot/run_now").status_code == 401
+    assert client.get("/api/otpbot/queue").status_code == 401
+    assert client.post("/api/otpbot/queue/x/tag", json={"tag": "BD"}).status_code == 401
+    assert client.delete("/api/otpbot/queue/x").status_code == 401
+    assert client.post("/api/otpbot/start").status_code == 401
+    assert client.post("/api/otpbot/stop").status_code == 401
+
+
+def test_otpbot_queue_lifecycle(client, monkeypatch):
+    headers = {"X-API-Token": "test-api-token"}
+
+    from app.automation import otp_bot
+
+    async def _no_sleep(seconds):
+        return None
+
+    monkeypatch.setattr(otp_bot, "_sleep", _no_sleep)
+
+    class FakeUserbot:
+        def __init__(self):
+            self.sent_messages = []
+            self.sent_files = []
+
+        async def send_message(self, target, text, reply_to=None):
+            self.sent_messages.append((target, text, reply_to))
+            return {"sent": True, "message_id": len(self.sent_messages) + 100}
+
+        async def send_file(self, target, path, caption="", reply_to=None):
+            self.sent_files.append((target, path, reply_to))
+            return {"sent": True, "message_id": 999}
+
+        async def read_messages(self, target, limit=20):
+            return [{"text": "Added.", "out": False}]
+
+    from app.integrations.telegram_user import set_userbot
+
+    fake = FakeUserbot()
+    set_userbot(fake)
+    try:
+        empty = client.get("/api/otpbot/queue", headers=headers)
+        assert empty.status_code == 200
+        assert empty.json()["queue"] == []
+
+        # Enqueue via the real upload endpoint so it goes through the same
+        # code path a real "send file" does.
+        upload = client.post(
+            "/api/chat/upload",
+            files={"file": ("plain_numbers.txt", b"+880***1111\n", "text/plain")},
+            headers=headers,
+        )
+        assert upload.status_code == 200
+
+        queued = client.get("/api/otpbot/queue", headers=headers).json()["queue"]
+        assert len(queued) == 1
+        entry_id = queued[0]["id"]
+        assert queued[0]["tag"] is None  # nothing to infer it from
+
+        tagged = client.post(
+            f"/api/otpbot/queue/{entry_id}/tag", json={"tag": "BD"}, headers=headers
+        )
+        assert tagged.status_code == 200
+        assert tagged.json()["tag"] == "BD"
+
+        started = client.post("/api/otpbot/start", headers=headers)
+        assert started.status_code == 200
+        assert started.json()["ok"] is True
+
+        status = client.get("/api/otpbot/status", headers=headers).json()
+        assert status["config"]["enabled"] is True
+        assert len(status["active_files"]) == 1
+        assert status["queue"] == []
+
+        stopped = client.post("/api/otpbot/stop", headers=headers)
+        assert stopped.status_code == 200
+        assert stopped.json()["enabled"] is False
+    finally:
+        set_userbot(None)

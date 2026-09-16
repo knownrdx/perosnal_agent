@@ -186,15 +186,17 @@ class ChatRequest(BaseModel):
 class OtpBotConfigRequest(BaseModel):
     enabled: bool | None = None
     target_bot: str | None = None
-    file_path: str | None = None
     add_command_template: str | None = None
-    tag: str | None = None
     limit: int | None = None
     count: int | None = None
     quota_command: str | None = None
     quota_threshold: int | None = None
     cleanup_command: str | None = None
     interval_minutes: int | None = None
+
+
+class OtpBotTagRequest(BaseModel):
+    tag: str = Field(min_length=1, max_length=60)
 
 
 def create_app() -> FastAPI:
@@ -777,6 +779,10 @@ def create_app() -> FastAPI:
                 thread_id=row.current_thread_id,
             )
 
+        from app.automation import otp_bot
+
+        await otp_bot.enqueue_file(rel, safe_name)
+
         return {"saved": True, "path": rel, "name": safe_name}
 
     @app.get("/api/chat/pending_upload", dependencies=[Depends(require_api_access)])
@@ -822,7 +828,58 @@ def create_app() -> FastAPI:
 
         config = await otp_bot.get_config()
         last_result = await otp_bot.get_last_result()
-        return {"config": config, "last_result": last_result}
+        last_start = await otp_bot.get_last_start_result()
+        queue = await otp_bot.get_queue()
+        active_files = await otp_bot.get_active_files()
+        awaiting = await otp_bot.get_awaiting_tag_entry()
+        return {
+            "config": config,
+            "last_result": last_result,
+            "last_start": last_start,
+            "queue": queue,
+            "active_files": active_files,
+            "awaiting_tag_for": awaiting,
+        }
+
+    @app.get("/api/otpbot/queue", dependencies=[Depends(require_api_access)])
+    async def otpbot_get_queue() -> dict[str, Any]:
+        from app.automation import otp_bot
+
+        return {"queue": await otp_bot.get_queue(), "active_files": await otp_bot.get_active_files()}
+
+    @app.post("/api/otpbot/queue/{entry_id}/tag", dependencies=[Depends(require_api_access)])
+    async def otpbot_set_tag(entry_id: str, payload: OtpBotTagRequest) -> dict[str, Any]:
+        from app.automation import otp_bot
+
+        entry = await otp_bot.set_queue_tag(entry_id, payload.tag)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="queue entry not found")
+        return entry
+
+    @app.delete("/api/otpbot/queue/{entry_id}", dependencies=[Depends(require_api_access)])
+    async def otpbot_remove_from_queue(entry_id: str) -> dict[str, Any]:
+        from app.automation import otp_bot
+
+        removed = await otp_bot.remove_from_queue(entry_id)
+        if not removed:
+            raise HTTPException(status_code=404, detail="queue entry not found")
+        return {"removed": True, "entry_id": entry_id}
+
+    @app.post("/api/otpbot/start", dependencies=[Depends(require_api_access)])
+    async def otpbot_start() -> dict[str, Any]:
+        """Same deterministic entrypoint the "start"/"done" chat trigger uses -
+        refuses (with a clear missing_tags list) if any queued file has no tag
+        yet, so the dashboard button and the chat phrase never disagree.
+        """
+        from app.automation import otp_bot
+
+        return await otp_bot.start_automation()
+
+    @app.post("/api/otpbot/stop", dependencies=[Depends(require_api_access)])
+    async def otpbot_stop() -> dict[str, Any]:
+        from app.automation import otp_bot
+
+        return await otp_bot.stop_automation()
 
     @app.post("/api/otpbot/run_now", dependencies=[Depends(require_api_access)])
     async def otpbot_run_now() -> dict[str, Any]:

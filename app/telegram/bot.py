@@ -48,7 +48,7 @@ Commands:
 /approve <id> / /reject <id> - decide a HIGH_RISK request
 /jobs    - scheduled jobs
 /memory <query> - search long-term memory
-/otpbot  - status | on | off | run (OTP-bot number automation)
+/otpbot  - status of the OTP-number automation (just say "start"/"stop" to run it)
 
 AI model:
 /models  - list providers and models
@@ -516,9 +516,11 @@ class AgentBot:
 
         @dp.message(Command("otpbot"))
         async def _otpbot(message: Message, command: CommandObject) -> None:
-            # Status/on/off for the deterministic OTP-number bot automation.
-            # Full configuration (target bot, file, commands, interval) lives
-            # in the web dashboard's OTP Bot panel - see /help for the link.
+            # Read-only status/on/off for the deterministic OTP-number bot
+            # automation. The actual queue-file/tag/start/stop workflow is
+            # conversational - see app.automation.otp_bot's module docstring -
+            # so the owner never has to remember command syntax for the
+            # day-to-day flow, only this one for a quick health check.
             if not await self._guard(message):
                 return
             from app.automation import otp_bot
@@ -532,7 +534,7 @@ class AgentBot:
                 )
                 return
             if arg in {"off", "disable", "disabled"}:
-                await otp_bot.save_config({"enabled": False})
+                await otp_bot.stop_automation()
                 await message.answer("\u23F8\uFE0F Automation disabled.")
                 return
             if arg in {"run", "now"}:
@@ -549,6 +551,8 @@ class AgentBot:
 
             cfg = await otp_bot.get_config()
             last = await otp_bot.get_last_result()
+            queue = await otp_bot.get_queue()
+            active = await otp_bot.get_active_files()
             lines = [
                 "\U0001F501 OTP-bot automation",
                 "",
@@ -556,6 +560,8 @@ class AgentBot:
                 f"Target: {cfg['target_bot']}",
                 f"Checks every: {cfg['interval_minutes']} min",
                 f"Refill when active \u2264: {cfg['quota_threshold']}",
+                f"Active files: {', '.join(f['name'] for f in active) or '(none)'}",
+                f"Queued (not started yet): {', '.join(f['name'] for f in queue) or '(none)'}",
             ]
             if last:
                 lines += ["", f"Last run: {'ok' if last.get('ok') else 'FAILED'} "
@@ -564,8 +570,10 @@ class AgentBot:
                     lines.append(f"Error: {last['error'][:200]}")
             lines += [
                 "",
-                "/otpbot on | off | run",
-                "Full settings: web dashboard \u2192 OTP Bot panel",
+                "Just send a numbers file then say \"start\" or \"done\" - I'll ask "
+                "a tag for each file that needs one and take it from there.",
+                "Say \"stop\" any time to pause the periodic checks.",
+                "/otpbot on | off | run for a quick manual override.",
             ]
             await message.answer("\n".join(lines))
 
@@ -669,10 +677,15 @@ class AgentBot:
                     thread_id=row.current_thread_id,
                 )
 
+            from app.automation import otp_bot
+
+            await otp_bot.enqueue_file(rel, safe_name)
+            queue = await otp_bot.get_queue()
             await message.answer(
                 f"\U0001F4C1 Saved: {rel}\n\n"
-                "Tell me what to do with it, e.g. \"add these numbers to @PBDxbot\" "
-                "- I will attach this file automatically to your next instruction."
+                f"Queued for the OTP-bot automation ({len(queue)} file(s) waiting). "
+                "Send more files, then say \"start\" (or \"done\") when you're finished - "
+                "I'll ask a tag for each file before running anything."
             )
 
         @dp.message(F.text & ~F.text.startswith("/"))

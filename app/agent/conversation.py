@@ -183,6 +183,39 @@ async def handle_message(
     snapshot = await _session_snapshot(chat_id)
     thread_id = snapshot["thread_id"]
 
+    # ------------------------------------------------------------------ #
+    # Deterministic OTP-bot number-file automation triggers. These are
+    # checked BEFORE the LLM classifier on purpose: the whole point of this
+    # workflow is that it keeps working even when every LLM provider is
+    # down/rate-limited, and a plain "start"/"off"/tag-answer message must
+    # never get reinterpreted as small talk by a router that's just guessing.
+    from app.automation import otp_bot
+
+    async with session_scope() as session:
+        await repo.add_message(session, chat_id=chat_id, role="user", content=text, thread_id=thread_id)
+
+    if await otp_bot.get_awaiting_tag_entry() is not None:
+        answer = await otp_bot.handle_tag_answer(text)
+        await _record_reply(chat_id, answer, thread_id=thread_id)
+        return Reply(answer, Intent.CONTROL)
+
+    if otp_bot.is_stop_trigger(text):
+        answer = await otp_bot.handle_stop_trigger()
+        await _record_reply(chat_id, answer, thread_id=thread_id)
+        return Reply(answer, Intent.CONTROL)
+
+    if otp_bot.is_resume_trigger(text):
+        answer = await otp_bot.handle_resume_trigger()
+        await _record_reply(chat_id, answer, thread_id=thread_id)
+        return Reply(answer, Intent.CONTROL)
+
+    if otp_bot.is_start_trigger(text) and (
+        await otp_bot.get_queue() or await otp_bot.get_active_files()
+    ):
+        answer = await otp_bot.handle_start_trigger()
+        await _record_reply(chat_id, answer, thread_id=thread_id)
+        return Reply(answer, Intent.CONTROL)
+
     decision: Decision = await classify(
         text,
         active_task_id=snapshot["active_task_id"],
@@ -197,9 +230,6 @@ async def handle_message(
         extra={"chat_id": chat_id, "intent": decision.intent.value,
                "reason": decision.reason, "task_id": decision.target_task_id},
     )
-
-    async with session_scope() as session:
-        await repo.add_message(session, chat_id=chat_id, role="user", content=text, thread_id=thread_id)
 
     # ------------------------------------------------------------------ #
     if decision.intent is Intent.CONTROL:

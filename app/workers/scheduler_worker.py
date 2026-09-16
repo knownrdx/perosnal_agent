@@ -186,6 +186,10 @@ class SchedulerRunner:
         self._next_otp_check = now + interval
 
         result = await otp_bot.run_cycle(config)
+        if result.error == "no active files - run start() first":
+            # Enabled but nothing was ever started successfully - nothing to
+            # check yet, not a failure worth notifying about.
+            return True
         log.info(
             "otp_automation_cycle",
             extra={"ok": result.ok, "action": result.action, "active_quota": result.active_quota},

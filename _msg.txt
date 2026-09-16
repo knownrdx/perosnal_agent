@@ -1,36 +1,47 @@
-Deterministic OTP-number-bot automation (no LLM in the loop) + UI
+OTP-bot: multi-file queue, autonomous tags, start/stop, notifications
 
-Root cause of "file uploads but never actually adds numbers": the target
-bot (@PBDxbot) requires the add-numbers command to be sent as a REPLY to
-the just-uploaded file message - a standalone command after the file gets
-silently rejected ("No valid phone numbers found"). Getting an LLM task to
-reliably reproduce that exact two-step reply sequence, forever, on a
-schedule, was a bad bet - doubly so since the LLM provider (omniroute) has
-been rate-limited for hours at a time in production, which would make a
-normal Task-based scheduled job simply never run.
+The owner's actual workflow: send several number files one at a time, say
+"start" or "done" once, and the agent should take it from there with as
+little back-and-forth as possible - deciding things itself instead of
+asking every time.
 
-app/automation/otp_bot.py: a small, LLM-free state machine
+app/automation/otp_bot.py: files now go into a persistent QUEUE on upload
+(Telegram or web). Before ever prompting for a tag, the agent tries to
+decide it on its own: read it straight off the filename if it contains a
+known region/campaign token (numbers_BD_batch2.txt -> "BD"), fall back to
+an owner-configured default_tag, then fall back to whatever tag was used
+last time (the common case: same campaign, new batch). It only asks when
+none of those give an answer, and even then asks once per file, not once
+per message.
 
-Send /myquota, parse the "Active" count, and only if it is at/under the
-configured threshold: send the cleanup command, send the numbers file, then
-send the add-numbers command AS A REPLY to that file's message_id
-(reply_to_message_id, threaded through send_message/send_file in
-telegram_user.py and the tg_send_message/tg_send_file tools - useful on its
-own for any other FSM-style bot). Every step is a direct userbot call; no
-model call anywhere in the cycle, so it is exactly as fast/reliable as
-Telegram itself.
+start()/stop() replace the old single always-on config: "start"/"done"
+(or the Start button) sends /useddelete once, then adds every queued file
+as its own reply-to-file-message command (still required by the target
+bot's FSM) with its own tag, and only then turns the periodic quota
+monitor on. "stop"/"off" just pauses the monitor - queue and the files
+that were actually added stay recorded, so resuming later is a clean,
+explicit decision, and if the owner says "start" again with nothing newly
+queued the agent resumes the same files on its own rather than asking
+which ones. A bot reply that looks like a rejection ("No valid phone
+numbers found", etc.) is now treated as a real failure, not silently
+reported as success.
 
-Wired into the existing scheduler loop (own timer, own interval, config
-stored via the existing AppSetting key/value table - no new table needed)
-so once configured it needs zero further attention, exactly matching "amar
-alada kore kisu na kora lage".
+These triggers are matched deterministically in app/agent/conversation.py
+BEFORE the LLM router runs, so "start"/"stop"/a bare tag answer work
+identically from Telegram or the web dashboard chat even while every LLM
+provider is down - the same reason this whole module avoids the LLM in
+the first place.
 
-Full UI: web dashboard OTP Bot panel (enable, target bot, interval, quota
-threshold, file path, commands, tag/limit/count, Save, Run now, last-run
-result) plus /otpbot on|off|run|status on Telegram - the owner asked for
-this to be settable from a preset/panel rather than typed instructions each
-time.
+Web dashboard OTP Bot panel: separate Queue and Active-files views, Start/
+Stop buttons, per-file tag input, plus the existing settings (target bot,
+interval, threshold, commands) now including a "default tag" field. /otpbot
+on Telegram is now a read-only status/quick-override view that also shows
+queue + active file names; the real day-to-day flow needs no command syntax
+at all. Telegram gets a push notification whenever start/stop actually
+fires, regardless of which channel triggered it.
 
-573 tests (12 new: 6 for the automation cycle itself covering skip/refill/
-not-linked/unparseable-quota/persistence, 2 API endpoint tests, plus 4
-existing tests fixed for the new reply_to parameter), smoke 10/10.
+591 tests (was 573; rewrote test_otp_bot_automation.py's 6 tests into 20
+covering tag inference/default/reuse, queue lifecycle, bot-rejection
+handling, and the deterministic start/stop/resume triggers; added 7 more:
+2 API queue-endpoint tests, 3 conversation-trigger integration tests, plus
+schema doc updates), smoke 10/10.

@@ -836,15 +836,37 @@
           <!-- ===================== OTP BOT PANEL ===================== -->
           <div class="panel" id="panel-otpbot">
             <div class="panel-section">
-              <h3>Automation</h3>
+              <h3>How this works</h3>
               <p class="small" style="color:var(--text-dim); margin-top:-4px;">
                 Runs entirely without the LLM (deterministic), so a slow or down
-                LLM provider never stops it. Checks quota on its own timer;
-                when exhausted, cleans up used numbers and re-adds from the
-                configured file automatically.
+                LLM provider never stops it. Upload a numbers file (paperclip in
+                Chat, or send it on Telegram), then type <b>start</b> (or <b>done</b>)
+                below or in Chat. The agent decides the tag on its own from the
+                filename when it can - it only asks when it genuinely has nothing
+                to go on. Type <b>stop</b> any time to pause the periodic checks.
               </p>
+            </div>
 
-              <div class="row" style="align-items:center; margin-top:10px;">
+            <div class="panel-section">
+              <h3>Queue (uploaded, not started yet)</h3>
+              <div id="otpbot-queue-list">Loading...</div>
+              <div class="row mt12">
+                <button type="button" class="primary" id="otpbot-start-btn">Start</button>
+              </div>
+            </div>
+
+            <div class="panel-section">
+              <h3>Active files (running, monitored on a timer)</h3>
+              <div id="otpbot-active-list">Loading...</div>
+              <div class="row mt12">
+                <button type="button" id="otpbot-stop-btn">Stop</button>
+                <button type="button" id="otpbot-run-now-btn">Check quota now</button>
+              </div>
+            </div>
+
+            <div class="panel-section">
+              <h3>Settings</h3>
+              <div class="row" style="align-items:center;">
                 <label class="small" style="margin:0; display:flex; align-items:center; gap:6px;">
                   <input type="checkbox" id="otpbot-enabled" style="width:auto;"> Enabled
                 </label>
@@ -864,9 +886,6 @@
                 </div>
               </div>
 
-              <label for="otpbot-file">File to (re-)upload</label>
-              <input type="text" id="otpbot-file" placeholder="uploads/numbers.txt (blank = most recently uploaded file)">
-
               <div class="row mt8">
                 <div>
                   <label for="otpbot-quota-cmd">Quota-check command</label>
@@ -883,8 +902,8 @@
 
               <div class="row mt8">
                 <div>
-                  <label for="otpbot-tag">Tag</label>
-                  <input type="text" id="otpbot-tag">
+                  <label for="otpbot-default-tag">Default tag (blank = decide per file)</label>
+                  <input type="text" id="otpbot-default-tag" placeholder="leave blank to auto-detect / reuse last">
                 </div>
                 <div>
                   <label for="otpbot-limit">Limit</label>
@@ -897,8 +916,7 @@
               </div>
 
               <div class="row mt12">
-                <button type="button" class="primary" id="otpbot-save-btn">Save</button>
-                <button type="button" id="otpbot-run-now-btn">Run now</button>
+                <button type="button" class="primary" id="otpbot-save-btn">Save settings</button>
               </div>
             </div>
 
@@ -2070,6 +2088,8 @@
 
   function loadOtpBot() {
     qs("#otpbot-last-result").textContent = "Loading...";
+    qs("#otpbot-queue-list").textContent = "Loading...";
+    qs("#otpbot-active-list").textContent = "Loading...";
     apiFetchJson("/api/otpbot/status")
       .then(function (data) {
         var cfg = data.config || {};
@@ -2077,18 +2097,87 @@
         qs("#otpbot-target").value = cfg.target_bot || "";
         qs("#otpbot-interval").value = cfg.interval_minutes != null ? cfg.interval_minutes : 10;
         qs("#otpbot-threshold").value = cfg.quota_threshold != null ? cfg.quota_threshold : 0;
-        qs("#otpbot-file").value = cfg.file_path || "";
         qs("#otpbot-quota-cmd").value = cfg.quota_command || "/myquota";
         qs("#otpbot-cleanup-cmd").value = cfg.cleanup_command || "/useddelete";
         qs("#otpbot-add-cmd").value = cfg.add_command_template || "";
-        qs("#otpbot-tag").value = cfg.tag || "";
+        qs("#otpbot-default-tag").value = cfg.default_tag || "";
         qs("#otpbot-limit").value = cfg.limit != null ? cfg.limit : 4;
         qs("#otpbot-count").value = cfg.count != null ? cfg.count : 4;
+        renderOtpBotQueue(data.queue || [], data.awaiting_tag_for);
+        renderOtpBotActive(data.active_files || []);
         renderOtpBotLastResult(data.last_result);
       })
       .catch(function () {
         qs("#otpbot-last-result").textContent = "Failed to load.";
+        qs("#otpbot-queue-list").textContent = "Failed to load.";
+        qs("#otpbot-active-list").textContent = "Failed to load.";
       });
+  }
+
+  function renderOtpBotQueue(queue, awaitingTagFor) {
+    var el = qs("#otpbot-queue-list");
+    el.innerHTML = "";
+    if (!queue.length) {
+      el.textContent = "Nothing queued. Upload a file (Chat panel paperclip, or Telegram) to add one.";
+      return;
+    }
+    queue.forEach(function (entry) {
+      var row = document.createElement("div");
+      row.className = "row";
+      row.style.alignItems = "center";
+      row.style.marginBottom = "6px";
+
+      var label = document.createElement("span");
+      label.style.flex = "1";
+      var waiting = awaitingTagFor && awaitingTagFor.id === entry.id;
+      label.textContent = entry.name + (entry.tag ? " (tag: " + entry.tag + ")" : waiting ? " - waiting for tag" : " - no tag yet");
+      row.appendChild(label);
+
+      var tagInput = document.createElement("input");
+      tagInput.type = "text";
+      tagInput.placeholder = "tag";
+      tagInput.value = entry.tag || "";
+      tagInput.style.width = "90px";
+      row.appendChild(tagInput);
+
+      var tagBtn = document.createElement("button");
+      tagBtn.type = "button";
+      tagBtn.textContent = "Set tag";
+      tagBtn.addEventListener("click", function () {
+        var val = tagInput.value.trim();
+        if (!val) return;
+        apiFetchJson("/api/otpbot/queue/" + encodeURIComponent(entry.id) + "/tag", {
+          method: "POST", body: { tag: val }
+        }).then(loadOtpBot).catch(function () { showConfirm("Failed to set tag."); });
+      });
+      row.appendChild(tagBtn);
+
+      var removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.textContent = "Remove";
+      removeBtn.addEventListener("click", function () {
+        apiFetchJson("/api/otpbot/queue/" + encodeURIComponent(entry.id), { method: "DELETE" })
+          .then(loadOtpBot).catch(function () { showConfirm("Failed to remove."); });
+      });
+      row.appendChild(removeBtn);
+
+      el.appendChild(row);
+    });
+  }
+
+  function renderOtpBotActive(activeFiles) {
+    var el = qs("#otpbot-active-list");
+    el.innerHTML = "";
+    if (!activeFiles.length) {
+      el.textContent = "Nothing running yet - queue a file and hit Start.";
+      return;
+    }
+    activeFiles.forEach(function (entry) {
+      var p = document.createElement("div");
+      p.textContent = entry.name + " (tag: " + (entry.tag || "General") + ")";
+      p.style.marginBottom = "4px";
+      el.appendChild(p);
+    });
   }
 
   function renderOtpBotLastResult(result) {
@@ -2121,17 +2210,16 @@
       target_bot: qs("#otpbot-target").value.trim(),
       interval_minutes: parseInt(qs("#otpbot-interval").value, 10) || 10,
       quota_threshold: parseInt(qs("#otpbot-threshold").value, 10) || 0,
-      file_path: qs("#otpbot-file").value.trim(),
       quota_command: qs("#otpbot-quota-cmd").value.trim() || "/myquota",
       cleanup_command: qs("#otpbot-cleanup-cmd").value.trim() || "/useddelete",
       add_command_template: qs("#otpbot-add-cmd").value.trim(),
-      tag: qs("#otpbot-tag").value.trim(),
+      default_tag: qs("#otpbot-default-tag").value.trim(),
       limit: parseInt(qs("#otpbot-limit").value, 10) || 4,
       count: parseInt(qs("#otpbot-count").value, 10) || 4
     };
     return apiFetchJson("/api/otpbot/config", { method: "POST", body: body })
       .then(function () {
-        if (showConfirmMsg) showConfirm("Automation settings saved.");
+        if (showConfirmMsg) showConfirm("Settings saved.");
       });
   }
 
@@ -2141,12 +2229,43 @@
     });
   }
 
+  function handleOtpBotStart() {
+    var btn = qs("#otpbot-start-btn");
+    btn.disabled = true;
+    btn.textContent = "Starting...";
+    saveOtpBotConfig(false)
+      .then(function () { return apiFetchJson("/api/otpbot/start", { method: "POST" }); })
+      .then(function (result) {
+        if (result.ok) {
+          showConfirm("Started - " + result.files.length + " file(s) added.");
+        } else if (result.missing_tags && result.missing_tags.length) {
+          showConfirm("Set a tag for every queued file first, then Start again.");
+        } else {
+          showConfirm("Could not start: " + (result.error || "unknown error"));
+        }
+        loadOtpBot();
+      })
+      .catch(function () { showConfirm("Start failed."); })
+      .finally(function () {
+        btn.disabled = false;
+        btn.textContent = "Start";
+      });
+  }
+
+  function handleOtpBotStop() {
+    var btn = qs("#otpbot-stop-btn");
+    btn.disabled = true;
+    apiFetchJson("/api/otpbot/stop", { method: "POST" })
+      .then(function () { showConfirm("Automation stopped."); loadOtpBot(); })
+      .catch(function () { showConfirm("Stop failed."); })
+      .finally(function () { btn.disabled = false; });
+  }
+
   function handleOtpBotRunNow() {
     var btn = qs("#otpbot-run-now-btn");
     btn.disabled = true;
-    btn.textContent = "Running...";
-    saveOtpBotConfig(false)
-      .then(function () { return apiFetchJson("/api/otpbot/run_now", { method: "POST" }); })
+    btn.textContent = "Checking...";
+    apiFetchJson("/api/otpbot/run_now", { method: "POST" })
       .then(function (result) {
         renderOtpBotLastResult(result);
         showConfirm(result.ok ? "Cycle finished: " + result.action : "Cycle failed - see Last Run.");
@@ -2156,7 +2275,7 @@
       })
       .finally(function () {
         btn.disabled = false;
-        btn.textContent = "Run now";
+        btn.textContent = "Check quota now";
       });
   }
 
@@ -2260,6 +2379,8 @@
 
     qs("#otpbot-save-btn").addEventListener("click", handleOtpBotSave);
     qs("#otpbot-run-now-btn").addEventListener("click", handleOtpBotRunNow);
+    qs("#otpbot-start-btn").addEventListener("click", handleOtpBotStart);
+    qs("#otpbot-stop-btn").addEventListener("click", handleOtpBotStop);
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
   }
