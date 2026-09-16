@@ -48,6 +48,7 @@ Commands:
 /approve <id> / /reject <id> - decide a HIGH_RISK request
 /jobs    - scheduled jobs
 /memory <query> - search long-term memory
+/otpchat - open the dedicated OTP-bot thread (send number files there)
 /otpbot  - status of the OTP-number automation (just say "start"/"stop" to run it)
 
 AI model:
@@ -514,6 +515,30 @@ class AgentBot:
             lines += ["", "/history <id> to switch back to one", "/new to start another"]
             await message.answer("\n".join(lines))
 
+        @dp.message(Command("otpchat"))
+        async def _otpchat(message: Message) -> None:
+            """Open (creating it the first time) the dedicated OTP-bot thread.
+
+            Answers "where do I send the number files?" once and for all -
+            after this, this chat is in that thread, and every file sent goes
+            straight into the queue.
+            """
+            if not await self._guard(message):
+                return
+            from app.automation import otp_bot
+
+            await otp_bot.ensure_thread(message.chat.id)
+            queue = await otp_bot.get_queue()
+            active = await otp_bot.get_active_files()
+            await message.answer(
+                "\U0001F501 You are now in the OTP Bot thread.\n\n"
+                "Send number files here - each one is queued automatically. "
+                "Say \"start\" (or \"done\") when you've sent them all, \"stop\" to pause.\n\n"
+                f"Queued now: {', '.join(f['name'] for f in queue) or '(none)'}\n"
+                f"Currently running: {', '.join(f['name'] for f in active) or '(none)'}\n\n"
+                "/history to switch back to another conversation."
+            )
+
         @dp.message(Command("otpbot"))
         async def _otpbot(message: Message, command: CommandObject) -> None:
             # Read-only status/on/off for the deterministic OTP-number bot
@@ -679,14 +704,21 @@ class AgentBot:
 
             from app.automation import otp_bot
 
-            await otp_bot.enqueue_file(rel, safe_name)
-            queue = await otp_bot.get_queue()
-            await message.answer(
-                f"\U0001F4C1 Saved: {rel}\n\n"
-                f"Queued for the OTP-bot automation ({len(queue)} file(s) waiting). "
-                "Send more files, then say \"start\" (or \"done\") when you're finished - "
-                "I'll ask a tag for each file before running anything."
-            )
+            if await otp_bot.is_otp_thread(message.chat.id):
+                await otp_bot.enqueue_file(rel, safe_name)
+                queue = await otp_bot.get_queue()
+                await message.answer(
+                    f"\U0001F4C1 Saved: {rel}\n\n"
+                    f"Queued for the OTP-bot automation ({len(queue)} file(s) waiting). "
+                    "Send more files, then say \"start\" (or \"done\") when you're finished."
+                )
+            else:
+                await message.answer(
+                    f"\U0001F4C1 Saved: {rel}\n\n"
+                    "Tell me what to do with it - I'll attach it to your next instruction.\n"
+                    "(For OTP-bot number files, use /otpchat to open the dedicated thread; "
+                    "files sent there are queued automatically.)"
+                )
 
         @dp.message(F.text & ~F.text.startswith("/"))
         async def _natural(message: Message) -> None:

@@ -54,6 +54,14 @@ def _reset_userbot(monkeypatch):
     set_userbot(None)
 
 
+OTP_CHAT_ID = 4242
+
+
+async def _bind_otp_thread(chat_id: int = OTP_CHAT_ID) -> str:
+    """Put `chat_id` into the dedicated OTP thread, as /otpchat would."""
+    return await otp_bot.ensure_thread(chat_id)
+
+
 async def _write_numbers_file(name: str = "numbers.txt") -> str:
     from app.config import get_settings
     from app.security import rel_path
@@ -79,6 +87,47 @@ async def test_config_roundtrip(environment):
     reloaded = await otp_bot.get_config()
     assert reloaded["enabled"] is True
     assert reloaded["interval_minutes"] == 15
+
+
+# --------------------------------------------------------------------------- #
+# Dedicated chat thread - answers "where do I send the files?" structurally
+# --------------------------------------------------------------------------- #
+async def test_ensure_thread_creates_and_binds_once(environment):
+    assert await otp_bot.get_thread_id() == ""
+
+    thread_id = await otp_bot.ensure_thread(OTP_CHAT_ID)
+    assert thread_id
+    assert await otp_bot.get_thread_id() == thread_id
+    assert await otp_bot.is_otp_thread(OTP_CHAT_ID) is True
+
+    # Calling it again reuses the same thread instead of spawning a new one.
+    again = await otp_bot.ensure_thread(OTP_CHAT_ID)
+    assert again == thread_id
+
+
+async def test_is_otp_thread_false_in_another_conversation(environment):
+    from app.db import repo
+    from app.db.base import session_scope
+
+    await otp_bot.ensure_thread(OTP_CHAT_ID)
+    assert await otp_bot.is_otp_thread(OTP_CHAT_ID) is True
+
+    # Owner starts an unrelated conversation - the OTP triggers must not fire
+    # there, otherwise a plain "start" hijacks a normal chat.
+    async with session_scope() as session:
+        await repo.reset_session(session, OTP_CHAT_ID)
+    assert await otp_bot.is_otp_thread(OTP_CHAT_ID) is False
+
+
+async def test_thread_is_titled_so_it_is_findable(environment):
+    from app.db import repo
+    from app.db.base import session_scope
+
+    thread_id = await otp_bot.ensure_thread(OTP_CHAT_ID)
+    async with session_scope() as session:
+        threads = await repo.list_threads(session, OTP_CHAT_ID, limit=10)
+    match = [t for t in threads if t["thread_id"] == thread_id]
+    assert match, "the dedicated thread must show up in the thread list"
 
 
 # --------------------------------------------------------------------------- #

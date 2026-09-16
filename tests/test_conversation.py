@@ -33,6 +33,7 @@ async def test_otp_start_trigger_asks_for_tag_without_creating_a_task(environmen
     uploads.mkdir(parents=True, exist_ok=True)
     (uploads / "plain_numbers.txt").write_text("+880***1111\n", encoding="utf-8")
 
+    await otp_bot.ensure_thread(CHAT_ID)
     await otp_bot.enqueue_file(rel, "plain_numbers.txt")
     before = await _task_count()
 
@@ -44,6 +45,28 @@ async def test_otp_start_trigger_asks_for_tag_without_creating_a_task(environmen
     assert await otp_bot.get_awaiting_tag_entry() is not None
 
 
+async def test_otp_triggers_ignored_outside_the_dedicated_thread(environment):
+    """A plain "start" in a normal conversation must stay a normal message."""
+    from app.automation import otp_bot
+    from app.config import get_settings
+
+    uploads = get_settings().workspace / "uploads"
+    uploads.mkdir(parents=True, exist_ok=True)
+    (uploads / "plain_numbers.txt").write_text("+880***1111\n", encoding="utf-8")
+
+    await otp_bot.ensure_thread(CHAT_ID)
+    await otp_bot.enqueue_file("uploads/plain_numbers.txt", "plain_numbers.txt")
+
+    # Owner switches to some other conversation.
+    async with session_scope() as session:
+        await repo.reset_session(session, CHAT_ID)
+
+    reply = await handle_message(CHAT_ID, USER_ID, "start")
+    # Not intercepted by the automation - no tag prompt was armed.
+    assert await otp_bot.get_awaiting_tag_entry() is None
+    assert "ki tag dibo" not in reply.text
+
+
 async def test_otp_tag_answer_intercepted_before_router(environment, monkeypatch):
     from app.automation import otp_bot
     from app.config import get_settings
@@ -52,6 +75,7 @@ async def test_otp_tag_answer_intercepted_before_router(environment, monkeypatch
     uploads = get_settings().workspace / "uploads"
     uploads.mkdir(parents=True, exist_ok=True)
     (uploads / "plain_numbers.txt").write_text("+880***1111\n", encoding="utf-8")
+    await otp_bot.ensure_thread(CHAT_ID)
     await otp_bot.enqueue_file("uploads/plain_numbers.txt", "plain_numbers.txt")
     await handle_message(CHAT_ID, USER_ID, "start")  # arms the tag prompt
 
@@ -82,6 +106,7 @@ async def test_otp_tag_answer_intercepted_before_router(environment, monkeypatch
 async def test_otp_stop_trigger_intercepted_before_router(environment):
     from app.automation import otp_bot
 
+    await otp_bot.ensure_thread(CHAT_ID)
     await otp_bot.save_config({"enabled": True})
     reply = await handle_message(CHAT_ID, USER_ID, "stop")
     assert (await otp_bot.get_config())["enabled"] is False

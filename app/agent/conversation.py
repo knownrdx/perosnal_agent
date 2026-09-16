@@ -189,32 +189,35 @@ async def handle_message(
     # workflow is that it keeps working even when every LLM provider is
     # down/rate-limited, and a plain "start"/"off"/tag-answer message must
     # never get reinterpreted as small talk by a router that's just guessing.
+    #
+    # Scoped to the dedicated OTP thread so these very ordinary words stay
+    # ordinary everywhere else - "start" in a general conversation should
+    # not silently fire an automation.
     from app.automation import otp_bot
 
     async with session_scope() as session:
         await repo.add_message(session, chat_id=chat_id, role="user", content=text, thread_id=thread_id)
 
-    if await otp_bot.get_awaiting_tag_entry() is not None:
-        answer = await otp_bot.handle_tag_answer(text)
-        await _record_reply(chat_id, answer, thread_id=thread_id)
-        return Reply(answer, Intent.CONTROL)
+    if await otp_bot.is_otp_thread(chat_id):
+        if await otp_bot.get_awaiting_tag_entry() is not None:
+            answer = await otp_bot.handle_tag_answer(text)
+            await _record_reply(chat_id, answer, thread_id=thread_id)
+            return Reply(answer, Intent.CONTROL)
 
-    if otp_bot.is_stop_trigger(text):
-        answer = await otp_bot.handle_stop_trigger()
-        await _record_reply(chat_id, answer, thread_id=thread_id)
-        return Reply(answer, Intent.CONTROL)
+        if otp_bot.is_stop_trigger(text):
+            answer = await otp_bot.handle_stop_trigger()
+            await _record_reply(chat_id, answer, thread_id=thread_id)
+            return Reply(answer, Intent.CONTROL)
 
-    if otp_bot.is_resume_trigger(text):
-        answer = await otp_bot.handle_resume_trigger()
-        await _record_reply(chat_id, answer, thread_id=thread_id)
-        return Reply(answer, Intent.CONTROL)
+        if otp_bot.is_resume_trigger(text):
+            answer = await otp_bot.handle_resume_trigger()
+            await _record_reply(chat_id, answer, thread_id=thread_id)
+            return Reply(answer, Intent.CONTROL)
 
-    if otp_bot.is_start_trigger(text) and (
-        await otp_bot.get_queue() or await otp_bot.get_active_files()
-    ):
-        answer = await otp_bot.handle_start_trigger()
-        await _record_reply(chat_id, answer, thread_id=thread_id)
-        return Reply(answer, Intent.CONTROL)
+        if otp_bot.is_start_trigger(text):
+            answer = await otp_bot.handle_start_trigger()
+            await _record_reply(chat_id, answer, thread_id=thread_id)
+            return Reply(answer, Intent.CONTROL)
 
     decision: Decision = await classify(
         text,

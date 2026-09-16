@@ -781,9 +781,14 @@ def create_app() -> FastAPI:
 
         from app.automation import otp_bot
 
-        await otp_bot.enqueue_file(rel, safe_name)
+        # Only files dropped into the dedicated OTP thread join its queue -
+        # elsewhere an upload is just an attachment for the next instruction.
+        queued = False
+        if await otp_bot.is_otp_thread(chat_id):
+            await otp_bot.enqueue_file(rel, safe_name)
+            queued = True
 
-        return {"saved": True, "path": rel, "name": safe_name}
+        return {"saved": True, "path": rel, "name": safe_name, "queued_for_otpbot": queued}
 
     @app.get("/api/chat/pending_upload", dependencies=[Depends(require_api_access)])
     async def chat_pending_upload() -> dict[str, Any]:
@@ -832,6 +837,10 @@ def create_app() -> FastAPI:
         queue = await otp_bot.get_queue()
         active_files = await otp_bot.get_active_files()
         awaiting = await otp_bot.get_awaiting_tag_entry()
+        in_thread = False
+        settings = get_settings()
+        if settings.owner_chat_id is not None:
+            in_thread = await otp_bot.is_otp_thread(settings.owner_chat_id)
         return {
             "config": config,
             "last_result": last_result,
@@ -839,6 +848,8 @@ def create_app() -> FastAPI:
             "queue": queue,
             "active_files": active_files,
             "awaiting_tag_for": awaiting,
+            "thread_id": config.get("thread_id") or "",
+            "in_otp_thread": in_thread,
         }
 
     @app.get("/api/otpbot/queue", dependencies=[Depends(require_api_access)])
@@ -864,6 +875,23 @@ def create_app() -> FastAPI:
         if not removed:
             raise HTTPException(status_code=404, detail="queue entry not found")
         return {"removed": True, "entry_id": entry_id}
+
+    @app.post("/api/otpbot/thread", dependencies=[Depends(require_api_access)])
+    async def otpbot_open_thread() -> dict[str, Any]:
+        """Open (creating it once) the dedicated OTP-bot chat thread and make
+        it the current one, so uploads land in the queue without the owner
+        having to remember which conversation is the right one.
+        """
+        from app.automation import otp_bot
+
+        settings = get_settings()
+        chat_id = settings.owner_chat_id
+        if chat_id is None:
+            raise HTTPException(
+                status_code=503, detail="no owner chat configured (set TELEGRAM_ALLOWED_USER_IDS)"
+            )
+        thread_id = await otp_bot.ensure_thread(chat_id)
+        return {"thread_id": thread_id}
 
     @app.post("/api/otpbot/start", dependencies=[Depends(require_api_access)])
     async def otpbot_start() -> dict[str, Any]:

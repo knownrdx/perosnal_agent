@@ -839,12 +839,20 @@
               <h3>How this works</h3>
               <p class="small" style="color:var(--text-dim); margin-top:-4px;">
                 Runs entirely without the LLM (deterministic), so a slow or down
-                LLM provider never stops it. Upload a numbers file (paperclip in
-                Chat, or send it on Telegram), then type <b>start</b> (or <b>done</b>)
-                below or in Chat. The agent decides the tag on its own from the
-                filename when it can - it only asks when it genuinely has nothing
-                to go on. Type <b>stop</b> any time to pause the periodic checks.
+                LLM provider never stops it. There is one dedicated chat thread
+                for this - open it below, drop your number files in it, then type
+                <b>start</b> (or <b>done</b>). Files sent in any other thread are
+                left alone, so there is never any doubt about where a file goes.
+                The agent decides each file's tag on its own from the filename
+                when it can, and only asks when it genuinely has nothing to go on.
+                Type <b>stop</b> any time to pause the periodic checks.
               </p>
+              <div id="otpbot-thread-state" class="small" style="margin-top:8px;"></div>
+              <div class="row mt8">
+                <button type="button" class="primary" id="otpbot-open-thread-btn">
+                  Open the OTP Bot chat
+                </button>
+              </div>
             </div>
 
             <div class="panel-section">
@@ -2106,12 +2114,42 @@
         renderOtpBotQueue(data.queue || [], data.awaiting_tag_for);
         renderOtpBotActive(data.active_files || []);
         renderOtpBotLastResult(data.last_result);
+        renderOtpBotThreadState(data);
       })
       .catch(function () {
         qs("#otpbot-last-result").textContent = "Failed to load.";
         qs("#otpbot-queue-list").textContent = "Failed to load.";
         qs("#otpbot-active-list").textContent = "Failed to load.";
       });
+  }
+
+  function renderOtpBotThreadState(data) {
+    var el = qs("#otpbot-thread-state");
+    if (!data.thread_id) {
+      el.textContent = "No dedicated thread yet - click below to create it.";
+      el.style.color = "var(--text-dim)";
+    } else if (data.in_otp_thread) {
+      el.textContent = "Chat is currently in the OTP Bot thread - files you drop there are queued automatically.";
+      el.style.color = "var(--accent)";
+    } else {
+      el.textContent = "The OTP Bot thread exists, but Chat is in a different conversation right now.";
+      el.style.color = "var(--text-dim)";
+    }
+  }
+
+  function handleOtpBotOpenThread() {
+    var btn = qs("#otpbot-open-thread-btn");
+    btn.disabled = true;
+    apiFetchJson("/api/otpbot/thread", { method: "POST" })
+      .then(function () {
+        // Jump the user straight into it - that IS the point of the button.
+        switchPanel("chat");
+        renderFreshThread();
+        loadThreads();
+        showConfirm("You are now in the OTP Bot chat - drop your number files here.");
+      })
+      .catch(function () { showConfirm("Could not open the thread."); })
+      .finally(function () { btn.disabled = false; });
   }
 
   function renderOtpBotQueue(queue, awaitingTagFor) {
@@ -2381,6 +2419,7 @@
     qs("#otpbot-run-now-btn").addEventListener("click", handleOtpBotRunNow);
     qs("#otpbot-start-btn").addEventListener("click", handleOtpBotStart);
     qs("#otpbot-stop-btn").addEventListener("click", handleOtpBotStop);
+    qs("#otpbot-open-thread-btn").addEventListener("click", handleOtpBotOpenThread);
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
   }

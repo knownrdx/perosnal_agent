@@ -65,8 +65,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "cleanup_command": "/useddelete",
     "interval_minutes": 10,
     "default_tag": "",           # if set, every new file auto-tags with this, never asks
+    "thread_id": "",             # dedicated chat thread; "" = not bound yet
     "awaiting_tag_entry_id": None,  # set while a "what tag for X" prompt is pending
 }
+
+# Seeded as the dedicated thread's first message so it gets a recognisable
+# title in the thread list (list_threads titles a thread from its first user
+# message) instead of showing up as a nameless "New chat".
+THREAD_TITLE = "\U0001F501 OTP Bot - send number files here"
 
 # Known tag/region tokens the agent recognises straight out of a filename, so
 # it can decide the tag itself instead of asking every single time - e.g.
@@ -181,6 +187,64 @@ async def _decide_tag(name: str) -> str | None:
     if config.get("default_tag"):
         return config["default_tag"]
     return await _get_last_tag()
+
+
+# --------------------------------------------------------------------------- #
+# Dedicated chat thread: one conversation that IS the OTP-bot workspace.
+#
+# Without this the owner has to remember which of several chat threads a
+# number file belongs in, and a file dropped into a general conversation
+# looks identical to one meant for this automation. Binding a specific
+# thread makes "where do I send the files?" answer itself - anything sent
+# in that thread is for the OTP bot, anything elsewhere is not.
+# --------------------------------------------------------------------------- #
+async def get_thread_id() -> str:
+    return (await get_config()).get("thread_id") or ""
+
+
+async def is_otp_thread(chat_id: int) -> bool:
+    """True when the given chat's CURRENT thread is the dedicated OTP one."""
+    bound = await get_thread_id()
+    if not bound:
+        return False
+    async with session_scope() as session:
+        row = await repo.ensure_session(session, chat_id)
+        return row.current_thread_id == bound
+
+
+async def ensure_thread(chat_id: int) -> str:
+    """Create (once) and switch to the dedicated OTP-bot thread, returning it.
+
+    Reuses the existing thread if one is already bound and still present, so
+    calling this repeatedly never spawns duplicate near-identical threads.
+    """
+    bound = await get_thread_id()
+    async with session_scope() as session:
+        # A chat that has never been seen has no chat_sessions row yet, and
+        # reset_session is an UPDATE - without this it would silently affect
+        # zero rows and leave the chat on the default thread.
+        await repo.ensure_session(session, chat_id)
+
+        if bound:
+            known = {t["thread_id"] for t in await repo.list_threads(session, chat_id, limit=200)}
+            if bound in known:
+                await repo.switch_thread(session, chat_id, bound)
+                return bound
+
+        new_thread = await repo.reset_session(session, chat_id)
+        await repo.add_message(
+            session, chat_id=chat_id, role="assistant",
+            content=(
+                f"{THREAD_TITLE}\n\n"
+                "Send number files here (one at a time is fine), then say "
+                "\"start\" when you're done. Anything sent in this thread goes "
+                "straight into the OTP-bot queue - files sent in other threads "
+                "are left alone."
+            ),
+            thread_id=new_thread,
+        )
+    await save_config({"thread_id": new_thread})
+    return new_thread
 
 
 # --------------------------------------------------------------------------- #

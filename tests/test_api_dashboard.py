@@ -344,6 +344,7 @@ def test_otpbot_requires_auth(client):
     assert client.delete("/api/otpbot/queue/x").status_code == 401
     assert client.post("/api/otpbot/start").status_code == 401
     assert client.post("/api/otpbot/stop").status_code == 401
+    assert client.post("/api/otpbot/thread").status_code == 401
 
 
 def test_otpbot_queue_lifecycle(client, monkeypatch):
@@ -381,6 +382,11 @@ def test_otpbot_queue_lifecycle(client, monkeypatch):
         assert empty.status_code == 200
         assert empty.json()["queue"] == []
 
+        # Open the dedicated thread first - uploads only queue in there.
+        opened = client.post("/api/otpbot/thread", headers=headers)
+        assert opened.status_code == 200
+        assert opened.json()["thread_id"]
+
         # Enqueue via the real upload endpoint so it goes through the same
         # code path a real "send file" does.
         upload = client.post(
@@ -389,6 +395,7 @@ def test_otpbot_queue_lifecycle(client, monkeypatch):
             headers=headers,
         )
         assert upload.status_code == 200
+        assert upload.json()["queued_for_otpbot"] is True
 
         queued = client.get("/api/otpbot/queue", headers=headers).json()["queue"]
         assert len(queued) == 1
