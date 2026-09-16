@@ -77,7 +77,7 @@ class FakeTelethonClient:
     async def get_me(self):
         return FakeMe()
 
-    async def send_message(self, entity, text):
+    async def send_message(self, entity, text, reply_to=None):
         self.sent.append((str(entity), text))
 
         class Msg:
@@ -398,7 +398,7 @@ class FakePyrogramClient:
     async def get_me(self):
         return FakePyroUser()
 
-    async def send_message(self, chat_id, text):
+    async def send_message(self, chat_id, text, reply_to_message_id=None):
         self.sent.append((chat_id, text))
 
         class Msg:
@@ -406,7 +406,7 @@ class FakePyrogramClient:
 
         return Msg()
 
-    async def send_document(self, chat_id, document, caption=""):
+    async def send_document(self, chat_id, document, caption="", reply_to_message_id=None):
         self.sent_documents.append((chat_id, document, caption))
 
         class Msg:

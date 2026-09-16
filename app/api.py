@@ -183,6 +183,20 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
 
 
+class OtpBotConfigRequest(BaseModel):
+    enabled: bool | None = None
+    target_bot: str | None = None
+    file_path: str | None = None
+    add_command_template: str | None = None
+    tag: str | None = None
+    limit: int | None = None
+    count: int | None = None
+    quota_command: str | None = None
+    quota_threshold: int | None = None
+    cleanup_command: str | None = None
+    interval_minutes: int | None = None
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Personal AI Agent", version="1.0.0", docs_url=None, redoc_url=None)
 
@@ -787,6 +801,42 @@ def create_app() -> FastAPI:
             ctx.pop("pending_upload", None)
             await repo.update_session(session, chat_id, context=ctx)
         return {"cleared": True}
+
+    # --- OTP-number bot automation (deterministic, no LLM in the loop) -- #
+    @app.get("/api/otpbot/config", dependencies=[Depends(require_api_access)])
+    async def otpbot_get_config() -> dict[str, Any]:
+        from app.automation import otp_bot
+
+        return await otp_bot.get_config()
+
+    @app.post("/api/otpbot/config", dependencies=[Depends(require_api_access)])
+    async def otpbot_set_config(payload: OtpBotConfigRequest) -> dict[str, Any]:
+        from app.automation import otp_bot
+
+        patch = {k: v for k, v in payload.model_dump().items() if v is not None}
+        return await otp_bot.save_config(patch)
+
+    @app.get("/api/otpbot/status", dependencies=[Depends(require_api_access)])
+    async def otpbot_status() -> dict[str, Any]:
+        from app.automation import otp_bot
+
+        config = await otp_bot.get_config()
+        last_result = await otp_bot.get_last_result()
+        return {"config": config, "last_result": last_result}
+
+    @app.post("/api/otpbot/run_now", dependencies=[Depends(require_api_access)])
+    async def otpbot_run_now() -> dict[str, Any]:
+        """Trigger one cycle immediately, without waiting for the scheduler's
+        own interval - lets the dashboard's "Run now" button give instant
+        feedback instead of the owner wondering if the setting even saved.
+        """
+        from dataclasses import asdict
+
+        from app.automation import otp_bot
+
+        config = await otp_bot.get_config()
+        result = await otp_bot.run_cycle(config)
+        return asdict(result)
 
     # --- static web dashboard ------------------------------------------- #
     # Mounted last so it never shadows an /api/* or /health route above.

@@ -48,6 +48,7 @@ Commands:
 /approve <id> / /reject <id> - decide a HIGH_RISK request
 /jobs    - scheduled jobs
 /memory <query> - search long-term memory
+/otpbot  - status | on | off | run (OTP-bot number automation)
 
 AI model:
 /models  - list providers and models
@@ -511,6 +512,61 @@ class AgentBot:
                     f"({t['message_count']} msgs)"
                 )
             lines += ["", "/history <id> to switch back to one", "/new to start another"]
+            await message.answer("\n".join(lines))
+
+        @dp.message(Command("otpbot"))
+        async def _otpbot(message: Message, command: CommandObject) -> None:
+            # Status/on/off for the deterministic OTP-number bot automation.
+            # Full configuration (target bot, file, commands, interval) lives
+            # in the web dashboard's OTP Bot panel - see /help for the link.
+            if not await self._guard(message):
+                return
+            from app.automation import otp_bot
+
+            arg = (command.args or "").strip().lower()
+            if arg in {"on", "enable", "enabled"}:
+                cfg = await otp_bot.save_config({"enabled": True})
+                await message.answer(
+                    f"\u2705 Automation enabled - checking {cfg['target_bot']} every "
+                    f"{cfg['interval_minutes']} min."
+                )
+                return
+            if arg in {"off", "disable", "disabled"}:
+                await otp_bot.save_config({"enabled": False})
+                await message.answer("\u23F8\uFE0F Automation disabled.")
+                return
+            if arg in {"run", "now"}:
+                await message.answer("\U0001F504 Running one cycle now...")
+                result = await otp_bot.run_cycle()
+                if result.ok:
+                    await message.answer(
+                        f"\u2705 {result.action} (active quota was {result.active_quota})"
+                        + (f"\n\n{result.add_reply[:500]}" if result.add_reply else "")
+                    )
+                else:
+                    await message.answer(f"\u274C {result.error[:400]}")
+                return
+
+            cfg = await otp_bot.get_config()
+            last = await otp_bot.get_last_result()
+            lines = [
+                "\U0001F501 OTP-bot automation",
+                "",
+                f"Enabled: {cfg['enabled']}",
+                f"Target: {cfg['target_bot']}",
+                f"Checks every: {cfg['interval_minutes']} min",
+                f"Refill when active \u2264: {cfg['quota_threshold']}",
+            ]
+            if last:
+                lines += ["", f"Last run: {'ok' if last.get('ok') else 'FAILED'} "
+                              f"({last.get('action', '')})"]
+                if last.get("error"):
+                    lines.append(f"Error: {last['error'][:200]}")
+            lines += [
+                "",
+                "/otpbot on | off | run",
+                "Full settings: web dashboard \u2192 OTP Bot panel",
+            ]
             await message.answer("\n".join(lines))
 
         @dp.message(Command("mode"))

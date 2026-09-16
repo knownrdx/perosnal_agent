@@ -497,24 +497,30 @@ class TelegramUserbot:
     # ------------------------------------------------------------------ #
     # Actions
     # ------------------------------------------------------------------ #
-    async def send_message(self, target: str, text: str) -> dict[str, Any]:
+    async def send_message(
+        self, target: str, text: str, *, reply_to: int | None = None
+    ) -> dict[str, Any]:
         client = await self.client()
         if self._backend == BACKEND_PYROGRAM:
             peer = self._resolve_pyrogram(target)
-            sent = await client.send_message(peer, text)
+            sent = await client.send_message(peer, text, reply_to_message_id=reply_to)
             return {"sent": True, "message_id": sent.id, "to": str(target)}
         entity = await self._resolve(client, target)
-        sent = await client.send_message(entity, text)
+        sent = await client.send_message(entity, text, reply_to=reply_to)
         return {"sent": True, "message_id": sent.id, "to": str(target)}
 
-    async def send_file(self, target: str, path: str, caption: str = "") -> dict[str, Any]:
+    async def send_file(
+        self, target: str, path: str, caption: str = "", *, reply_to: int | None = None
+    ) -> dict[str, Any]:
         client = await self.client()
         if self._backend == BACKEND_PYROGRAM:
             peer = self._resolve_pyrogram(target)
-            sent = await client.send_document(peer, path, caption=caption or "")
+            sent = await client.send_document(
+                peer, path, caption=caption or "", reply_to_message_id=reply_to
+            )
             return {"sent": True, "message_id": sent.id, "to": str(target)}
         entity = await self._resolve(client, target)
-        sent = await client.send_file(entity, path, caption=caption or None)
+        sent = await client.send_file(entity, path, caption=caption or None, reply_to=reply_to)
         return {"sent": True, "message_id": sent.id, "to": str(target)}
 
     async def read_messages(self, target: str, limit: int = 20) -> list[dict[str, Any]]:

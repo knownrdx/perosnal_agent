@@ -28,23 +28,34 @@ def _fail(exc: Exception) -> None:
     "tg_send_message",
     description=(
         "Send a Telegram message from the OWNER'S OWN account (not the bot). "
-        "Target: @username, numeric id, or 'me' for Saved Messages."
+        "Target: @username, numeric id, or 'me' for Saved Messages. "
+        "Some bots (e.g. FSM-style admin bots) only accept a follow-up command "
+        "when it is sent as a REPLY to their own previous message - pass "
+        "reply_to_message_id (from tg_read_messages' 'id' field) when that matters."
     ),
     permission=Permission.WRITE,
     args={
         "to": Arg("string", True, "@username, chat id, or 'me'"),
         "text": Arg("string", True, "Message text"),
+        "reply_to_message_id": Arg(
+            "integer", False,
+            "Reply to this message id instead of sending standalone (needed by "
+            "some FSM-style bots that only accept the next command as a reply)",
+            default=None,
+        ),
     },
     timeout_s=120,
     max_retries=1,
     side_effect=True,
     verify=lambda data: bool(data.get("message_id")),
 )
-async def tg_send_message(to: str, text: str, ctx: ToolContext | None = None) -> dict[str, Any]:
+async def tg_send_message(
+    to: str, text: str, reply_to_message_id: int | None = None, ctx: ToolContext | None = None
+) -> dict[str, Any]:
     if not text.strip():
         raise InvalidInput("text must not be empty")
     try:
-        result = await get_userbot().send_message(to, text[:4000])
+        result = await get_userbot().send_message(to, text[:4000], reply_to=reply_to_message_id)
     except UserbotError as exc:
         _fail(exc)
     log.info("tg_user_sent", extra={"tool": "tg_send_message",
@@ -54,19 +65,29 @@ async def tg_send_message(to: str, text: str, ctx: ToolContext | None = None) ->
 
 @tool(
     "tg_send_file",
-    description="Send a workspace file from the owner's own Telegram account.",
+    description=(
+        "Send a workspace file from the owner's own Telegram account. "
+        "Pass reply_to_message_id when the target bot's flow requires the file "
+        "to be a reply to a specific prompt message rather than a standalone send."
+    ),
     permission=Permission.WRITE,
     args={
         "to": Arg("string", True, "@username, chat id, or 'me'"),
         "path": Arg("string", True, "Workspace-relative file"),
         "caption": Arg("string", False, "Optional caption", default=""),
+        "reply_to_message_id": Arg(
+            "integer", False, "Reply to this message id instead of sending standalone",
+            default=None,
+        ),
     },
     timeout_s=600,
     max_retries=1,
     side_effect=True,
     verify=lambda data: bool(data.get("message_id")),
 )
-async def tg_send_file(to: str, path: str, caption: str = "") -> dict[str, Any]:
+async def tg_send_file(
+    to: str, path: str, caption: str = "", reply_to_message_id: int | None = None
+) -> dict[str, Any]:
     try:
         target = safe_path(path, must_exist=True)
     except UnsafePath as exc:
@@ -76,7 +97,9 @@ async def tg_send_file(to: str, path: str, caption: str = "") -> dict[str, Any]:
     if target.stat().st_size == 0:
         raise InvalidInput("refusing to send an empty file")
     try:
-        result = await get_userbot().send_file(to, str(target), caption)
+        result = await get_userbot().send_file(
+            to, str(target), caption, reply_to=reply_to_message_id
+        )
     except UserbotError as exc:
         _fail(exc)
     result["path"] = rel_path(target)

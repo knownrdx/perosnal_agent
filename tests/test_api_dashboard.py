@@ -310,3 +310,32 @@ def test_chat_threads_require_auth(client):
     assert client.get("/api/chat/threads").status_code == 401
     assert client.post("/api/chat/threads/new").status_code == 401
     assert client.post("/api/chat/threads/x/switch").status_code == 401
+
+
+def test_otpbot_config_and_status(client):
+    headers = {"X-API-Token": "test-api-token"}
+
+    default = client.get("/api/otpbot/config", headers=headers)
+    assert default.status_code == 200
+    assert default.json()["enabled"] is False
+
+    updated = client.post(
+        "/api/otpbot/config",
+        json={"enabled": True, "target_bot": "@PBDxbot", "interval_minutes": 5},
+        headers=headers,
+    )
+    assert updated.status_code == 200
+    assert updated.json()["enabled"] is True
+    assert updated.json()["interval_minutes"] == 5
+
+    status = client.get("/api/otpbot/status", headers=headers)
+    assert status.status_code == 200
+    assert status.json()["config"]["enabled"] is True
+    assert status.json()["last_result"] is None
+
+
+def test_otpbot_requires_auth(client):
+    assert client.get("/api/otpbot/config").status_code == 401
+    assert client.post("/api/otpbot/config", json={}).status_code == 401
+    assert client.get("/api/otpbot/status").status_code == 401
+    assert client.post("/api/otpbot/run_now").status_code == 401

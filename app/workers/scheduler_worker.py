@@ -30,6 +30,7 @@ class SchedulerRunner:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._next_briefing = None
+        self._next_otp_check = None
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._loop())
@@ -51,6 +52,7 @@ class SchedulerRunner:
                 if fired:
                     log.info("scheduler_fired", extra={"count": fired})
                 await self.maybe_send_briefing()
+                await self.maybe_run_otp_automation()
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - scheduler must never die
@@ -154,3 +156,55 @@ class SchedulerRunner:
                     data={"job_id": job.id, "kind": job.kind},
                 )
         return fired
+
+    async def maybe_run_otp_automation(self) -> bool:
+        """Check-and-refill the OTP-number distribution bot on its own timer.
+
+        Deliberately LLM-free (see app/automation/otp_bot.py's module
+        docstring) so it keeps working even when the configured LLM provider
+        is slow, rate-limited, or down entirely - all of which have happened
+        in production. Configured entirely from the web dashboard's
+        Automation panel / /otpbot Telegram command; no code change needed to
+        turn it on, change the interval, or point it at a different bot.
+        """
+        from app.automation import otp_bot
+
+        config = await otp_bot.get_config()
+        if not config.get("enabled"):
+            self._next_otp_check = None
+            return False
+
+        now = utcnow()
+        interval = timedelta(minutes=max(1, int(config.get("interval_minutes", 10))))
+        if self._next_otp_check is None:
+            # First tick after boot/enable only arms the timer - it must not
+            # fire immediately on every restart.
+            self._next_otp_check = now + interval
+            return False
+        if now < self._next_otp_check:
+            return False
+        self._next_otp_check = now + interval
+
+        result = await otp_bot.run_cycle(config)
+        log.info(
+            "otp_automation_cycle",
+            extra={"ok": result.ok, "action": result.action, "active_quota": result.active_quota},
+        )
+
+        if self.notifier is None or self.settings.owner_chat_id is None:
+            return result.ok
+
+        if not result.ok:
+            await self.notifier.send(
+                self.settings.owner_chat_id,
+                f"\u26A0\uFE0F OTP-bot automation failed: {result.error[:300]}",
+                dedupe_key=f"otp_automation_error:{result.ran_at}",
+            )
+        elif result.action == "added":
+            await self.notifier.send(
+                self.settings.owner_chat_id,
+                f"\U0001F504 Quota was exhausted - cleaned up and re-added numbers to "
+                f"{config['target_bot']}.\n\n{result.add_reply[:500]}",
+                dedupe_key=f"otp_automation_added:{result.ran_at}",
+            )
+        return result.ok

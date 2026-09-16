@@ -1,16 +1,36 @@
-File uploads now show up as a permanent chat message
+Deterministic OTP-number-bot automation (no LLM in the loop) + UI
 
-An upload only ever wrote to invisible session context
-(pending_upload) - the file itself never appeared in the actual chat
-history, so reloading the Chat panel (or scrolling Telegram) made it look
-like nothing had been uploaded at all, even though it was attached and
-working underneath.
+Root cause of "file uploads but never actually adds numbers": the target
+bot (@PBDxbot) requires the add-numbers command to be sent as a REPLY to
+the just-uploaded file message - a standalone command after the file gets
+silently rejected ("No valid phone numbers found"). Getting an LLM task to
+reliably reproduce that exact two-step reply sequence, forever, on a
+schedule, was a bad bet - doubly so since the LLM provider (omniroute) has
+been rate-limited for hours at a time in production, which would make a
+normal Task-based scheduled job simply never run.
 
-Fix: both upload paths (app/api.py's POST /api/chat/upload and
-app/telegram/bot.py's F.document handler) now also write a normal "user"
-message ("Uploaded: <name>") into the conversation, on the chat's current
-thread, right alongside setting pending_upload. It is a real, permanently
-stored chat turn - it survives a page reload and shows up in
-GET /api/chat/history exactly like any other message, from either surface.
+app/automation/otp_bot.py: a small, LLM-free state machine
 
-565 tests (1 updated to assert the upload appears in history), all green.
+Send /myquota, parse the "Active" count, and only if it is at/under the
+configured threshold: send the cleanup command, send the numbers file, then
+send the add-numbers command AS A REPLY to that file's message_id
+(reply_to_message_id, threaded through send_message/send_file in
+telegram_user.py and the tg_send_message/tg_send_file tools - useful on its
+own for any other FSM-style bot). Every step is a direct userbot call; no
+model call anywhere in the cycle, so it is exactly as fast/reliable as
+Telegram itself.
+
+Wired into the existing scheduler loop (own timer, own interval, config
+stored via the existing AppSetting key/value table - no new table needed)
+so once configured it needs zero further attention, exactly matching "amar
+alada kore kisu na kora lage".
+
+Full UI: web dashboard OTP Bot panel (enable, target bot, interval, quota
+threshold, file path, commands, tag/limit/count, Save, Run now, last-run
+result) plus /otpbot on|off|run|status on Telegram - the owner asked for
+this to be settable from a preset/panel rather than typed instructions each
+time.
+
+573 tests (12 new: 6 for the automation cycle itself covering skip/refill/
+not-linked/unparseable-quota/persistence, 2 API endpoint tests, plus 4
+existing tests fixed for the new reply_to parameter), smoke 10/10.

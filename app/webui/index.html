@@ -635,6 +635,7 @@
           <button class="nav-item" data-panel="skills">🧠 Skills</button>
           <button class="nav-item" data-panel="memory">💾 Memory</button>
           <button class="nav-item" data-panel="jobs">⏰ Jobs</button>
+          <button class="nav-item" data-panel="otpbot">🔁 OTP Bot</button>
           <button class="nav-item" data-panel="llm">⚙️ LLM</button>
           <button class="nav-item" data-panel="bridges">🔗 Bridges</button>
           <button class="nav-item" data-panel="settings">🛠️ Settings</button>
@@ -829,6 +830,81 @@
             <div class="panel-section">
               <h3>Scheduled Jobs</h3>
               <div id="jobs-list">Loading...</div>
+            </div>
+          </div>
+
+          <!-- ===================== OTP BOT PANEL ===================== -->
+          <div class="panel" id="panel-otpbot">
+            <div class="panel-section">
+              <h3>Automation</h3>
+              <p class="small" style="color:var(--text-dim); margin-top:-4px;">
+                Runs entirely without the LLM (deterministic), so a slow or down
+                LLM provider never stops it. Checks quota on its own timer;
+                when exhausted, cleans up used numbers and re-adds from the
+                configured file automatically.
+              </p>
+
+              <div class="row" style="align-items:center; margin-top:10px;">
+                <label class="small" style="margin:0; display:flex; align-items:center; gap:6px;">
+                  <input type="checkbox" id="otpbot-enabled" style="width:auto;"> Enabled
+                </label>
+              </div>
+
+              <label for="otpbot-target">Target bot</label>
+              <input type="text" id="otpbot-target" placeholder="@PBDxbot">
+
+              <div class="row mt8">
+                <div>
+                  <label for="otpbot-interval">Check every (minutes)</label>
+                  <input type="number" id="otpbot-interval" min="1">
+                </div>
+                <div>
+                  <label for="otpbot-threshold">Refill when active quota &le;</label>
+                  <input type="number" id="otpbot-threshold" min="0">
+                </div>
+              </div>
+
+              <label for="otpbot-file">File to (re-)upload</label>
+              <input type="text" id="otpbot-file" placeholder="uploads/numbers.txt (blank = most recently uploaded file)">
+
+              <div class="row mt8">
+                <div>
+                  <label for="otpbot-quota-cmd">Quota-check command</label>
+                  <input type="text" id="otpbot-quota-cmd">
+                </div>
+                <div>
+                  <label for="otpbot-cleanup-cmd">Cleanup command</label>
+                  <input type="text" id="otpbot-cleanup-cmd">
+                </div>
+              </div>
+
+              <label for="otpbot-add-cmd">Add-numbers command template</label>
+              <input type="text" id="otpbot-add-cmd" placeholder="/fan -t {tag} -l {limit} -c {count}">
+
+              <div class="row mt8">
+                <div>
+                  <label for="otpbot-tag">Tag</label>
+                  <input type="text" id="otpbot-tag">
+                </div>
+                <div>
+                  <label for="otpbot-limit">Limit</label>
+                  <input type="number" id="otpbot-limit" min="1">
+                </div>
+                <div>
+                  <label for="otpbot-count">Count</label>
+                  <input type="number" id="otpbot-count" min="1">
+                </div>
+              </div>
+
+              <div class="row mt12">
+                <button type="button" class="primary" id="otpbot-save-btn">Save</button>
+                <button type="button" id="otpbot-run-now-btn">Run now</button>
+              </div>
+            </div>
+
+            <div class="panel-section">
+              <h3>Last Run</h3>
+              <div id="otpbot-last-result">Loading...</div>
             </div>
           </div>
 
@@ -1113,6 +1189,7 @@
     skills: "Skills",
     memory: "Memory",
     jobs: "Jobs",
+    otpbot: "OTP Bot",
     llm: "LLM",
     bridges: "Bridges",
     settings: "Settings"
@@ -1144,6 +1221,7 @@
     if (name === "skills") loadSkills();
     if (name === "memory") loadMemory();
     if (name === "jobs") loadJobs();
+    if (name === "otpbot") loadOtpBot();
     if (name === "llm") loadLlm();
     if (name === "bridges") loadBridges();
     if (name === "settings") loadAutonomy();
@@ -1987,6 +2065,102 @@
   }
 
   /* ============================================================
+     OTP BOT PANEL (deterministic automation, no LLM involved)
+     ============================================================ */
+
+  function loadOtpBot() {
+    qs("#otpbot-last-result").textContent = "Loading...";
+    apiFetchJson("/api/otpbot/status")
+      .then(function (data) {
+        var cfg = data.config || {};
+        qs("#otpbot-enabled").checked = !!cfg.enabled;
+        qs("#otpbot-target").value = cfg.target_bot || "";
+        qs("#otpbot-interval").value = cfg.interval_minutes != null ? cfg.interval_minutes : 10;
+        qs("#otpbot-threshold").value = cfg.quota_threshold != null ? cfg.quota_threshold : 0;
+        qs("#otpbot-file").value = cfg.file_path || "";
+        qs("#otpbot-quota-cmd").value = cfg.quota_command || "/myquota";
+        qs("#otpbot-cleanup-cmd").value = cfg.cleanup_command || "/useddelete";
+        qs("#otpbot-add-cmd").value = cfg.add_command_template || "";
+        qs("#otpbot-tag").value = cfg.tag || "";
+        qs("#otpbot-limit").value = cfg.limit != null ? cfg.limit : 4;
+        qs("#otpbot-count").value = cfg.count != null ? cfg.count : 4;
+        renderOtpBotLastResult(data.last_result);
+      })
+      .catch(function () {
+        qs("#otpbot-last-result").textContent = "Failed to load.";
+      });
+  }
+
+  function renderOtpBotLastResult(result) {
+    var el = qs("#otpbot-last-result");
+    if (!result) {
+      el.textContent = "No run yet.";
+      return;
+    }
+    el.innerHTML = "";
+    var lines = [
+      "When: " + relativeTimeOrNow(result.ran_at),
+      "Outcome: " + (result.ok ? "ok (" + result.action + ")" : "FAILED"),
+    ];
+    if (result.active_quota !== null && result.active_quota !== undefined) {
+      lines.push("Active quota at check time: " + result.active_quota);
+    }
+    if (result.error) lines.push("Error: " + result.error);
+    if (result.add_reply) lines.push("Bot's reply after adding: " + result.add_reply);
+    lines.forEach(function (line) {
+      var p = document.createElement("div");
+      p.textContent = line;
+      p.style.marginBottom = "4px";
+      el.appendChild(p);
+    });
+  }
+
+  function saveOtpBotConfig(showConfirmMsg) {
+    var body = {
+      enabled: qs("#otpbot-enabled").checked,
+      target_bot: qs("#otpbot-target").value.trim(),
+      interval_minutes: parseInt(qs("#otpbot-interval").value, 10) || 10,
+      quota_threshold: parseInt(qs("#otpbot-threshold").value, 10) || 0,
+      file_path: qs("#otpbot-file").value.trim(),
+      quota_command: qs("#otpbot-quota-cmd").value.trim() || "/myquota",
+      cleanup_command: qs("#otpbot-cleanup-cmd").value.trim() || "/useddelete",
+      add_command_template: qs("#otpbot-add-cmd").value.trim(),
+      tag: qs("#otpbot-tag").value.trim(),
+      limit: parseInt(qs("#otpbot-limit").value, 10) || 4,
+      count: parseInt(qs("#otpbot-count").value, 10) || 4
+    };
+    return apiFetchJson("/api/otpbot/config", { method: "POST", body: body })
+      .then(function () {
+        if (showConfirmMsg) showConfirm("Automation settings saved.");
+      });
+  }
+
+  function handleOtpBotSave() {
+    saveOtpBotConfig(true).catch(function () {
+      showConfirm("Failed to save.");
+    });
+  }
+
+  function handleOtpBotRunNow() {
+    var btn = qs("#otpbot-run-now-btn");
+    btn.disabled = true;
+    btn.textContent = "Running...";
+    saveOtpBotConfig(false)
+      .then(function () { return apiFetchJson("/api/otpbot/run_now", { method: "POST" }); })
+      .then(function (result) {
+        renderOtpBotLastResult(result);
+        showConfirm(result.ok ? "Cycle finished: " + result.action : "Cycle failed - see Last Run.");
+      })
+      .catch(function () {
+        showConfirm("Run failed.");
+      })
+      .finally(function () {
+        btn.disabled = false;
+        btn.textContent = "Run now";
+      });
+  }
+
+  /* ============================================================
      SETTINGS PANEL (autonomy)
      ============================================================ */
 
@@ -2083,6 +2257,9 @@
     qs("#llm-refresh-btn").addEventListener("click", refreshLlmHealth);
 
     qs("#autonomy-save-btn").addEventListener("click", saveAutonomy);
+
+    qs("#otpbot-save-btn").addEventListener("click", handleOtpBotSave);
+    qs("#otpbot-run-now-btn").addEventListener("click", handleOtpBotRunNow);
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
   }
