@@ -85,6 +85,9 @@ async def test_otp_tag_answer_intercepted_before_router(environment, monkeypatch
     monkeypatch.setattr(otp_bot, "_sleep", _no_sleep)
 
     class FakeUserbot:
+        def __init__(self):
+            self._reply_id = 0
+
         async def send_message(self, target, text, reply_to=None):
             return {"sent": True, "message_id": 1}
 
@@ -92,7 +95,9 @@ async def test_otp_tag_answer_intercepted_before_router(environment, monkeypatch
             return {"sent": True, "message_id": 2}
 
         async def read_messages(self, target, limit=20):
-            return [{"text": "Added.", "out": False}]
+            # Fresh id each read - the automation waits for a NEWER message.
+            self._reply_id += 1
+            return [{"text": "Added.", "id": self._reply_id, "out": False}]
 
     set_userbot(FakeUserbot())
     try:

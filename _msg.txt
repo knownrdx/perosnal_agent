@@ -1,33 +1,24 @@
-Fix infinite recursion in _sleep that broke every real OTP-bot run
+Wait for the bot's actual reply instead of sleeping a fixed 3 seconds
 
-"Start" failed with a bare "maximum recursion depth exceeded" and nothing
-else to go on. Two separate mistakes combined to produce that:
+A live run added 53,412 numbers successfully but reported the wrong result:
+the first file's outcome was shown as the /useddelete reply ("Deleted 4,796
+used/expired numbers") rather than its own confirmation. Cause: the code
+slept 3s and then read the latest bot message. A large file takes the target
+bot far longer than that to ingest, so the read returned the PREVIOUS
+message - the automation had no way to tell "it answered" from "it has not
+answered yet".
 
-1. The bulk rename of asyncio.sleep -> _sleep (introduced so tests could
-   skip the real delays) also rewrote the body of _sleep itself, so it
-   called itself forever. Every test monkeypatches _sleep, so the entire
-   suite passed while nothing worked in production - the exact blind spot
-   a mocked-out helper creates.
+Both the add and the quota check now anchor on the id of the last bot
+message before sending, then poll until something newer appears (90s for an
+add, 45s for a quota check). No reply within the window is now an explicit
+failure that says the add may or may not have gone through, instead of
+silently attributing someone else's message to this file.
 
-2. start_automation caught RuntimeError to report "the bot rejected your
-   file". RecursionError subclasses RuntimeError, so a hard crash was
-   presented to the owner as a bot rejection, pointing the investigation
-   at @PBDxbot instead of at our own code.
+Test doubles updated to issue increasing message ids, since "newer than what
+I last saw" is now the thing under test; FailingUserbot gained the methods
+the real path touches first. Two regressions added: one drives a bot that
+only answers after several polls and asserts the stale /useddelete text is
+never reported as the add's result, another asserts a silent bot fails
+loudly and leaves nothing marked active.
 
-Fixes: _sleep calls asyncio.sleep again; bot rejections now raise a
-dedicated AddRejected exception instead of a broad built-in; unexpected
-errors report their exception type and log a full traceback, so the next
-crash is diagnosable from the container logs rather than from one
-context-free sentence.
-
-Regression tests: one exercises the REAL _sleep (reloading a pristine
-module, since the autouse fixture patches it away) and was verified to
-fail with RecursionError when the bug is reintroduced; another asserts a
-genuine exception is reported as a crash, not as a bot rejection.
-
-Also surfaced by the debugging: the Telegram userbot is currently not
-linked (status linked=False), so /tglogin is still needed before a real
-run can succeed - that is a separate, pre-existing condition, now
-reported accurately instead of being masked.
-
-598 tests (was 596), smoke unaffected.
+600 tests (was 598), smoke 10/10.

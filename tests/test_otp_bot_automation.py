@@ -15,17 +15,43 @@ from app.integrations.telegram_user import UserbotError, set_userbot
 
 
 class FakeUserbot:
-    """Records every call and returns scripted replies."""
+    """Records every call and returns scripted replies.
+
+    Replies carry incrementing ids because the automation waits for a bot
+    message NEWER than the last one it saw. The script advances on SEND, not
+    on read: the real code reads once before sending (to anchor on the last
+    message) and then polls until something newer appears, so advancing on
+    read would consume the script out of order.
+    """
 
     def __init__(self, replies: list[dict[str, Any]]) -> None:
         self.replies = list(replies)
         self.sent_messages: list[tuple[str, str, int | None]] = []
         self.sent_files: list[tuple[str, str, int | None]] = []
         self._next_message_id = 1000
+        self._reply_id = 0
+        self._current: dict[str, Any] | None = None
+
+    def _advance(self) -> None:
+        """Move to the next scripted reply, or re-issue the last one under a
+        fresh id when the script runs out - the automation waits for a NEWER
+        message, so a fake that stops producing ids would hang instead of
+        simply running out of interesting things to say.
+        """
+        self._reply_id += 1
+        if self.replies:
+            nxt = dict(self.replies.pop(0))
+        elif self._current is not None:
+            nxt = dict(self._current)
+        else:
+            return
+        nxt["id"] = self._reply_id
+        self._current = nxt
 
     async def send_message(self, target: str, text: str, reply_to: int | None = None) -> dict[str, Any]:
         self.sent_messages.append((target, text, reply_to))
         self._next_message_id += 1
+        self._advance()
         return {"sent": True, "message_id": self._next_message_id, "to": target}
 
     async def send_file(self, target: str, path: str, caption: str = "", reply_to: int | None = None) -> dict[str, Any]:
@@ -34,13 +60,21 @@ class FakeUserbot:
         return {"sent": True, "message_id": self._next_message_id, "to": target}
 
     async def read_messages(self, target: str, limit: int = 20) -> list[dict[str, Any]]:
-        if not self.replies:
+        if self._current is None:
             return []
-        return [self.replies.pop(0)]
+        return [self._current]
 
 
 class FailingUserbot:
+    """An unlinked account: every call raises, including the anchor read."""
+
     async def send_message(self, *args, **kwargs):
+        raise UserbotError("Telegram account is not linked. Use /tglogin first.")
+
+    async def send_file(self, *args, **kwargs):
+        raise UserbotError("Telegram account is not linked. Use /tglogin first.")
+
+    async def read_messages(self, *args, **kwargs):
         raise UserbotError("Telegram account is not linked. Use /tglogin first.")
 
 
@@ -293,6 +327,68 @@ async def test_stop_disables_monitor_but_keeps_active_files(environment):
     stopped = await otp_bot.stop_automation()
     assert stopped["enabled"] is False
     assert len(await otp_bot.get_active_files()) == 1  # untouched
+
+
+async def test_add_waits_for_a_new_reply_not_the_previous_one(environment, monkeypatch):
+    """Regression: a slow add returned the PREVIOUS bot message as its result.
+
+    Live, a large file took longer than the old fixed 3s sleep, so the add
+    was reported with the /useddelete reply ("Deleted 4,796 used numbers")
+    instead of its own confirmation.
+    """
+    rel = await _write_numbers_file("numbers_BD.txt")
+    await otp_bot.enqueue_file(rel, "numbers_BD.txt")
+
+    class SlowBot:
+        """Answers the add only after several polls, as a busy bot would."""
+
+        def __init__(self) -> None:
+            self.polls_until_answer = 3
+            self.current = {"text": "\U0001F5D1 Deleted 4,796 used numbers.", "id": 10, "out": False}
+
+        async def send_message(self, target, text, reply_to=None):
+            return {"sent": True, "message_id": 500}
+
+        async def send_file(self, target, path, caption="", reply_to=None):
+            return {"sent": True, "message_id": 501}
+
+        async def read_messages(self, target, limit=20):
+            if self.polls_until_answer > 0:
+                self.polls_until_answer -= 1
+            elif self.current["id"] == 10:
+                self.current = {"text": "\u26A1 53412 added", "id": 11, "out": False}
+            return [self.current]
+
+    set_userbot(SlowBot())
+    result = await otp_bot.start_automation()
+
+    assert result["ok"] is True
+    reply = result["files"][0]["reply"]
+    assert "53412 added" in reply
+    assert "Deleted" not in reply, "must not report the previous message as this add's result"
+
+
+async def test_add_fails_when_the_bot_never_answers(environment, monkeypatch):
+    rel = await _write_numbers_file("numbers_BD.txt")
+    await otp_bot.enqueue_file(rel, "numbers_BD.txt")
+
+    class SilentBot:
+        async def send_message(self, target, text, reply_to=None):
+            return {"sent": True, "message_id": 500}
+
+        async def send_file(self, target, path, caption="", reply_to=None):
+            return {"sent": True, "message_id": 501}
+
+        async def read_messages(self, target, limit=20):
+            # Never produces anything newer than the anchor.
+            return [{"text": "an older message", "id": 10, "out": False}]
+
+    set_userbot(SilentBot())
+    result = await otp_bot.start_automation()
+
+    assert result["ok"] is False
+    assert "no reply" in result["error"]
+    assert await otp_bot.get_active_files() == []
 
 
 # --------------------------------------------------------------------------- #

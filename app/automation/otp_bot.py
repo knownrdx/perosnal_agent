@@ -385,14 +385,44 @@ async def _last_bot_message(target: str, *, limit: int = 5) -> dict[str, Any] | 
     return None
 
 
+async def _wait_for_new_bot_reply(
+    target: str, *, after_id: int | None, timeout_s: float = 90.0, poll_s: float = 3.0
+) -> dict[str, Any] | None:
+    """Wait for a bot message NEWER than ``after_id``.
+
+    A fixed sleep-then-read is not enough: a large file can take the target
+    bot well over a minute to ingest, and reading too early returns its
+    PREVIOUS message - which is how an add once got reported with the
+    /useddelete reply ("Deleted 4,796 used numbers") as its result. Anchoring
+    on the last-seen message id makes "has it actually answered yet?"
+    decidable instead of guessed.
+    """
+    waited = 0.0
+    while waited < timeout_s:
+        await _sleep(poll_s)
+        waited += poll_s
+        message = await _last_bot_message(target)
+        if message is None:
+            continue
+        if after_id is None or int(message.get("id", 0)) > after_id:
+            return message
+    return None
+
+
 async def _add_one_file(target: str, entry: dict[str, Any], cfg: dict[str, Any]) -> str:
     """Send one file as a reply-based add; returns the bot's reply text.
-    Raises RuntimeError if the bot's own reply indicates the add failed
+    Raises AddRejected if the bot's own reply indicates the add failed
     (e.g. "No valid phone numbers found") - a delivered message is not the
     same as a successful add, and silently reporting success on a rejected
     file would hide the exact bug this automation exists to avoid.
     """
     target_path = safe_path(entry["path"], must_exist=True)
+
+    # Remember where the conversation stood before we touch it, so we can
+    # tell this file's reply apart from whatever the bot said last.
+    previous = await _last_bot_message(target)
+    previous_id = int(previous.get("id", 0)) if previous else None
+
     sent_file = await get_userbot().send_file(target, str(target_path))
     await _sleep(2)
 
@@ -400,10 +430,14 @@ async def _add_one_file(target: str, entry: dict[str, Any], cfg: dict[str, Any])
         tag=entry.get("tag") or "General", limit=cfg["limit"], count=cfg["count"]
     )
     await get_userbot().send_message(target, command_text, reply_to=sent_file.get("message_id"))
-    await _sleep(3)
 
-    reply = await _last_bot_message(target)
-    text = reply["text"] if reply else ""
+    reply = await _wait_for_new_bot_reply(target, after_id=previous_id)
+    if reply is None:
+        raise AddRejected(
+            f"{entry['name']}: no reply from {target} within the wait window - "
+            "the add may or may not have gone through, check the chat"
+        )
+    text = reply.get("text") or ""
     if text and _looks_like_failure(text):
         raise AddRejected(f"{entry['name']}: bot rejected the add ({text[:200]})")
     return text
@@ -643,9 +677,15 @@ async def run_cycle(config: dict[str, Any] | None = None) -> CycleResult:
         return result
 
     try:
+        # Anchor on the last bot message before asking, so a slow answer is
+        # waited for rather than the previous one being mistaken for it.
+        before_quota = await _last_bot_message(target)
+        before_quota_id = int(before_quota.get("id", 0)) if before_quota else None
+
         await get_userbot().send_message(target, cfg["quota_command"])
-        await _sleep(3)
-        quota_msg = await _last_bot_message(target)
+        quota_msg = await _wait_for_new_bot_reply(
+            target, after_id=before_quota_id, timeout_s=45.0
+        )
         if quota_msg is None:
             result.error = "no reply from the bot to the quota command"
             await _save_last_result(result)

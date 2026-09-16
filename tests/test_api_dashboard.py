@@ -361,6 +361,7 @@ def test_otpbot_queue_lifecycle(client, monkeypatch):
         def __init__(self):
             self.sent_messages = []
             self.sent_files = []
+            self._reply_id = 0
 
         async def send_message(self, target, text, reply_to=None):
             self.sent_messages.append((target, text, reply_to))
@@ -371,7 +372,10 @@ def test_otpbot_queue_lifecycle(client, monkeypatch):
             return {"sent": True, "message_id": 999}
 
         async def read_messages(self, target, limit=20):
-            return [{"text": "Added.", "out": False}]
+            # Fresh id each read: the automation waits for a message NEWER
+            # than the last one it saw, so a fixed id would never satisfy it.
+            self._reply_id += 1
+            return [{"text": "Added.", "id": self._reply_id, "out": False}]
 
     from app.integrations.telegram_user import set_userbot
 
