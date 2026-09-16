@@ -893,6 +893,33 @@ def create_app() -> FastAPI:
         thread_id = await otp_bot.ensure_thread(chat_id)
         return {"thread_id": thread_id}
 
+    @app.get("/api/otpbot/chat_tail", dependencies=[Depends(require_api_access)])
+    async def otpbot_chat_tail(limit: int = 10) -> dict[str, Any]:
+        """The last few messages in the target-bot chat, as the automation
+        sees them. When a run reports "no reply", this is the difference
+        between guessing and knowing what the bot actually said.
+        """
+        from app.automation import otp_bot
+        from app.integrations.telegram_user import UserbotError, get_userbot
+
+        config = await otp_bot.get_config()
+        target = config["target_bot"]
+        try:
+            messages = await get_userbot().read_messages(target, min(limit, 30))
+        except UserbotError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {
+            "target_bot": target,
+            "messages": [
+                {
+                    "id": m.get("id"),
+                    "out": m.get("out"),
+                    "text": (m.get("text") or "")[:600],
+                }
+                for m in messages
+            ],
+        }
+
     @app.post("/api/otpbot/start", dependencies=[Depends(require_api_access)])
     async def otpbot_start() -> dict[str, Any]:
         """Same deterministic entrypoint the "start"/"done" chat trigger uses -

@@ -1,24 +1,18 @@
-Quota check: accept only a reply that is actually a quota
+Read the NEWEST bot message, not the oldest one in the window
 
-Live "check quota now" failed with "could not parse an 'Active' count",
-quoting the bot's own "Fast Add Complete!" notice. Waiting for a NEWER
-message was not enough - the target bot posts its own progress and
-completion notices, so a stray one arrives first and gets mistaken for the
-answer while the real /myquota reply is still in flight.
+"Check quota now" kept reporting "no reply from the bot to the quota
+command" while the answer ("Active : 50047") was already visible in the
+chat. _last_bot_message iterated its window in reverse, but read_messages
+returns newest-first - both Telethon's iter_messages and Pyrogram's
+get_chat_history do - so it consistently picked the OLDEST message it had
+fetched. Anchoring and reply-matching were then comparing against stale
+history, which is why the earlier timing fixes looked ineffective.
 
-_wait_for_new_bot_reply now takes an optional predicate, and the quota
-check only accepts a message that actually parses as a quota; anything else
-newer is skipped and the wait continues. Unparseable chatter is therefore
-"not the answer yet" rather than a hard failure, which is what it always
-meant.
+Also adds GET /api/otpbot/chat_tail: the last few messages in the target
+chat exactly as the automation sees them (id, direction, text). This is
+what made the bug visible - the run said "no reply", the chat tail showed
+the reply sitting there two ids above - and it turns any future "it says it
+did not answer" into something checkable instead of guessable.
 
-The parser also now accepts comma-grouped counts ("Active : 4,796"), which
-appear once the number grows and would otherwise have read as unparseable.
-
-Tests: the real reply formats are pinned (including the grouped-thousands
-case and a "Fast Add Complete!" line that must NOT parse), plus a bot that
-posts an add notice before its quota reply and must still be read
-correctly. The old unparseable-quota test asserted the now-obsolete
-behaviour and was rewritten to match what the code should do.
-
-602 tests (was 600).
+603 tests (was 602): the new one pins the newest-first contract with a
+realistic interleaved history.

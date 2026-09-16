@@ -386,8 +386,15 @@ def _parse_quota(text: str) -> int | None:
 
 
 async def _last_bot_message(target: str, *, limit: int = 5) -> dict[str, Any] | None:
+    """The most recent message FROM the bot (not from us).
+
+    read_messages returns newest-first, so the newest bot message is the
+    first non-outgoing entry. Iterating in reverse here once returned the
+    OLDEST message in the window instead, which is why a quota check could
+    sit at "no reply" while the answer was already sitting in the chat.
+    """
     messages = await get_userbot().read_messages(target, limit)
-    for message in reversed(messages):
+    for message in messages:
         if not message.get("out"):
             return message
     return None

@@ -391,6 +391,31 @@ async def test_add_fails_when_the_bot_never_answers(environment, monkeypatch):
     assert await otp_bot.get_active_files() == []
 
 
+async def test_last_bot_message_picks_the_newest_not_the_oldest(environment):
+    """Regression: read_messages returns NEWEST-first (both Telethon's
+    iter_messages and Pyrogram's get_chat_history do), but the code iterated
+    in reverse and so returned the oldest message in the window. Live, that
+    left a quota check reporting "no reply" while "Active : 50047" was
+    already sitting in the chat.
+    """
+
+    class HistoryBot:
+        async def read_messages(self, target, limit=20):
+            return [
+                {"id": 42135, "text": "Active : 50047", "out": False},
+                {"id": 42134, "text": "/myquota", "out": True},
+                {"id": 42133, "text": "Active : 51484", "out": False},
+                {"id": 42131, "text": "\u26A1 Fast Add Complete!", "out": False},
+            ]
+
+    set_userbot(HistoryBot())
+    latest = await otp_bot._last_bot_message("@PBDxbot")
+
+    assert latest is not None
+    assert latest["id"] == 42135
+    assert "50047" in latest["text"]
+
+
 async def test_quota_parser_handles_the_real_reply_formats():
     """Exact shapes seen from the live bot, including grouped thousands."""
     assert otp_bot._parse_quota("\U0001F4CA Your quota\n\nActive : 0\nLimit  : unlimited") == 0
