@@ -58,6 +58,7 @@ async def _session_snapshot(chat_id: int) -> dict[str, Any]:
     async with session_scope() as session:
         row = await repo.ensure_session(session, chat_id)
         mode, active_id, last_id = row.mode, row.active_task_id, row.last_task_id
+        thread_id = row.current_thread_id
         pending_upload = dict(row.context or {}).get("pending_upload")
 
         active_request, active_status = "", ""
@@ -73,11 +74,12 @@ async def _session_snapshot(chat_id: int) -> dict[str, Any]:
 
         turns = [
             f"{m.role}: {m.content[:200]}"
-            for m in await repo.recent_messages(session, chat_id, limit=6)
+            for m in await repo.recent_messages(session, chat_id, limit=6, thread_id=thread_id)
         ]
 
     return {
         "mode": mode,
+        "thread_id": thread_id,
         "active_task_id": active_id,
         "last_task_id": last_id,
         "active_request": active_request,
@@ -87,7 +89,9 @@ async def _session_snapshot(chat_id: int) -> dict[str, Any]:
     }
 
 
-async def chat_reply(chat_id: int, text: str, llm: Any | None = None) -> str:
+async def chat_reply(
+    chat_id: int, text: str, llm: Any | None = None, *, thread_id: str | None = None,
+) -> str:
     """One-shot conversational answer, with memory and recent turns."""
     from app.agent.learning import relevant_memories
 
@@ -95,7 +99,9 @@ async def chat_reply(chat_id: int, text: str, llm: Any | None = None) -> str:
     memories = await relevant_memories(text, limit=4)
 
     async with session_scope() as session:
-        turns = await repo.recent_messages(session, chat_id, limit=MAX_TURNS)
+        if thread_id is None:
+            thread_id = (await repo.ensure_session(session, chat_id)).current_thread_id
+        turns = await repo.recent_messages(session, chat_id, limit=MAX_TURNS, thread_id=thread_id)
 
     messages = [Message("system", CHAT_PROMPT)]
     if memories:
@@ -175,6 +181,7 @@ async def handle_message(
     """Route one message and produce the reply to send."""
     settings = get_settings()
     snapshot = await _session_snapshot(chat_id)
+    thread_id = snapshot["thread_id"]
 
     decision: Decision = await classify(
         text,
@@ -192,18 +199,18 @@ async def handle_message(
     )
 
     async with session_scope() as session:
-        await repo.add_message(session, chat_id=chat_id, role="user", content=text)
+        await repo.add_message(session, chat_id=chat_id, role="user", content=text, thread_id=thread_id)
 
     # ------------------------------------------------------------------ #
     if decision.intent is Intent.CONTROL:
         answer = await _control_reply(snapshot, chat_id)
-        await _record_reply(chat_id, answer)
+        await _record_reply(chat_id, answer, thread_id=thread_id)
         return Reply(answer, decision.intent, snapshot["active_task_id"])
 
     # ------------------------------------------------------------------ #
     if decision.intent is Intent.CHAT:
-        answer = await chat_reply(chat_id, text, llm=llm)
-        await _record_reply(chat_id, answer)
+        answer = await chat_reply(chat_id, text, llm=llm, thread_id=thread_id)
+        await _record_reply(chat_id, answer, thread_id=thread_id)
         return Reply(answer, decision.intent)
 
     # ------------------------------------------------------------------ #
@@ -256,7 +263,7 @@ async def handle_message(
                     answer = f"\U0001F504 Continuing from the last job.\nID: {target_id}"
 
         if decision.intent is Intent.FOLLOW_UP:
-            await _record_reply(chat_id, answer)
+            await _record_reply(chat_id, answer, thread_id=thread_id)
             return Reply(answer, Intent.FOLLOW_UP, target_id, created_task=True)
 
     # ------------------------------------------------------------------ #
@@ -300,13 +307,13 @@ async def handle_message(
         f"\U0001F680 On it\n\n{text[:200]}\n\n"
         f"ID: {task_id}\nI will message you when it is done."
     )
-    await _record_reply(chat_id, answer)
+    await _record_reply(chat_id, answer, thread_id=thread_id)
     log.info("task_created_from_chat", extra={"task_id": task_id, "chat_id": chat_id})
     return Reply(answer, Intent.TASK, task_id, created_task=True)
 
 
-async def _record_reply(chat_id: int, text: str) -> None:
+async def _record_reply(chat_id: int, text: str, *, thread_id: str | None = None) -> None:
     async with session_scope() as session:
-        await repo.add_message(session, chat_id=chat_id, role="assistant", content=text)
+        await repo.add_message(session, chat_id=chat_id, role="assistant", content=text, thread_id=thread_id)
         row = await repo.ensure_session(session, chat_id)
         await repo.update_session(session, chat_id, turn_count=row.turn_count + 1)

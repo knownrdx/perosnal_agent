@@ -609,11 +609,15 @@ def create_app() -> FastAPI:
         settings = get_settings()
         chat_id = settings.owner_chat_id
         if chat_id is None:
-            return {"chat_id": None, "messages": []}
+            return {"chat_id": None, "thread_id": None, "messages": []}
         async with session_scope() as session:
-            turns = await repo.recent_messages(session, chat_id, limit=min(limit, 200))
+            row = await repo.ensure_session(session, chat_id)
+            turns = await repo.recent_messages(
+                session, chat_id, limit=min(limit, 200), thread_id=row.current_thread_id
+            )
             return {
                 "chat_id": chat_id,
+                "thread_id": row.current_thread_id,
                 "messages": [
                     {
                         "role": t.role,
@@ -624,6 +628,62 @@ def create_app() -> FastAPI:
                     for t in turns
                 ],
             }
+
+    @app.get("/api/chat/threads", dependencies=[Depends(require_api_access)])
+    async def chat_threads() -> dict[str, Any]:
+        settings = get_settings()
+        chat_id = settings.owner_chat_id
+        if chat_id is None:
+            return {"count": 0, "threads": []}
+        async with session_scope() as session:
+            threads = await repo.list_threads(session, chat_id, limit=50)
+            return {
+                "count": len(threads),
+                "threads": [
+                    {
+                        "thread_id": t["thread_id"],
+                        "title": t["title"],
+                        "message_count": t["message_count"],
+                        "last_active_at": t["last_active_at"].isoformat()
+                        if t["last_active_at"] else None,
+                        "is_current": t["is_current"],
+                    }
+                    for t in threads
+                ],
+            }
+
+    @app.post("/api/chat/threads/new", dependencies=[Depends(require_api_access)])
+    async def chat_new_thread() -> dict[str, Any]:
+        """ChatGPT-style "New chat": same mechanism as Telegram's /new command.
+        The previous thread is never deleted - it stays listed in
+        GET /api/chat/threads and reachable via POST .../switch.
+        """
+        settings = get_settings()
+        chat_id = settings.owner_chat_id
+        if chat_id is None:
+            raise HTTPException(
+                status_code=503,
+                detail="no owner chat configured (set TELEGRAM_ALLOWED_USER_IDS)",
+            )
+        async with session_scope() as session:
+            new_thread_id = await repo.reset_session(session, chat_id)
+        return {"thread_id": new_thread_id}
+
+    @app.post("/api/chat/threads/{thread_id}/switch", dependencies=[Depends(require_api_access)])
+    async def chat_switch_thread(thread_id: str) -> dict[str, Any]:
+        settings = get_settings()
+        chat_id = settings.owner_chat_id
+        if chat_id is None:
+            raise HTTPException(
+                status_code=503,
+                detail="no owner chat configured (set TELEGRAM_ALLOWED_USER_IDS)",
+            )
+        async with session_scope() as session:
+            threads = await repo.list_threads(session, chat_id, limit=200)
+            if not any(t["thread_id"] == thread_id for t in threads):
+                raise HTTPException(status_code=404, detail="thread not found")
+            await repo.switch_thread(session, chat_id, thread_id)
+        return {"thread_id": thread_id}
 
     @app.post("/api/chat", dependencies=[Depends(require_api_access)])
     async def chat_send(payload: ChatRequest) -> dict[str, Any]:

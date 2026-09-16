@@ -60,6 +60,41 @@ async def create_all() -> None:
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    await _apply_schema_patches()
+
+
+# --------------------------------------------------------------------------- #
+# Lightweight schema patches
+# --------------------------------------------------------------------------- #
+# create_all() only creates whole tables that don't exist yet - it never adds a
+# column to a table that is already there. Any column added to models.py after
+# the table first existed in production needs a matching entry here, or a live
+# deploy crashes the moment it queries that column ("column does not exist").
+# No alembic in V1 (small single-user schema - see personal_ai_agent_master_
+# prompt.txt section 33), so this does the one thing a real migration tool
+# would: add missing columns, idempotently, on both Postgres and SQLite.
+_COLUMN_PATCHES: tuple[tuple[str, str, str], ...] = (
+    ("conversation", "thread_id", "VARCHAR(40) DEFAULT 'main'"),
+    ("chat_sessions", "current_thread_id", "VARCHAR(40) DEFAULT 'main'"),
+)
+
+
+async def _apply_schema_patches() -> None:
+    from sqlalchemy import text
+
+    engine = get_engine()
+    for table, column, ddl_type in _COLUMN_PATCHES:
+        # Each column gets its own transaction: on Postgres, one failed
+        # statement poisons the rest of a shared transaction ("current
+        # transaction is aborted") so a later, genuinely-needed ALTER would
+        # silently never run if they all shared one `engine.begin()` block.
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
+                )
+        except Exception:  # noqa: BLE001 - column already exists on either backend
+            pass
 
 
 async def dispose_engine() -> None:

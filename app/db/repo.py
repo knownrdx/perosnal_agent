@@ -479,23 +479,39 @@ async def memory_delete(session: AsyncSession, key: str) -> bool:
 # Conversation (short-term memory)
 # --------------------------------------------------------------------------- #
 async def add_message(
-    session: AsyncSession, *, chat_id: int, role: str, content: str, task_id: str | None = None
+    session: AsyncSession, *, chat_id: int, role: str, content: str,
+    task_id: str | None = None, thread_id: str | None = None,
 ) -> None:
     session.add(
-        Conversation(chat_id=chat_id, role=role, content=content[:8000], task_id=task_id)
+        Conversation(
+            chat_id=chat_id, role=role, content=content[:8000], task_id=task_id,
+            thread_id=thread_id or "main",
+        )
     )
 
 
-async def recent_messages(session: AsyncSession, chat_id: int, limit: int = 10) -> list[Conversation]:
+async def recent_messages(
+    session: AsyncSession, chat_id: int, limit: int = 10, *, thread_id: str | None = None,
+) -> list[Conversation]:
     """Most recent turns, oldest first.
+
+    ``thread_id=None`` (the default) matches every thread for this chat, so
+    existing callers that predate multi-thread support (e.g. the task
+    engine's cross-referencing context) keep seeing the chat's whole recent
+    history rather than being silently narrowed to just "main". Callers that
+    care about ONE conversation thread (web chat, Telegram's active thread)
+    pass the chat session's ``current_thread_id`` explicitly.
 
     Ordered by id as well as timestamp: two turns written in the same instant
     would otherwise come back in an arbitrary order, which would show the LLM a
     conversation where the answer precedes the question.
     """
+    conditions = [Conversation.chat_id == chat_id]
+    if thread_id is not None:
+        conditions.append(Conversation.thread_id == thread_id)
     stmt = (
         select(Conversation)
-        .where(Conversation.chat_id == chat_id)
+        .where(*conditions)
         .order_by(Conversation.created_at.desc(), Conversation.id.desc())
         .limit(limit)
     )
@@ -698,17 +714,99 @@ async def update_session(session: AsyncSession, chat_id: int, **values: Any) -> 
     )
 
 
-async def reset_session(session: AsyncSession, chat_id: int) -> None:
-    """Start a fresh thread: forget the active task and recent turns."""
+async def reset_session(session: AsyncSession, chat_id: int) -> str:
+    """Start a fresh conversation thread (ChatGPT-style "New Chat").
+
+    Older behaviour deleted the conversation outright; the owner asked to
+    keep full session/chat history browsable instead, so this now just
+    switches the chat onto a brand-new ``thread_id`` and clears the
+    thread-scoped state (active task, turn count, title, pending-upload
+    context). Nothing is deleted - the previous thread's messages stay
+    exactly where they are, reachable via ``list_threads``/``switch_thread``.
+
+    Returns the new thread_id.
+    """
+    new_thread = new_id()
     await session.execute(
         update(ChatSession)
         .where(ChatSession.chat_id == chat_id)
         .values(
             active_task_id=None, turn_count=0, title="", context={},
+            current_thread_id=new_thread,
             started_at=utcnow(), last_active_at=utcnow(),
         )
     )
-    await session.execute(delete(Conversation).where(Conversation.chat_id == chat_id))
+    return new_thread
+
+
+async def list_threads(session: AsyncSession, chat_id: int, limit: int = 30) -> list[dict[str, Any]]:
+    """Every conversation thread for one chat, most recently active first.
+
+    One row per distinct thread_id: its message count, the timestamp of its
+    latest message, and a title taken from its first user message (falls
+    back to "New chat" for a thread that has no messages yet, e.g. the one
+    just created by ``reset_session``).
+    """
+    summary_stmt = (
+        select(
+            Conversation.thread_id,
+            func.count(Conversation.id).label("count"),
+            func.max(Conversation.created_at).label("last_at"),
+        )
+        .where(Conversation.chat_id == chat_id)
+        .group_by(Conversation.thread_id)
+        .order_by(func.max(Conversation.created_at).desc())
+        .limit(limit)
+    )
+    summary_rows = (await session.execute(summary_stmt)).all()
+
+    row = await ensure_session(session, chat_id)
+    threads: list[dict[str, Any]] = []
+    seen_ids = set()
+    for thread_id, count, last_at in summary_rows:
+        seen_ids.add(thread_id)
+        first_stmt = (
+            select(Conversation.content)
+            .where(Conversation.chat_id == chat_id, Conversation.thread_id == thread_id,
+                   Conversation.role == "user")
+            .order_by(Conversation.created_at.asc(), Conversation.id.asc())
+            .limit(1)
+        )
+        first_message = (await session.scalars(first_stmt)).first()
+        threads.append({
+            "thread_id": thread_id,
+            "title": (first_message or "New chat")[:60],
+            "message_count": count,
+            "last_active_at": last_at,
+            "is_current": thread_id == row.current_thread_id,
+        })
+
+    # The current thread may not have any messages yet (just started with
+    # /new or the web dashboard's "New chat") - still show it, at the top.
+    if row.current_thread_id not in seen_ids:
+        threads.insert(0, {
+            "thread_id": row.current_thread_id,
+            "title": "New chat",
+            "message_count": 0,
+            "last_active_at": row.last_active_at,
+            "is_current": True,
+        })
+    return threads
+
+
+async def switch_thread(session: AsyncSession, chat_id: int, thread_id: str) -> None:
+    """Make ``thread_id`` the chat's active thread without touching its history."""
+    row = await ensure_session(session, chat_id)
+    await session.execute(
+        update(ChatSession)
+        .where(ChatSession.chat_id == chat_id)
+        .values(
+            current_thread_id=thread_id, active_task_id=None, turn_count=0,
+            title="", context={k: v for k, v in dict(row.context or {}).items()
+                                if k != "pending_upload"},
+            last_active_at=utcnow(),
+        )
+    )
 
 
 async def latest_task_for_chat(session: AsyncSession, chat_id: int) -> Task | None:

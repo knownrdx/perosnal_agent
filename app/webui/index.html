@@ -249,10 +249,64 @@
   }
 
   /* ---------- chat panel ---------- */
-  #chat-panel-wrap {
+  #chat-layout {
+    display: flex;
+    gap: 12px;
+    height: calc(100vh - 110px);
+  }
+
+  #chat-threads-sidebar {
+    width: 220px;
+    flex-shrink: 0;
     display: flex;
     flex-direction: column;
-    height: calc(100vh - 110px);
+    gap: 8px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    overflow-y: auto;
+  }
+
+  #chat-threads-sidebar #chat-new-btn { width: 100%; }
+
+  .thread-item {
+    padding: 8px 9px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 12.5px;
+    line-height: 1.35;
+    border: 1px solid transparent;
+  }
+
+  .thread-item:hover { background: rgba(63, 167, 179, 0.08); }
+
+  .thread-item.current {
+    background: rgba(63, 167, 179, 0.14);
+    border-color: var(--accent);
+  }
+
+  .thread-item .thread-title {
+    display: block;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .thread-item .thread-meta {
+    display: block;
+    color: var(--text-dim);
+    font-size: 10.5px;
+    margin-top: 2px;
+  }
+
+  #chat-panel-wrap {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 6px;
@@ -533,6 +587,10 @@
     #topbar { padding: 10px 12px; }
 
     table, thead, tbody, th, td, tr { font-size: 12.5px; }
+
+    #chat-layout { flex-direction: column; height: auto; }
+    #chat-threads-sidebar { width: 100%; max-height: 160px; }
+    #chat-panel-wrap { height: 60vh; }
   }
 </style>
 </head>
@@ -594,23 +652,29 @@
 
           <!-- ===================== CHAT PANEL ===================== -->
           <div class="panel active" id="panel-chat">
-            <div id="chat-panel-wrap">
-              <div id="chat-messages">
-                <div id="chat-empty">Say something. I remember everything you and I have talked about here and on Telegram - one shared conversation.</div>
-                <div id="chat-typing">Thinking...</div>
+            <div id="chat-layout">
+              <div id="chat-threads-sidebar">
+                <button type="button" class="primary" id="chat-new-btn">+ New chat</button>
+                <div id="chat-threads-list">Loading...</div>
               </div>
-              <form id="chat-form" autocomplete="off">
-                <div id="chat-pending-file">
-                  <span id="chat-pending-file-name"></span>
-                  <button type="button" id="chat-pending-file-clear">Remove</button>
+              <div id="chat-panel-wrap">
+                <div id="chat-messages">
+                  <div id="chat-empty">Say something. I remember everything you and I have talked about here and on Telegram - one shared conversation.</div>
+                  <div id="chat-typing">Thinking...</div>
                 </div>
-                <div id="chat-input-row">
-                  <input type="file" id="chat-file-input" style="display:none;">
-                  <button type="button" id="chat-attach-btn" title="Attach a file">📎</button>
-                  <textarea id="chat-input" rows="1" placeholder="Message the agent..." required></textarea>
-                  <button type="submit" class="primary" id="chat-send-btn">Send</button>
-                </div>
-              </form>
+                <form id="chat-form" autocomplete="off">
+                  <div id="chat-pending-file">
+                    <span id="chat-pending-file-name"></span>
+                    <button type="button" id="chat-pending-file-clear">Remove</button>
+                  </div>
+                  <div id="chat-input-row">
+                    <input type="file" id="chat-file-input" style="display:none;">
+                    <button type="button" id="chat-attach-btn" title="Attach a file">📎</button>
+                    <textarea id="chat-input" rows="1" placeholder="Message the agent..." required></textarea>
+                    <button type="submit" class="primary" id="chat-send-btn">Send</button>
+                  </div>
+                </form>
+              </div>
             </div>
           </div>
 
@@ -1126,6 +1190,80 @@
       })
       .catch(function () { /* banner already shown by apiFetch */ });
     checkPendingUpload();
+    loadThreads();
+  }
+
+  function relativeTimeOrNow(iso) {
+    return iso ? relativeTime(iso) : "just now";
+  }
+
+  function loadThreads() {
+    apiFetchJson("/api/chat/threads")
+      .then(function (data) {
+        renderThreads((data && data.threads) || []);
+      })
+      .catch(function () { /* banner already shown by apiFetch */ });
+  }
+
+  function renderThreads(threads) {
+    var container = qs("#chat-threads-list");
+    if (!threads.length) {
+      container.innerHTML = "";
+      var empty = document.createElement("div");
+      empty.className = "small";
+      empty.style.color = "var(--text-dim)";
+      empty.textContent = "No conversations yet.";
+      container.appendChild(empty);
+      return;
+    }
+    container.innerHTML = "";
+    threads.forEach(function (t) {
+      var item = document.createElement("div");
+      item.className = "thread-item" + (t.is_current ? " current" : "");
+      item.setAttribute("data-thread-id", t.thread_id);
+
+      var title = document.createElement("span");
+      title.className = "thread-title";
+      title.textContent = t.title || "New chat";
+      item.appendChild(title);
+
+      var meta = document.createElement("span");
+      meta.className = "thread-meta";
+      meta.textContent = t.message_count + " msgs \u00B7 " + relativeTimeOrNow(t.last_active_at);
+      item.appendChild(meta);
+
+      if (!t.is_current) {
+        item.addEventListener("click", function () { switchThread(t.thread_id); });
+      }
+      container.appendChild(item);
+    });
+  }
+
+  function switchThread(threadId) {
+    apiFetch("/api/chat/threads/" + encodeURIComponent(threadId) + "/switch", { method: "POST" })
+      .then(function (res) {
+        if (!res.ok) throw new Error("switch failed");
+        return renderFreshThread();
+      })
+      .catch(function () { /* banner already shown by apiFetch */ });
+  }
+
+  function startNewChat() {
+    apiFetch("/api/chat/threads/new", { method: "POST" })
+      .then(function (res) {
+        if (!res.ok) throw new Error("new chat failed");
+        return renderFreshThread();
+      })
+      .catch(function () { /* banner already shown by apiFetch */ });
+  }
+
+  function renderFreshThread() {
+    // Clear the message list and reload from scratch for the now-current thread.
+    qsa(".chat-bubble", qs("#chat-messages")).forEach(function (el) { el.remove(); });
+    qs("#chat-empty").style.display = "block";
+    hidePendingFile();
+    chatHistoryLoaded = false;
+    loadChatHistory();
   }
 
   function handleChatSubmit(evt) {
@@ -1150,6 +1288,7 @@
       .then(function (data) {
         appendChatBubble("assistant", data.reply, new Date().toISOString());
         hidePendingFile();
+        loadThreads();
       })
       .catch(function (e) {
         if (!e || e.status !== 401) {
@@ -1906,6 +2045,8 @@
         .then(function () { hidePendingFile(); })
         .catch(function () { /* banner already shown by apiFetch */ });
     });
+
+    qs("#chat-new-btn").addEventListener("click", startNewChat);
 
     qsa(".nav-item").forEach(function (btn) {
       btn.addEventListener("click", function () {

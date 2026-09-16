@@ -37,6 +37,7 @@ Commands:
 /start   - check that the agent is alive
 /help    - this message
 /new     - start a fresh conversation
+/history - list/switch past conversations
 /mode    - auto | chat | task
 /session - what this conversation is about
 /status  - system status (workers, db, llm, resources)
@@ -460,16 +461,57 @@ class AgentBot:
 
         @dp.message(Command("new"))
         async def _new(message: Message) -> None:
-            """Start a fresh conversation thread."""
+            # Start a fresh conversation thread. Old threads stay saved -
+            # see /history to list and switch back to any of them.
             if not await self._guard(message):
                 return
             async with session_scope() as session:
                 await repo.ensure_session(session, message.chat.id)
                 await repo.reset_session(session, message.chat.id)
             await message.answer(
-                "\U0001F195 Fresh start. I have cleared this conversation's context.\n"
-                "(Your tasks and memory are untouched.)"
+                "\U0001F195 New chat started.\n"
+                "(Your previous conversation is saved - see /history. "
+                "Tasks and memory are untouched.)"
             )
+
+        @dp.message(Command("history"))
+        async def _history(message: Message, command: CommandObject) -> None:
+            # List past conversation threads, or switch to one: /history <id>.
+            if not await self._guard(message):
+                return
+            arg = (command.args or "").strip()
+            async with session_scope() as session:
+                if arg:
+                    threads = await repo.list_threads(session, message.chat.id, limit=100)
+                    match = next(
+                        (t for t in threads if t["thread_id"].startswith(arg)), None
+                    )
+                    if match is None:
+                        await message.answer(
+                            f"\u274C No saved thread starts with '{arg}'. Send /history to list them."
+                        )
+                        return
+                    await repo.switch_thread(session, message.chat.id, match["thread_id"])
+                    await message.answer(
+                        f"\U0001F4AC Switched to: {match['title']}\n"
+                        f"({match['message_count']} messages)"
+                    )
+                    return
+
+                threads = await repo.list_threads(session, message.chat.id, limit=15)
+
+            if not threads:
+                await message.answer("No conversation history yet.")
+                return
+            lines = ["\U0001F4DA Recent conversations:", ""]
+            for t in threads:
+                marker = "\u25B6\uFE0F " if t["is_current"] else "   "
+                lines.append(
+                    f"{marker}{t['thread_id'][:8]} - {t['title']} "
+                    f"({t['message_count']} msgs)"
+                )
+            lines += ["", "/history <id> to switch back to one", "/new to start another"]
+            await message.answer("\n".join(lines))
 
         @dp.message(Command("mode"))
         async def _mode(message: Message, command: CommandObject) -> None:

@@ -166,7 +166,7 @@ def test_chat_send_and_history(client, monkeypatch):
     async def fake_classify(*args, **kwargs):
         return Decision(Intent.CHAT, "test")
 
-    async def fake_chat_reply(chat_id, text, llm=None):
+    async def fake_chat_reply(chat_id, text, llm=None, thread_id=None):
         return f"echo: {text}"
 
     monkeypatch.setattr("app.agent.conversation.classify", fake_classify)
@@ -201,7 +201,7 @@ def test_chat_works_with_cookie_only(client, monkeypatch):
     async def fake_classify(*args, **kwargs):
         return Decision(Intent.CHAT, "test")
 
-    async def fake_chat_reply(chat_id, text, llm=None):
+    async def fake_chat_reply(chat_id, text, llm=None, thread_id=None):
         return "hi from the cookie session"
 
     monkeypatch.setattr("app.agent.conversation.classify", fake_classify)
@@ -250,3 +250,58 @@ def test_chat_upload_requires_auth(client):
     files = {"file": ("x.txt", b"data", "text/plain")}
     assert client.post("/api/chat/upload", files=files).status_code == 401
     assert client.get("/api/chat/pending_upload").status_code == 401
+
+
+def test_chat_threads_new_and_switch(client, monkeypatch):
+    """New chat / thread switch mirrors Telegram's /new and /history commands."""
+    headers = {"X-API-Token": "test-api-token"}
+
+    from app.agent.router import Decision, Intent
+
+    async def fake_classify(*args, **kwargs):
+        return Decision(Intent.CHAT, "test")
+
+    async def fake_chat_reply(chat_id, text, llm=None, thread_id=None):
+        return f"echo: {text}"
+
+    monkeypatch.setattr("app.agent.conversation.classify", fake_classify)
+    monkeypatch.setattr("app.agent.conversation.chat_reply", fake_chat_reply)
+
+    first = client.post("/api/chat", json={"message": "first thread message"}, headers=headers)
+    assert first.status_code == 200
+
+    threads_before = client.get("/api/chat/threads", headers=headers).json()
+    assert threads_before["count"] == 1
+    first_thread_id = threads_before["threads"][0]["thread_id"]
+
+    new_thread = client.post("/api/chat/threads/new", headers=headers)
+    assert new_thread.status_code == 200
+    second_thread_id = new_thread.json()["thread_id"]
+    assert second_thread_id != first_thread_id
+
+    # New thread's history is empty; nothing from the old thread leaked in.
+    history = client.get("/api/chat/history", headers=headers).json()
+    assert history["thread_id"] == second_thread_id
+    assert history["messages"] == []
+
+    threads_after = client.get("/api/chat/threads", headers=headers).json()
+    assert threads_after["count"] == 2
+    current = next(t for t in threads_after["threads"] if t["is_current"])
+    assert current["thread_id"] == second_thread_id
+
+    # Switch back to the first thread - its history is untouched.
+    switched = client.post(f"/api/chat/threads/{first_thread_id}/switch", headers=headers)
+    assert switched.status_code == 200
+    history_back = client.get("/api/chat/history", headers=headers).json()
+    assert history_back["thread_id"] == first_thread_id
+    assert len(history_back["messages"]) == 2  # user + assistant from the first send
+
+    assert client.post(
+        "/api/chat/threads/does-not-exist/switch", headers=headers
+    ).status_code == 404
+
+
+def test_chat_threads_require_auth(client):
+    assert client.get("/api/chat/threads").status_code == 401
+    assert client.post("/api/chat/threads/new").status_code == 401
+    assert client.post("/api/chat/threads/x/switch").status_code == 401

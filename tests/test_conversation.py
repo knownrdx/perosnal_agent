@@ -273,13 +273,18 @@ async def test_reset_clears_thread_but_keeps_tasks(environment, echo_llm):
     created = await handle_message(CHAT_ID, USER_ID, "build the report", llm=echo_llm)
 
     async with session_scope() as session:
-        await repo.reset_session(session, CHAT_ID)
+        old_thread_id = (await repo.ensure_session(session, CHAT_ID)).current_thread_id
+        new_thread_id = await repo.reset_session(session, CHAT_ID)
         row = await repo.get_session(session, CHAT_ID)
-        turns = await repo.recent_messages(session, CHAT_ID, limit=10)
+        # The NEW thread has no messages yet - old_thread_id's history is untouched.
+        turns = await repo.recent_messages(session, CHAT_ID, limit=10, thread_id=new_thread_id)
+        old_turns = await repo.recent_messages(session, CHAT_ID, limit=10, thread_id=old_thread_id)
         task = await repo.get_task(session, created.task_id)
 
     assert row.active_task_id is None
+    assert new_thread_id != old_thread_id
     assert turns == []
+    assert len(old_turns) == 2, "the owner asked to keep full session history, not delete it"
     assert task is not None, "/new must not delete work"
 
 

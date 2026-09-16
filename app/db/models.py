@@ -332,6 +332,7 @@ class ChatSession(Base):
     mode: Mapped[str] = mapped_column(String(16), default="auto")
     active_task_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     last_task_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    current_thread_id: Mapped[str] = mapped_column(String(40), default="main")
     turn_count: Mapped[int] = mapped_column(Integer, default=0)
     context: Mapped[dict] = mapped_column(JSON, default=dict)
     started_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
@@ -380,12 +381,19 @@ class InboundMessage(Base):
 
 
 class Conversation(Base):
-    """Short-term memory: recent chat turns per Telegram chat."""
+    """Short-term memory: recent chat turns per Telegram chat.
+
+    ``thread_id`` partitions a chat_id's history into separate conversation
+    threads (ChatGPT-style "New Chat"). Every existing row before this field
+    was added belongs to the implicit "main" thread. A message is never
+    deleted when a new thread starts - old threads stay fully readable.
+    """
 
     __tablename__ = "conversation"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    thread_id: Mapped[str] = mapped_column(String(40), default="main", index=True)
     role: Mapped[str] = mapped_column(String(16))
     content: Mapped[str] = mapped_column(Text)
     task_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
