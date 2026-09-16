@@ -89,6 +89,39 @@ async def test_config_roundtrip(environment):
     assert reloaded["interval_minutes"] == 15
 
 
+async def test_sleep_helper_actually_sleeps_and_does_not_recurse():
+    """Regression: _sleep once called itself, so every real run died with
+    "maximum recursion depth exceeded". The autouse fixture monkeypatches
+    _sleep away, so this test reloads a clean copy of the module to get the
+    REAL one - otherwise the whole suite can pass while production is
+    completely broken.
+    """
+    import importlib
+    import time
+
+    pristine = importlib.reload(importlib.import_module("app.automation.otp_bot"))
+    started = time.monotonic()
+    await pristine._sleep(0.02)
+    assert time.monotonic() - started >= 0.01
+
+
+async def test_start_reports_a_crash_as_a_crash_not_a_bot_rejection(environment, monkeypatch):
+    """A genuine exception must not be mislabelled as "the bot rejected it"."""
+    rel = await _write_numbers_file("numbers_BD.txt")
+    await otp_bot.enqueue_file(rel, "numbers_BD.txt")
+
+    class ExplodingUserbot:
+        async def send_message(self, *args, **kwargs):
+            raise ValueError("something genuinely broke")
+
+    set_userbot(ExplodingUserbot())
+    result = await otp_bot.start_automation()
+
+    assert result["ok"] is False
+    assert "unexpected error (ValueError)" in result["error"]
+    assert "rejected" not in result["error"]
+
+
 # --------------------------------------------------------------------------- #
 # Dedicated chat thread - answers "where do I send the files?" structurally
 # --------------------------------------------------------------------------- #

@@ -98,8 +98,13 @@ async def _sleep(seconds: float) -> None:
     """Thin wrapper around asyncio.sleep so tests can monkeypatch it to zero -
     the real delays exist only to give the target bot time to reply before we
     read its messages back.
+
+    NOTE: this must call asyncio.sleep, never _sleep - an earlier bulk rename
+    of asyncio.sleep -> _sleep rewrote this body too and made the function
+    infinitely recursive. Tests monkeypatch _sleep, so only production hit it,
+    surfacing as a bare "maximum recursion depth exceeded" with no traceback.
     """
-    await _sleep(seconds)
+    await asyncio.sleep(seconds)
 
 
 @dataclass(slots=True)
@@ -350,6 +355,17 @@ async def set_awaiting_tag_entry(entry_id: str | None) -> None:
     await save_config({"awaiting_tag_entry_id": entry_id})
 
 
+class AddRejected(Exception):
+    """The target bot's own reply says the add did not work.
+
+    A distinct type rather than RuntimeError: RecursionError, ValueError and
+    friends all subclass Exception too, and catching a broad built-in here
+    once caused a real crash (infinite recursion in _sleep) to be reported to
+    the owner as "the bot rejected your file", sending the investigation in
+    completely the wrong direction.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # Helpers shared by start() and the periodic refill cycle
 # --------------------------------------------------------------------------- #
@@ -389,7 +405,7 @@ async def _add_one_file(target: str, entry: dict[str, Any], cfg: dict[str, Any])
     reply = await _last_bot_message(target)
     text = reply["text"] if reply else ""
     if text and _looks_like_failure(text):
-        raise RuntimeError(f"{entry['name']}: bot rejected the add ({text[:200]})")
+        raise AddRejected(f"{entry['name']}: bot rejected the add ({text[:200]})")
     return text
 
 
@@ -436,11 +452,15 @@ async def start_automation() -> dict[str, Any]:
         result["error"] = f"telegram account not linked or errored: {exc}"
     except FileNotFoundError as exc:
         result["error"] = str(exc)
-    except RuntimeError as exc:
+    except AddRejected as exc:
         result["error"] = str(exc)
     except Exception as exc:  # noqa: BLE001 - start() must never crash the caller
+        # log.exception keeps the real traceback in the container logs; the
+        # owner-facing string alone is not enough to debug a crash like the
+        # recursive-_sleep one, which read simply as "maximum recursion depth
+        # exceeded" with no indication of where.
         log.exception("otp_bot_start_error")
-        result["error"] = f"unexpected error: {exc}"
+        result["error"] = f"unexpected error ({type(exc).__name__}): {exc}"
 
     async with session_scope() as session:
         await repo.set_setting(session, LAST_START_KEY, result)
@@ -672,6 +692,6 @@ async def run_cycle(config: dict[str, Any] | None = None) -> CycleResult:
         return result
     except Exception as exc:  # noqa: BLE001 - a cycle must never crash the runner
         log.exception("otp_bot_cycle_error")
-        result.error = f"unexpected error: {exc}"
+        result.error = f"unexpected error ({type(exc).__name__}): {exc}"
         await _save_last_result(result)
         return result
