@@ -196,3 +196,96 @@ async def test_history_is_rebuilt_after_restart(environment, echo_llm):
 
     history = await AgentEngine(llm=echo_llm)._load_history(task_id)
     assert history and "file_write" in history[0]
+
+
+# --------------------------------------------------------------------------- #
+# Persistent retries (B)
+# --------------------------------------------------------------------------- #
+async def test_temporary_failure_retries_past_old_max_retries_ceiling(environment, echo_llm):
+    """With task_persist_forever on, retry_count alone must not stop retries."""
+    from app.db.models import FailureKind
+
+    task_id = await _create_task("flaky job")
+    async with session_scope() as session:
+        await repo.update_task(session, task_id, max_retries=2, retry_count=5)
+
+    engine = AgentEngine(llm=echo_llm)
+    await engine._fail(task_id, "temporary network blip", FailureKind.TEMPORARY)
+
+    async with session_scope() as session:
+        task = await repo.get_task(session, task_id)
+    assert task.status == TaskStatus.PENDING.value, (
+        "a TEMPORARY failure must keep requeueing past the old max_retries=2 "
+        "ceiling when task_persist_forever is true"
+    )
+    assert task.retry_count == 6
+    assert task.run_after is not None
+
+
+async def test_temporary_failure_stops_when_persist_forever_disabled(environment, echo_llm, monkeypatch):
+    from app.config import reload_settings
+    from app.db.models import FailureKind
+
+    monkeypatch.setenv("TASK_PERSIST_FOREVER", "false")
+    reload_settings()
+
+    task_id = await _create_task("flaky job, bounded")
+    async with session_scope() as session:
+        await repo.update_task(session, task_id, max_retries=2, retry_count=2)
+
+    engine = AgentEngine(llm=echo_llm)
+    await engine._fail(task_id, "temporary network blip", FailureKind.TEMPORARY)
+
+    async with session_scope() as session:
+        task = await repo.get_task(session, task_id)
+    assert task.status == TaskStatus.FAILED.value, (
+        "with task_persist_forever off, retry_count >= max_retries must still stop"
+    )
+
+
+async def test_permanent_failure_never_retries_even_with_persist_forever(environment, echo_llm):
+    from app.db.models import FailureKind
+
+    task_id = await _create_task("doomed job")
+    engine = AgentEngine(llm=echo_llm)
+    await engine._fail(task_id, "invalid credentials", FailureKind.PERMANENT)
+
+    async with session_scope() as session:
+        task = await repo.get_task(session, task_id)
+    assert task.status == TaskStatus.FAILED.value
+    assert task.retry_count == 0
+
+
+@pytest.mark.parametrize(
+    "kind_name",
+    ["USER_ACTION_REQUIRED", "AUTH", "INVALID_INPUT"],
+)
+async def test_never_retry_kinds_stop_immediately(environment, echo_llm, kind_name):
+    from app.db.models import FailureKind
+
+    task_id = await _create_task(f"job failing with {kind_name}")
+    engine = AgentEngine(llm=echo_llm)
+    await engine._fail(task_id, "cannot proceed", FailureKind[kind_name])
+
+    async with session_scope() as session:
+        task = await repo.get_task(session, task_id)
+    assert task.status == TaskStatus.FAILED.value
+
+
+async def test_retry_backoff_is_capped_at_thirty_minutes(environment, echo_llm):
+    from datetime import timedelta
+
+    from app.db.models import FailureKind, utcnow
+
+    task_id = await _create_task("very persistent flaky job")
+    async with session_scope() as session:
+        await repo.update_task(session, task_id, retry_count=20)
+
+    engine = AgentEngine(llm=echo_llm)
+    before = utcnow()
+    await engine._fail(task_id, "still failing", FailureKind.TEMPORARY)
+
+    async with session_scope() as session:
+        task = await repo.get_task(session, task_id)
+    delay = (task.run_after - before).total_seconds()
+    assert 1750 <= delay <= 1810, "backoff must be capped around 1800s (30 min)"

@@ -6,10 +6,12 @@
 //	GET  /health              liveness
 //	GET  /status              connected / logged in / own JID
 //	POST /login/qr            start pairing, return the QR code (ASCII + raw)
+//	POST /login/phone         {"phone"} -> pairing code (link w/o QR scan)
 //	POST /logout              drop the session
 //	POST /send/text           {"to","text"}            -> message_id
 //	POST /send/file           {"to","path","caption"}  -> message_id
 //	GET  /messages?limit=&since=  recent inbound messages
+//	GET  /contacts            paired account's contact list
 //
 // Inbound messages are pushed to the agent's webhook and also kept in a small
 // in-memory ring buffer so the agent can poll after a restart.
@@ -42,6 +44,8 @@ import (
 	"github.com/skip2/go-qrcode"
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -55,6 +59,20 @@ const (
 	maxInboundBuffer = 200
 	maxMediaBytes    = 64 << 20 // 64 MB
 )
+
+// init spoofs the linked-device identity as a real Android phone instead of
+// the whatsmeow library default (OS name "whatsmeow", platform UNKNOWN,
+// which shows up as a generic/desktop browser entry in Linked Devices and
+// is an easy signal for WhatsApp's anti-automation heuristics). This must
+// run before any whatsmeow.Client is created / connects, since the QR and
+// phone-pairing flows both read these package-level store globals.
+func init() {
+	// Android major.minor.patch reported in the client payload; 13.0.0 is a
+	// realistic, still-common baseline for a OnePlus 11 (ColorOS/OxygenOS 13).
+	store.SetOSInfo("OnePlus 11", [3]uint32{13, 0, 0})
+	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_ANDROID_PHONE.Enum()
+	store.DeviceProps.RequireFullSync = proto.Bool(false)
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -488,6 +506,59 @@ func (b *bridge) safePath(rel string) (string, error) {
 	return resolved, nil
 }
 
+// pairPhone requests a pairing code for linking without scanning a QR code.
+// The client must already be connected (see connect()); WhatsApp closes the
+// pairing window ~160s after the underlying websocket connects.
+func (b *bridge) pairPhone(phone string) (string, error) {
+	phone = strings.TrimSpace(phone)
+	if phone == "" {
+		return "", errors.New("empty phone number")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// PairClientAndroid matches the Android-phone identity spoofed in init().
+	code, err := b.client.PairPhone(ctx, phone, true, whatsmeow.PairClientAndroid, "AI Agent Bridge")
+	if err != nil {
+		return "", err
+	}
+	return code, nil
+}
+
+// contactRecord is the JSON shape returned by GET /contacts.
+type contactRecord struct {
+	JID      string `json:"jid"`
+	Phone    string `json:"phone"`
+	Name     string `json:"name"`
+	PushName string `json:"push_name"`
+}
+
+// listContacts returns every contact cached in the local session store.
+func (b *bridge) listContacts() ([]contactRecord, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	all, err := b.client.Store.Contacts.GetAllContacts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]contactRecord, 0, len(all))
+	for jid, info := range all {
+		name := info.FullName
+		if name == "" {
+			name = info.FirstName
+		}
+		if name == "" {
+			name = info.BusinessName
+		}
+		out = append(out, contactRecord{
+			JID:      jid.String(),
+			Phone:    jid.User,
+			Name:     name,
+			PushName: info.PushName,
+		})
+	}
+	return out, nil
+}
+
 // ---------------------------------------------------------------------------
 // HTTP API
 // ---------------------------------------------------------------------------
@@ -584,6 +655,54 @@ func (b *bridge) routes() http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"logged_out": true})
+	}))
+
+	// Phone-number pairing: an alternative to scanning the QR code. The
+	// caller types the returned code into WhatsApp > Linked Devices >
+	// Link with phone number instead.
+	mux.HandleFunc("/login/phone", b.auth(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Phone string `json:"phone"`
+		}
+		if !decode(w, r, &body) {
+			return
+		}
+		if b.client.IsLoggedIn() {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"logged_in": true, "message": "already paired",
+			})
+			return
+		}
+		if !b.client.IsConnected() {
+			if err := b.connect(); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			time.Sleep(1 * time.Second) // let the websocket settle before pairing
+		}
+		code, err := b.pairPhone(body.Phone)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"logged_in": false,
+			"phone":     body.Phone,
+			"code":      code,
+		})
+	}))
+
+	mux.HandleFunc("/contacts", b.auth(func(w http.ResponseWriter, r *http.Request) {
+		if !b.client.IsLoggedIn() {
+			writeError(w, http.StatusServiceUnavailable, "whatsapp is not linked; use /login/qr")
+			return
+		}
+		contacts, err := b.listContacts()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"count": len(contacts), "contacts": contacts})
 	}))
 
 	mux.HandleFunc("/send/text", b.auth(func(w http.ResponseWriter, r *http.Request) {

@@ -323,15 +323,31 @@ class AgentEngine:
         await self._learn(task_id)
 
     async def _fail(self, task_id: str, error: str, kind: FailureKind) -> None:
+        settings = get_settings()
         async with session_scope() as session:
             task = await repo.get_task(session, task_id)
+            never_retry = {
+                FailureKind.PERMANENT,
+                FailureKind.USER_ACTION_REQUIRED,
+                FailureKind.AUTH,
+                FailureKind.INVALID_INPUT,
+            }
             retriable = (
                 kind is FailureKind.TEMPORARY
+                and kind not in never_retry
                 and task is not None
-                and task.retry_count < task.max_retries
+                and (
+                    settings.task_persist_forever
+                    or task.retry_count < task.max_retries
+                )
             )
             if retriable:
-                await repo.requeue_task(session, task_id, delay_s=30 * (task.retry_count + 1))
+                # Exponential backoff, capped so a long-stuck task still
+                # gets retried roughly every 30 minutes instead of storming
+                # or being abandoned; retry_count itself is not a stop
+                # condition when task_persist_forever is on.
+                delay_s = min(30 * (2 ** task.retry_count), 1800)
+                await repo.requeue_task(session, task_id, delay_s=delay_s)
                 await repo.log_event(session, "task_retry", task_id=task_id,
                                      level="WARNING", data={"error": error[:500]})
                 log.warning("task_retry", extra={"task_id": task_id, "error": error[:300]})
@@ -391,10 +407,12 @@ class AgentEngine:
         if not get_settings().learning_enabled:
             return
         from app.agent.learning import learn_from_failures, reflect_on_task
+        from app.agent.skills import synthesize_skills
 
         try:
             await reflect_on_task(task_id, llm=self.llm)
             await learn_from_failures()
+            await synthesize_skills(llm=self.llm)
         except Exception as exc:  # noqa: BLE001
             log.warning("learning_failed", extra={"task_id": task_id, "error": str(exc)[:200]})
 

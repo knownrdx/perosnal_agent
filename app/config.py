@@ -93,6 +93,7 @@ class Settings(BaseSettings):
     worker_poll_interval_s: float = 2.0
     scheduler_poll_interval_s: float = 10.0
     max_task_retries: int = 2
+    task_persist_forever: bool = True
     tool_default_timeout_s: int = 120
 
     # --- safety -----------------------------------------------------------

@@ -10,6 +10,8 @@ aiogram>=3.13
 croniter>=3.0
 cryptography>=43.0
 telethon>=1.36
+pyrogram>=2.0
+tgcrypto>=1.2
 psutil>=6.0
 
 # Document reading (PDF / Word / Excel). Pure-python wheels, no compiler.

@@ -8,6 +8,7 @@ from app.integrations.telegram_user import (
     API_HASH_KEY,
     API_ID_KEY,
     SESSION_KEY,
+    TELEGRAM_USER_BACKEND_KEY,
     TelegramUserbot,
     TwoFactorRequired,
     UserbotError,
@@ -280,3 +281,273 @@ async def test_bot_admin_requires_slash_command(environment, vault):
         {"command": "mybots"}, ToolContext()
     )
     assert not result.ok and "start" in result.error
+
+
+# --------------------------------------------------------------------------- #
+# Pyrogram backend
+# --------------------------------------------------------------------------- #
+def _pyrogram_available() -> bool:
+    from app.integrations.telegram_user import PYROGRAM_AVAILABLE
+
+    return PYROGRAM_AVAILABLE
+
+
+pyrogram_only = pytest.mark.skipif(
+    not _pyrogram_available(), reason="pyrogram is not installed in this environment"
+)
+
+
+class FakePyroUser:
+    id = 900123
+    username = "owner_pg"
+    first_name = "Arif"
+    last_name = ""
+    phone_number = "8801799999999"
+
+
+class FakePyroChat:
+    def __init__(self, chat_id, title="", username="", first_name="", last_name="", chat_type="private"):
+        self.id = chat_id
+        self.title = title
+        self.username = username
+        self.first_name = first_name
+        self.last_name = last_name
+        self.type = chat_type
+
+
+class FakePyroDialog:
+    def __init__(self, chat, unread=0):
+        self.chat = chat
+        self.unread_messages_count = unread
+
+
+class FakePyroMessage:
+    def __init__(self, msg_id, text="", chat=None, from_user=None, date=None, outgoing=False):
+        self.id = msg_id
+        self.text = text
+        self.caption = ""
+        self.chat = chat
+        self.from_user = from_user
+        self.date = date
+        self.outgoing = outgoing
+
+
+class FakePyrogramClient:
+    """Stands in for pyrogram.Client."""
+
+    def __init__(self, name=None, session_string=None, api_id=None, api_hash=None, in_memory=None, **kwargs):
+        self.name = name
+        self.session_string = session_string or "PYRO-SESSION-STRING-XYZ"
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.in_memory = in_memory
+        self._is_connected = False
+        self.sent: list[tuple] = []
+        self.sent_documents: list[tuple] = []
+        self.logged_out = False
+        self.reject_start = False
+
+    @property
+    def is_connected(self):
+        return self._is_connected
+
+    async def start(self):
+        if self.reject_start:
+            raise RuntimeError("AUTH_KEY_UNREGISTERED")
+        self._is_connected = True
+
+    async def stop(self, block: bool = True):
+        self._is_connected = False
+
+    async def get_me(self):
+        return FakePyroUser()
+
+    async def send_message(self, chat_id, text):
+        self.sent.append((chat_id, text))
+
+        class Msg:
+            id = 5151
+
+        return Msg()
+
+    async def send_document(self, chat_id, document, caption=""):
+        self.sent_documents.append((chat_id, document, caption))
+
+        class Msg:
+            id = 6161
+
+        return Msg()
+
+    async def get_chat_history(self, chat_id, limit=0):
+        for msg in [
+            FakePyroMessage(1, text="hello", from_user=FakePyroUser(), outgoing=False),
+            FakePyroMessage(2, text="world", from_user=FakePyroUser(), outgoing=True),
+        ][:limit or None]:
+            yield msg
+
+    async def get_dialogs(self, limit=0):
+        dialogs = [
+            FakePyroDialog(FakePyroChat(1, title="Group A", chat_type="group"), unread=3),
+            FakePyroDialog(FakePyroChat(2, username="bob", first_name="Bob", chat_type="private"), unread=0),
+        ]
+        for d in dialogs[: limit or None]:
+            yield d
+
+    async def search_global(self, query, limit=0):
+        yield FakePyroMessage(9, text="found it", chat=FakePyroChat(1, title="Group A"))
+
+    async def log_out(self):
+        self.logged_out = True
+        return True
+
+
+def _no_telethon_match(*args, **kwargs):
+    raise RuntimeError("not a valid telethon string")
+
+
+async def test_link_string_session_falls_back_to_pyrogram(vault, monkeypatch):
+    monkeypatch.setattr(
+        "app.integrations.telegram_user.TelegramClient", _no_telethon_match
+    )
+    fake = FakePyrogramClient()
+    monkeypatch.setattr(
+        "app.integrations.telegram_user.PyrogramClient", lambda **kw: fake
+    )
+
+    userbot = TelegramUserbot()
+    pasted_string = "PYRO-SESSION-STRING-XYZ" + "0" * 30
+    result = await userbot.link_string_session(pasted_string, api_id=123, api_hash="hash")
+    assert result["linked"] is True
+    assert result["method"] == "string_session"
+    assert result["user_id"] == FakePyroUser.id
+    assert vault.get(TELEGRAM_USER_BACKEND_KEY) == "pyrogram"
+    assert vault.get(SESSION_KEY) == pasted_string
+
+
+async def test_link_string_session_raises_when_both_backends_reject(vault, monkeypatch):
+    monkeypatch.setattr(
+        "app.integrations.telegram_user.TelegramClient", _no_telethon_match
+    )
+
+    class RejectingPyrogram(FakePyrogramClient):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.reject_start = True
+
+    monkeypatch.setattr(
+        "app.integrations.telegram_user.PyrogramClient", lambda **kw: RejectingPyrogram(**kw)
+    )
+
+    userbot = TelegramUserbot()
+    with pytest.raises(UserbotError, match="not recognised"):
+        await userbot.link_string_session(
+            "NOT-A-VALID-STRING" + "0" * 30, api_id=123, api_hash="hash"
+        )
+
+
+async def test_pyrogram_backend_persists_across_restart(vault, monkeypatch):
+    monkeypatch.setattr(
+        "app.integrations.telegram_user.TelegramClient", _no_telethon_match
+    )
+    fake = FakePyrogramClient()
+    monkeypatch.setattr(
+        "app.integrations.telegram_user.PyrogramClient", lambda **kw: fake
+    )
+
+    userbot = TelegramUserbot()
+    await userbot.link_string_session(
+        "PYRO-SESSION-STRING-XYZ" + "0" * 30, api_id=123, api_hash="hash"
+    )
+
+    # A brand-new instance (simulating a process restart) should read the
+    # backend from the vault and reconnect with Pyrogram, not Telethon.
+    fresh_fake = FakePyrogramClient()
+    monkeypatch.setattr(
+        "app.integrations.telegram_user.PyrogramClient", lambda **kw: fresh_fake
+    )
+    fresh = TelegramUserbot()
+    assert fresh._stored_backend() == "pyrogram"
+
+    client = await fresh.client()
+    assert client is fresh_fake
+    assert fresh._backend == "pyrogram"
+
+
+async def test_pyrogram_send_message(vault, monkeypatch):
+    monkeypatch.setattr(
+        "app.integrations.telegram_user.TelegramClient", _no_telethon_match
+    )
+    fake = FakePyrogramClient()
+    monkeypatch.setattr(
+        "app.integrations.telegram_user.PyrogramClient", lambda **kw: fake
+    )
+    userbot = TelegramUserbot()
+    await userbot.link_string_session(
+        "PYRO-SESSION-STRING-XYZ" + "0" * 30, api_id=123, api_hash="hash"
+    )
+
+    result = await userbot.send_message("me", "hi from pyrogram")
+    assert result == {"sent": True, "message_id": 5151, "to": "me"}
+    assert fake.sent == [("me", "hi from pyrogram")]
+
+
+async def test_pyrogram_read_messages(vault, monkeypatch):
+    monkeypatch.setattr(
+        "app.integrations.telegram_user.TelegramClient", _no_telethon_match
+    )
+    fake = FakePyrogramClient()
+    monkeypatch.setattr(
+        "app.integrations.telegram_user.PyrogramClient", lambda **kw: fake
+    )
+    userbot = TelegramUserbot()
+    await userbot.link_string_session(
+        "PYRO-SESSION-STRING-XYZ" + "0" * 30, api_id=123, api_hash="hash"
+    )
+
+    messages = await userbot.read_messages("me", limit=2)
+    assert len(messages) == 2
+    assert messages[0]["id"] == 1
+    assert messages[0]["text"] == "hello"
+    assert messages[0]["out"] is False
+    assert messages[1]["out"] is True
+    assert all("sender_id" in m for m in messages)
+
+
+async def test_pyrogram_list_dialogs(vault, monkeypatch):
+    monkeypatch.setattr(
+        "app.integrations.telegram_user.TelegramClient", _no_telethon_match
+    )
+    fake = FakePyrogramClient()
+    monkeypatch.setattr(
+        "app.integrations.telegram_user.PyrogramClient", lambda **kw: fake
+    )
+    userbot = TelegramUserbot()
+    await userbot.link_string_session(
+        "PYRO-SESSION-STRING-XYZ" + "0" * 30, api_id=123, api_hash="hash"
+    )
+
+    dialogs = await userbot.list_dialogs(limit=5)
+    assert len(dialogs) == 2
+    assert dialogs[0]["id"] == 1
+    assert dialogs[0]["name"] == "Group A"
+    assert dialogs[0]["is_group"] is True
+    assert dialogs[0]["unread"] == 3
+    assert dialogs[1]["username"] == "bob"
+    assert dialogs[1]["is_user"] is True
+
+
+async def test_pyrogram_botfather_raises_userbot_error(vault, monkeypatch):
+    monkeypatch.setattr(
+        "app.integrations.telegram_user.TelegramClient", _no_telethon_match
+    )
+    fake = FakePyrogramClient()
+    monkeypatch.setattr(
+        "app.integrations.telegram_user.PyrogramClient", lambda **kw: fake
+    )
+    userbot = TelegramUserbot()
+    await userbot.link_string_session(
+        "PYRO-SESSION-STRING-XYZ" + "0" * 30, api_id=123, api_hash="hash"
+    )
+
+    with pytest.raises(UserbotError, match="Telethon-linked session"):
+        await userbot.botfather("/mybots")

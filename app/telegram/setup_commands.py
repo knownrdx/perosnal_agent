@@ -8,7 +8,7 @@ touching the VPS:
     /delkey <p>         remove a stored key
     /addllm ...         register any OpenAI-compatible endpoint
     /rmllm <name>       remove one
-    /wa connect|status|logout
+    /wa connect|phone <num>|status|logout
     /teams connect <tenant> <client> <secret> [chat]
 
 Security: messages containing secrets are deleted from the chat immediately
@@ -59,6 +59,7 @@ AI models (easiest way):
 
 WhatsApp:
   /wa connect                    show the QR to link your account
+  /wa phone <number>             link by phone number instead (no QR)
   /wa status                     check the link
   /wa logout                     unlink
 
@@ -596,6 +597,33 @@ def register_setup_handlers(bot: Any) -> None:
                 await message.answer(f"\u274C {exc}")
                 return
             await message.answer("\U0001F513 WhatsApp unlinked.")
+            return
+
+        if action == "phone":
+            phone = (parts[1] if len(parts) > 1 else "").strip()
+            if not phone:
+                await message.answer(
+                    "Usage: /wa phone <number with country code>\n\n"
+                    "Example: /wa phone +8801XXXXXXXXX\n\n"
+                    "No QR needed - open WhatsApp \u2192 Settings \u2192 Linked devices \u2192 "
+                    "Link with phone number, then type the code I send you."
+                )
+                return
+            try:
+                result = await bridge.login_phone(phone)
+            except BridgeError as exc:
+                await message.answer(f"\u274C {exc}")
+                return
+            if result.get("logged_in"):
+                await message.answer("\u2705 Already linked.")
+                return
+            code = result.get("code", "")
+            await message.answer(
+                f"\U0001F4F1 Pairing code: `{code}`\n\n"
+                "WhatsApp \u2192 Settings \u2192 Linked devices \u2192 Link with phone number \u2192 "
+                "type this code (valid ~60s). Then check with /wa status",
+                parse_mode="Markdown",
+            )
             return
 
         if action == "send":

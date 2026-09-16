@@ -136,6 +136,14 @@ class WhatsAppBridge(BridgeClient):
             params["since"] = since
         return await self.request("GET", "/messages", params=params)
 
+    async def login_phone(self, phone: str) -> dict[str, Any]:
+        """Start phone-number pairing (no QR scan needed): returns a short code."""
+        return await self.request("POST", "/login/phone", json={"phone": phone})
+
+    async def contacts(self) -> dict[str, Any]:
+        """The paired account's contact list, as cached by the bridge."""
+        return await self.request("GET", "/contacts")
+
 
 class TeamsBridge(BridgeClient):
     channel = "teams"

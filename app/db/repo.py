@@ -20,6 +20,7 @@ from app.db.models import (
     Approval,
     ApprovalPattern,
     ApprovalStatus,
+    Contact,
     Conversation,
     Credential,
     InboundMessage,
@@ -456,8 +457,16 @@ async def memory_search(session: AsyncSession, query: str, limit: int = 10) -> l
     return list((await session.scalars(stmt)).all())
 
 
-async def memory_recent(session: AsyncSession, limit: int = 10) -> list[MemoryEntry]:
-    stmt = select(MemoryEntry).order_by(MemoryEntry.updated_at.desc()).limit(limit)
+async def memory_recent(
+    session: AsyncSession, limit: int = 10, *, kinds: Sequence[str] | None = None
+) -> list[MemoryEntry]:
+    stmt = (
+        select(MemoryEntry)
+        .order_by(MemoryEntry.updated_at.desc(), MemoryEntry.id.desc())
+        .limit(limit)
+    )
+    if kinds:
+        stmt = stmt.where(MemoryEntry.kind.in_(list(kinds)))
     return list((await session.scalars(stmt)).all())
 
 
@@ -828,3 +837,93 @@ async def stats(session: AsyncSession) -> dict[str, Any]:
         "enabled_jobs": int(jobs or 0),
         "memory_entries": int(memories or 0),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Contacts / members (Telegram + WhatsApp people the agent has seen)
+# --------------------------------------------------------------------------- #
+async def upsert_contact(
+    session: AsyncSession,
+    *,
+    channel: str,
+    external_id: str,
+    display_name: str,
+    username_or_phone: str = "",
+    seen_in: list[str] | None = None,
+) -> Contact:
+    """Insert or refresh a contact, keyed on (channel, external_id).
+
+    A re-sync updates ``last_seen_at``/``display_name`` and unions ``seen_in``
+    rather than creating a duplicate row.
+    """
+    existing = (
+        await session.scalars(
+            select(Contact).where(
+                Contact.channel == channel, Contact.external_id == external_id
+            )
+        )
+    ).first()
+    if existing:
+        existing.display_name = display_name or existing.display_name
+        if username_or_phone:
+            existing.username_or_phone = username_or_phone
+        if seen_in:
+            merged = list(dict.fromkeys(list(existing.seen_in or []) + list(seen_in)))
+            existing.seen_in = merged
+        existing.last_seen_at = utcnow()
+        session.add(existing)
+        await session.flush()
+        return existing
+
+    contact = Contact(
+        id=new_id(),
+        channel=channel,
+        external_id=external_id,
+        display_name=display_name,
+        username_or_phone=username_or_phone or None,
+        seen_in=list(seen_in or []),
+    )
+    session.add(contact)
+    try:
+        await session.flush()
+    except IntegrityError:
+        # Lost a race with another sync writing the same contact concurrently.
+        await session.rollback()
+        return await upsert_contact(
+            session,
+            channel=channel,
+            external_id=external_id,
+            display_name=display_name,
+            username_or_phone=username_or_phone,
+            seen_in=seen_in,
+        )
+    return contact
+
+
+async def list_contacts(
+    session: AsyncSession, channel: str | None = None, limit: int = 100
+) -> list[Contact]:
+    stmt = (
+        select(Contact)
+        .order_by(Contact.last_seen_at.desc(), Contact.id.desc())
+        .limit(limit)
+    )
+    if channel:
+        stmt = stmt.where(Contact.channel == channel)
+    return list((await session.scalars(stmt)).all())
+
+
+async def search_contacts(session: AsyncSession, query: str, limit: int = 20) -> list[Contact]:
+    like = f"%{query.lower()}%"
+    stmt = (
+        select(Contact)
+        .where(
+            or_(
+                func.lower(Contact.display_name).like(like),
+                func.lower(Contact.username_or_phone).like(like),
+            )
+        )
+        .order_by(Contact.last_seen_at.desc(), Contact.id.desc())
+        .limit(limit)
+    )
+    return list((await session.scalars(stmt)).all())

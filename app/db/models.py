@@ -390,3 +390,30 @@ class Conversation(Base):
     content: Mapped[str] = mapped_column(Text)
     task_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow, index=True)
+
+
+class Contact(Base):
+    """A person the agent has seen across Telegram and WhatsApp.
+
+    Synced from Telegram dialogs (the owner's userbot) and the WhatsApp
+    bridge's contact list, so the agent does not need to rediscover who is
+    who every time it is asked to message someone.
+    """
+
+    __tablename__ = "contacts"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    channel: Mapped[str] = mapped_column(String(16), index=True)   # telegram | whatsapp
+    external_id: Mapped[str] = mapped_column(String(200), index=True)
+    display_name: Mapped[str] = mapped_column(String(200), default="")
+    username_or_phone: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=utcnow, onupdate=utcnow
+    )
+    seen_in: Mapped[list] = mapped_column(JSON, default=list)
+    extra: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    __table_args__ = (
+        UniqueConstraint("channel", "external_id", name="uq_contact_channel_external"),
+    )

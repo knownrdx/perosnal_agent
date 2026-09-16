@@ -7,6 +7,7 @@ from app.agent.learning import (
     reflect_on_task,
     relevant_memories,
 )
+from app.agent.skills import synthesize_skills
 
 __all__ = [
     "AgentEngine",
@@ -21,4 +22,5 @@ __all__ = [
     "operation_key",
     "reflect_on_task",
     "relevant_memories",
+    "synthesize_skills",
 ]

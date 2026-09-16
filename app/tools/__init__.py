@@ -19,6 +19,7 @@ from app.tools.registry import registry, tool
 
 # Import order defines nothing functionally; each module self-registers.
 from app.tools import browser_tools  # noqa: F401,E402
+from app.tools import contact_tools  # noqa: F401,E402
 from app.tools import document_tools  # noqa: F401,E402
 from app.tools import email_tools  # noqa: F401,E402
 from app.tools import exec_tools  # noqa: F401,E402

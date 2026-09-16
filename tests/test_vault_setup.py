@@ -248,6 +248,45 @@ async def test_whatsapp_qr_png_error_is_readable(environment):
         await bridge.login_qr_png()
 
 
+async def test_whatsapp_login_phone(environment):
+    import httpx
+
+    from app.integrations import WhatsAppBridge
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/login/phone"
+        body = request.read()
+        assert b"+8801" in body
+        return httpx.Response(200, json={"logged_in": False, "code": "ABCD-1234"})
+
+    bridge = WhatsAppBridge("http://wa:8081", "tok")
+    bridge._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://wa:8081"
+    )
+    result = await bridge.login_phone("+8801XXXXXXXXX")
+    assert result["code"] == "ABCD-1234"
+
+
+async def test_whatsapp_contacts(environment):
+    import httpx
+
+    from app.integrations import WhatsAppBridge
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/contacts"
+        return httpx.Response(
+            200,
+            json={"count": 1, "contacts": [{"jid": "88011@s.whatsapp.net", "name": "Alice"}]},
+        )
+
+    bridge = WhatsAppBridge("http://wa:8081", "tok")
+    bridge._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://wa:8081"
+    )
+    result = await bridge.contacts()
+    assert result["contacts"][0]["name"] == "Alice"
+
+
 # --------------------------------------------------------------------------- #
 # Gateway health probe falls back to the chat endpoint
 # --------------------------------------------------------------------------- #

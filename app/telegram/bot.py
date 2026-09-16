@@ -61,9 +61,14 @@ Accounts & setup:
 /addllm <name> <url> <model> [key] - add any OpenAI-compatible LLM
 
 Messaging:
-/wa connect | status | logout | send <num> <text>
+/wa connect | phone <num> | status | logout | send <num> <text>
 /teams connect <tenant> <client> <secret> | status | send <chat> <text>
 /inbox   - recent WhatsApp/Teams messages
+
+Contacts & skills:
+/members [query] - people seen on Telegram/WhatsApp
+/syncmembers - pull in contacts now
+/skills  - what the agent has taught itself
 """
 
 
@@ -422,6 +427,11 @@ class AgentBot:
         from app.telegram.capability_commands import register_capability_commands
 
         register_capability_commands(dp, self._guard)
+
+        # Contacts/members sync and the self-updating skills memory.
+        from app.telegram.member_commands import register_member_handlers
+
+        register_member_handlers(dp, self._guard)
 
         @dp.message(Command("new"))
         async def _new(message: Message) -> None:

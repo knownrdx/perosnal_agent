@@ -1,4 +1,4 @@
-"""Telegram user account (userbot) via Telethon.
+"""Telegram user account (userbot) via Telethon or Pyrogram.
 
 This is the owner's own Telegram account, not the bot.  It lets the agent do
 things a bot cannot: read the owner's chats, message any user, and manage the
@@ -10,9 +10,17 @@ Login is driven entirely from the Telegram bot chat:
     /tgcode <code>                          -> signs in
     /tg2fa <password>                       -> only if 2FA is enabled
 
+or by pasting a session string exported from another tool. Two session
+string formats exist in the wild: Telethon's ``StringSession`` and
+Pyrogram's ``session_string``. ``link_string_session`` tries Telethon first
+(unchanged behaviour for existing users) and falls back to Pyrogram if that
+fails, so either format works. Which library authenticated the stored
+session is remembered in the vault so that a restart reconnects with the
+right one.
+
 The resulting session string is stored ENCRYPTED in the credential vault, so a
-restart does not require logging in again and the session never touches disk in
-plaintext.
+restart does not require logging in again and the session never touches disk
+in plaintext.
 """
 
 from __future__ import annotations
@@ -29,6 +37,10 @@ log = get_logger(__name__)
 SESSION_KEY = "telegram_user_session"
 API_ID_KEY = "telegram_user_api_id"
 API_HASH_KEY = "telegram_user_api_hash"
+TELEGRAM_USER_BACKEND_KEY = "telegram_user_backend"
+
+BACKEND_TELETHON = "telethon"
+BACKEND_PYROGRAM = "pyrogram"
 
 try:
     from telethon import TelegramClient, functions
@@ -48,6 +60,14 @@ except ImportError:  # pragma: no cover - optional dependency
     PhoneCodeInvalidError = Exception  # type: ignore[assignment,misc]
     PhoneCodeExpiredError = Exception  # type: ignore[assignment,misc]
     TELETHON_AVAILABLE = False
+
+try:
+    from pyrogram import Client as PyrogramClient
+
+    PYROGRAM_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    PyrogramClient = None  # type: ignore[assignment]
+    PYROGRAM_AVAILABLE = False
 
 
 class UserbotError(Exception):
@@ -72,19 +92,20 @@ class PendingLogin:
 
 
 class TelegramUserbot:
-    """Owns one Telethon client for the owner's account."""
+    """Owns one client (Telethon or Pyrogram) for the owner's account."""
 
     def __init__(self) -> None:
         self._client: Any = None
         self._pending: PendingLogin | None = None
         self._lock = asyncio.Lock()
+        self._backend: str = BACKEND_TELETHON
 
     # ------------------------------------------------------------------ #
     # Availability / state
     # ------------------------------------------------------------------ #
     @staticmethod
     def available() -> bool:
-        return TELETHON_AVAILABLE
+        return TELETHON_AVAILABLE or PYROGRAM_AVAILABLE
 
     def _require_telethon(self) -> None:
         if not TELETHON_AVAILABLE:
@@ -92,49 +113,108 @@ class TelegramUserbot:
                 "the 'telethon' package is not installed; add it to requirements and rebuild"
             )
 
+    def _require_pyrogram(self) -> None:
+        if not PYROGRAM_AVAILABLE:
+            raise UserbotError(
+                "the 'pyrogram' package is not installed; add it to requirements and rebuild"
+            )
+
     def has_session(self) -> bool:
         return bool(get_vault().get(SESSION_KEY))
+
+    def _stored_backend(self) -> str:
+        """Which library authenticated the stored session (defaults to telethon)."""
+        return get_vault().get(TELEGRAM_USER_BACKEND_KEY) or BACKEND_TELETHON
 
     # ------------------------------------------------------------------ #
     # Connection
     # ------------------------------------------------------------------ #
     async def client(self) -> Any:
-        """Return a connected, authorised Telethon client."""
-        self._require_telethon()
+        """Return a connected, authorised client using the backend the stored
+        session was linked with (Telethon or Pyrogram)."""
         async with self._lock:
-            if self._client is not None and self._client.is_connected():
-                return self._client
+            backend = self._stored_backend()
 
-            vault = get_vault()
-            session = vault.get(SESSION_KEY)
-            api_id = vault.get(API_ID_KEY)
-            api_hash = vault.get(API_HASH_KEY)
-            if not (session and api_id and api_hash):
-                raise UserbotError("Telegram account is not linked. Use /tglogin first.")
+            if backend == BACKEND_PYROGRAM:
+                return await self._client_pyrogram()
+            return await self._client_telethon()
 
-            client = TelegramClient(StringSession(session), int(api_id), api_hash)
-            await client.connect()
-            if not await client.is_user_authorized():
-                await client.disconnect()
-                raise UserbotError("stored Telegram session is no longer valid; run /tglogin again")
-            self._client = client
-            return client
+    async def _client_telethon(self) -> Any:
+        self._require_telethon()
+        if (
+            self._client is not None
+            and self._backend == BACKEND_TELETHON
+            and self._client.is_connected()
+        ):
+            return self._client
+
+        vault = get_vault()
+        session = vault.get(SESSION_KEY)
+        api_id = vault.get(API_ID_KEY)
+        api_hash = vault.get(API_HASH_KEY)
+        if not (session and api_id and api_hash):
+            raise UserbotError("Telegram account is not linked. Use /tglogin first.")
+
+        client = TelegramClient(StringSession(session), int(api_id), api_hash)
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise UserbotError("stored Telegram session is no longer valid; run /tglogin again")
+        self._client = client
+        self._backend = BACKEND_TELETHON
+        return client
+
+    async def _client_pyrogram(self) -> Any:
+        self._require_pyrogram()
+        if self._client is not None and self._backend == BACKEND_PYROGRAM and self._client.is_connected:
+            return self._client
+
+        vault = get_vault()
+        session = vault.get(SESSION_KEY)
+        api_id = vault.get(API_ID_KEY)
+        api_hash = vault.get(API_HASH_KEY)
+        if not (session and api_id and api_hash):
+            raise UserbotError("Telegram account is not linked. Use /tglogin first.")
+
+        app = PyrogramClient(
+            name=":memory:",
+            session_string=session,
+            api_id=int(api_id),
+            api_hash=api_hash,
+            in_memory=True,
+        )
+        try:
+            await app.start()
+            await app.get_me()
+        except Exception as exc:  # noqa: BLE001
+            try:
+                await app.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            raise UserbotError(
+                f"stored Telegram session is no longer valid; run /tglogin again ({str(exc)[:200]})"
+            ) from exc
+
+        self._client = app
+        self._backend = BACKEND_PYROGRAM
+        return app
 
     async def status(self) -> dict[str, Any]:
-        if not TELETHON_AVAILABLE:
+        if not self.available():
             return {"available": False, "linked": False, "error": "telethon not installed"}
         if not self.has_session():
             return {"available": True, "linked": False}
         try:
             client = await self.client()
             me = await client.get_me()
+            phone_number = getattr(me, "phone", None) or getattr(me, "phone_number", None)
             return {
                 "available": True,
                 "linked": True,
                 "user_id": me.id,
                 "username": me.username or "",
                 "name": " ".join(filter(None, [me.first_name, me.last_name])),
-                "phone": f"+{me.phone}" if getattr(me, "phone", None) else "",
+                "phone": f"+{phone_number}" if phone_number else "",
             }
         except UserbotError as exc:
             return {"available": True, "linked": False, "error": str(exc)}
@@ -212,9 +292,11 @@ class TelegramUserbot:
         await vault.set(SESSION_KEY, session_string)
         await vault.set(API_ID_KEY, str(pending.api_id))
         await vault.set(API_HASH_KEY, pending.api_hash)
+        await vault.set(TELEGRAM_USER_BACKEND_KEY, BACKEND_TELETHON)
 
         me = await client.get_me()
         self._client = client
+        self._backend = BACKEND_TELETHON
         self._pending = None
 
         log.info("userbot_linked", extra={"user_id": me.id})
@@ -235,14 +317,16 @@ class TelegramUserbot:
         accounts are already exported as a string from another machine. Pasting
         the string skips the code entirely.
 
-        The string is verified against Telegram before it is stored, so a typo
-        or a revoked session fails here rather than silently later.
+        Two session string formats exist in the wild: Telethon's and
+        Pyrogram's. This tries Telethon first (unchanged behaviour for
+        existing users); if that fails it tries the string as a Pyrogram
+        session. The string is verified against Telegram before it is
+        stored, so a typo or a revoked session fails here rather than
+        silently later.
         """
-        self._require_telethon()
-
         session_string = session_string.strip()
         if len(session_string) < 40:
-            raise UserbotError("that does not look like a Telethon session string")
+            raise UserbotError("that does not look like a Telegram session string")
 
         vault = get_vault()
         await vault.load()
@@ -253,6 +337,33 @@ class TelegramUserbot:
                 "api_id and api_hash are required the first time; get them from my.telegram.org"
             )
 
+        telethon_error: str | None = None
+        if TELETHON_AVAILABLE:
+            try:
+                return await self._link_telethon_string(session_string, api_id, api_hash)
+            except Exception as exc:  # noqa: BLE001 - fall through to pyrogram
+                telethon_error = str(exc)[:200]
+        else:
+            telethon_error = "telethon is not installed"
+
+        pyrogram_error: str | None = None
+        if PYROGRAM_AVAILABLE:
+            try:
+                return await self._link_pyrogram_string(session_string, api_id, api_hash)
+            except Exception as exc:  # noqa: BLE001
+                pyrogram_error = str(exc)[:200]
+        else:
+            pyrogram_error = "pyrogram is not installed"
+
+        raise UserbotError(
+            "that session string was not recognised by Telethon "
+            f"({telethon_error}) or Pyrogram ({pyrogram_error})"
+        )
+
+    async def _link_telethon_string(
+        self, session_string: str, api_id: int, api_hash: str
+    ) -> dict[str, Any]:
+        vault = get_vault()
         try:
             client = TelegramClient(StringSession(session_string), api_id, api_hash)
             await client.connect()
@@ -277,11 +388,52 @@ class TelegramUserbot:
         await vault.set(SESSION_KEY, session_string)
         await vault.set(API_ID_KEY, str(api_id))
         await vault.set(API_HASH_KEY, api_hash)
+        await vault.set(TELEGRAM_USER_BACKEND_KEY, BACKEND_TELETHON)
 
         self._client = client
+        self._backend = BACKEND_TELETHON
         self._pending = None
 
-        log.info("userbot_linked_via_string", extra={"user_id": me.id})
+        log.info("userbot_linked_via_string", extra={"user_id": me.id, "backend": BACKEND_TELETHON})
+        return {
+            "linked": True,
+            "method": "string_session",
+            "user_id": me.id,
+            "username": me.username or "",
+            "name": " ".join(filter(None, [me.first_name, me.last_name])),
+        }
+
+    async def _link_pyrogram_string(
+        self, session_string: str, api_id: int, api_hash: str
+    ) -> dict[str, Any]:
+        vault = get_vault()
+        app = PyrogramClient(
+            name=":memory:",
+            session_string=session_string,
+            api_id=api_id,
+            api_hash=api_hash,
+            in_memory=True,
+        )
+        try:
+            await app.start()
+            me = await app.get_me()
+        except Exception as exc:  # noqa: BLE001 - the string may be malformed/unauthorised
+            try:
+                await app.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            raise UserbotError(f"could not use that session string: {str(exc)[:200]}") from exc
+
+        await vault.set(SESSION_KEY, session_string)
+        await vault.set(API_ID_KEY, str(api_id))
+        await vault.set(API_HASH_KEY, api_hash)
+        await vault.set(TELEGRAM_USER_BACKEND_KEY, BACKEND_PYROGRAM)
+
+        self._client = app
+        self._backend = BACKEND_PYROGRAM
+        self._pending = None
+
+        log.info("userbot_linked_via_string", extra={"user_id": me.id, "backend": BACKEND_PYROGRAM})
         return {
             "linked": True,
             "method": "string_session",
@@ -293,6 +445,8 @@ class TelegramUserbot:
     async def export_session_string(self) -> str:
         """Return the current session string so the owner can back it up."""
         client = await self.client()
+        if self._backend == BACKEND_PYROGRAM:
+            return await client.export_session_string()
         return StringSession.save(client.session)
 
     @staticmethod
@@ -309,22 +463,33 @@ class TelegramUserbot:
                 await self._client.log_out()
             except Exception:  # noqa: BLE001
                 pass
-            try:
-                await self._client.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
+            if self._backend == BACKEND_PYROGRAM:
+                try:
+                    await self._client.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                try:
+                    await self._client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
         self._client = None
         self._pending = None
         removed = await vault.delete(SESSION_KEY)
         await vault.delete(API_ID_KEY)
         await vault.delete(API_HASH_KEY)
+        await vault.delete(TELEGRAM_USER_BACKEND_KEY)
+        self._backend = BACKEND_TELETHON
         log.info("userbot_logged_out")
         return removed
 
     async def close(self) -> None:
         if self._client is not None:
             try:
-                await self._client.disconnect()
+                if self._backend == BACKEND_PYROGRAM:
+                    await self._client.stop()
+                else:
+                    await self._client.disconnect()
             except Exception:  # noqa: BLE001
                 pass
         self._client = None
@@ -334,20 +499,44 @@ class TelegramUserbot:
     # ------------------------------------------------------------------ #
     async def send_message(self, target: str, text: str) -> dict[str, Any]:
         client = await self.client()
+        if self._backend == BACKEND_PYROGRAM:
+            peer = self._resolve_pyrogram(target)
+            sent = await client.send_message(peer, text)
+            return {"sent": True, "message_id": sent.id, "to": str(target)}
         entity = await self._resolve(client, target)
         sent = await client.send_message(entity, text)
         return {"sent": True, "message_id": sent.id, "to": str(target)}
 
     async def send_file(self, target: str, path: str, caption: str = "") -> dict[str, Any]:
         client = await self.client()
+        if self._backend == BACKEND_PYROGRAM:
+            peer = self._resolve_pyrogram(target)
+            sent = await client.send_document(peer, path, caption=caption or "")
+            return {"sent": True, "message_id": sent.id, "to": str(target)}
         entity = await self._resolve(client, target)
         sent = await client.send_file(entity, path, caption=caption or None)
         return {"sent": True, "message_id": sent.id, "to": str(target)}
 
     async def read_messages(self, target: str, limit: int = 20) -> list[dict[str, Any]]:
         client = await self.client()
-        entity = await self._resolve(client, target)
         out: list[dict[str, Any]] = []
+        if self._backend == BACKEND_PYROGRAM:
+            peer = self._resolve_pyrogram(target)
+            async for message in client.get_chat_history(peer, limit=limit):
+                message_date = getattr(message, "date", None)
+                out.append(
+                    {
+                        "id": message.id,
+                        "text": (message.text or message.caption or "")[:2000],
+                        "out": bool(getattr(message, "outgoing", False)),
+                        "date": message_date.isoformat() if message_date else None,
+                        "sender_id": getattr(message.from_user, "id", None)
+                        if message.from_user
+                        else None,
+                    }
+                )
+            return out
+        entity = await self._resolve(client, target)
         async for message in client.iter_messages(entity, limit=limit):
             out.append(
                 {
@@ -363,6 +552,28 @@ class TelegramUserbot:
     async def list_dialogs(self, limit: int = 30) -> list[dict[str, Any]]:
         client = await self.client()
         out: list[dict[str, Any]] = []
+        if self._backend == BACKEND_PYROGRAM:
+            async for dialog in client.get_dialogs(limit=limit):
+                chat = dialog.chat
+                chat_type = str(getattr(chat, "type", "")).lower()
+                is_group = "group" in chat_type
+                is_channel = "channel" in chat_type
+                is_user = "private" in chat_type or "bot" in chat_type
+                name = chat.title or " ".join(
+                    filter(None, [getattr(chat, "first_name", None), getattr(chat, "last_name", None)])
+                )
+                out.append(
+                    {
+                        "id": chat.id,
+                        "name": name or "",
+                        "username": getattr(chat, "username", "") or "",
+                        "unread": dialog.unread_messages_count,
+                        "is_group": is_group,
+                        "is_channel": is_channel,
+                        "is_user": is_user,
+                    }
+                )
+            return out
         async for dialog in client.iter_dialogs(limit=limit):
             out.append(
                 {
@@ -380,6 +591,19 @@ class TelegramUserbot:
     async def search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
         client = await self.client()
         out: list[dict[str, Any]] = []
+        if self._backend == BACKEND_PYROGRAM:
+            async for message in client.search_global(query, limit=limit):
+                message_date = getattr(message, "date", None)
+                chat_id = getattr(message.chat, "id", None) if message.chat else None
+                out.append(
+                    {
+                        "id": message.id,
+                        "chat_id": chat_id,
+                        "text": (message.text or message.caption or "")[:500],
+                        "date": message_date.isoformat() if message_date else None,
+                    }
+                )
+            return out
         async for message in client.iter_messages(None, search=query, limit=limit):
             out.append(
                 {
@@ -400,8 +624,16 @@ class TelegramUserbot:
         ``replies`` are follow-up messages sent one after another, which is how
         BotFather's multi-step dialogues (e.g. /newbot -> name -> username)
         work.
+
+        Only supported on a Telethon-linked session: Pyrogram has no
+        equivalent of Telethon's ``client.conversation()`` context manager.
         """
         client = await self.client()
+        if self._backend == BACKEND_PYROGRAM:
+            raise UserbotError(
+                "bot management via BotFather requires a Telethon-linked session; "
+                "use /tglogin or paste a Telethon session string for this feature"
+            )
         conversation_replies: list[str] = []
 
         async with client.conversation("BotFather", timeout=max(10.0, wait_s * (len(replies) + 2))) as conv:
@@ -424,6 +656,16 @@ class TelegramUserbot:
     @staticmethod
     async def _resolve(client: Any, target: str) -> Any:
         """Accept @username, numeric id, phone or 'me'."""
+        raw = str(target).strip()
+        if raw.lower() in {"me", "self", "saved"}:
+            return "me"
+        if raw.lstrip("-").isdigit():
+            return int(raw)
+        return raw
+
+    @staticmethod
+    def _resolve_pyrogram(target: str) -> Any:
+        """Accept @username, numeric id, phone or 'me' (Pyrogram peer form)."""
         raw = str(target).strip()
         if raw.lower() in {"me", "self", "saved"}:
             return "me"
