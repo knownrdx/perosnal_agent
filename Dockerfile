@@ -11,12 +11,17 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Runtime deps only (asyncpg/psutil ship manylinux wheels, no compiler needed).
+# gcc is only needed transiently: tgcrypto (Pyrogram's speed-up) has no
+# manylinux wheel for every python/arch combo and compiles from source.
+# Installed, used, then purged so the final image stays lean.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tini \
+    && apt-get install -y --no-install-recommends ca-certificates tini gcc python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && apt-get purge -y --auto-remove gcc python3-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN if [ "$INSTALL_BROWSER" = "true" ]; then \
         pip install --no-cache-dir "playwright>=1.47" && \
