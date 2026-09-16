@@ -27,7 +27,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, Response, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -644,6 +644,81 @@ def create_app() -> FastAPI:
             "task_id": reply.task_id,
             "created_task": reply.created_task,
         }
+
+    @app.post("/api/chat/upload", dependencies=[Depends(require_api_access)])
+    async def chat_upload(file: UploadFile) -> dict[str, Any]:
+        """Save an uploaded file the exact same way Telegram's F.document
+        handler does (app/telegram/bot.py): into uploads/, remembered as
+        pending_upload on the owner's chat session so it auto-attaches to
+        whatever instruction (web chat or Telegram) comes next.
+        """
+        settings = get_settings()
+        chat_id = settings.owner_chat_id
+        if chat_id is None:
+            raise HTTPException(
+                status_code=503,
+                detail="no owner chat configured (set TELEGRAM_ALLOWED_USER_IDS)",
+            )
+
+        from app.security import rel_path, safe_path
+
+        raw_name = file.filename or "upload"
+        safe_name = "".join(c for c in raw_name if c not in '\\/:*?"<>|').strip() or "file"
+        target = safe_path(f"uploads/{safe_name}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            stem, _, ext = safe_name.rpartition(".")
+            stem = stem or safe_name
+            target = safe_path(f"uploads/{stem}_{int(time.time())}{'.' + ext if ext else ''}")
+
+        size = 0
+        max_bytes = settings.max_file_bytes
+        with open(target, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_bytes:
+                    out.close()
+                    target.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"file is over the {settings.max_file_mb} MB limit",
+                    )
+                out.write(chunk)
+
+        rel = rel_path(target)
+        async with session_scope() as session:
+            row = await repo.ensure_session(session, chat_id)
+            ctx = dict(row.context or {})
+            ctx["pending_upload"] = {"path": rel, "name": safe_name}
+            await repo.update_session(session, chat_id, context=ctx)
+
+        return {"saved": True, "path": rel, "name": safe_name}
+
+    @app.get("/api/chat/pending_upload", dependencies=[Depends(require_api_access)])
+    async def chat_pending_upload() -> dict[str, Any]:
+        settings = get_settings()
+        chat_id = settings.owner_chat_id
+        if chat_id is None:
+            return {"pending_upload": None}
+        async with session_scope() as session:
+            row = await repo.ensure_session(session, chat_id)
+            return {"pending_upload": dict(row.context or {}).get("pending_upload")}
+
+    @app.delete("/api/chat/pending_upload", dependencies=[Depends(require_api_access)])
+    async def chat_clear_pending_upload() -> dict[str, Any]:
+        settings = get_settings()
+        chat_id = settings.owner_chat_id
+        if chat_id is None:
+            return {"cleared": True}
+        async with session_scope() as session:
+            row = await repo.ensure_session(session, chat_id)
+            ctx = dict(row.context or {})
+            ctx.pop("pending_upload", None)
+            await repo.update_session(session, chat_id, context=ctx)
+        return {"cleared": True}
 
     # --- static web dashboard ------------------------------------------- #
     # Mounted last so it never shadows an /api/* or /health route above.

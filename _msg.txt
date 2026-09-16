@@ -1,28 +1,26 @@
-Add a ChatGPT-style Chat panel to the web dashboard
+Web chat: file attach (paperclip), no attachments-only channel
 
-Every other panel is a control surface - tasks, jobs, contacts - but there
-was no way to just talk to the agent from the browser the way Telegram
-already lets you. Fixed.
+The owner pointed out the web dashboard's chat panel had no way to send a
+file - the only upload path was still Telegram's document handler.
 
-Backend: two new endpoints reusing the existing brain
+New: POST /api/chat/upload, GET/DELETE /api/chat/pending_upload
 
-POST /api/chat and GET /api/chat/history both call the exact same
-app.agent.conversation.handle_message()/recent_messages() that Telegram's
-"just talk to me" flow already uses, against the owner's chat_id
-(settings.owner_chat_id). No new conversation engine, no new memory store -
-a message sent from the web dashboard and one sent from Telegram are one
-continuous conversation either surface can see, same task-creation routing,
-same self-learning, same follow-up detection.
+Saves into uploads/ and writes pending_upload onto the owner's chat session
+context - the exact same mechanism Telegram's F.document handler
+(app/telegram/bot.py) already uses, same size limit, same filename
+collision handling. Because both paths write to the identical session
+field, a file uploaded from the web dashboard auto-attaches to the next
+instruction whether that instruction comes from the web chat panel or from
+Telegram - one shared pending-upload slot, not two competing ones.
 
-Frontend: a real chat UI, not a form
+Frontend: a paperclip button next to the chat input opens a native file
+picker, uploads via multipart/form-data (still credentials: 'include', no
+token ever touches the browser), shows the attached filename as a pill
+above the input with a Remove button, and clears automatically once the
+next message is sent (mirroring the reply the owner already gets on
+Telegram: "I will attach this file automatically to your next
+instruction").
 
-New "Chat" panel (now the default landing panel) - message bubbles,
-right-aligned for the owner, left for the agent, auto-scrolling, a
-"Thinking..." indicator while waiting, Enter to send / Shift+Enter for a
-newline, an auto-growing textarea. History loads once per session on first
-visit to the panel. Every request goes through the same credentials-include
-+ 401-redirects-to-login fetch wrapper the rest of the dashboard already
-uses - no separate auth path to get wrong.
+Needs python-multipart for FastAPI's UploadFile - added to requirements.txt.
 
-561 tests (3 new, covering send+history round-trip, auth-required, and
-cookie-only access), full suite green.
+563 tests (5 new), smoke 10/10.

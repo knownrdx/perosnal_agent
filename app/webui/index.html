@@ -328,6 +328,29 @@
     max-height: 140px;
   }
 
+  #chat-attach-btn {
+    flex-shrink: 0;
+    align-self: flex-end;
+  }
+
+  #chat-pending-file {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    margin: 0 12px;
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 12.5px;
+    color: var(--text-dim);
+  }
+
+  #chat-pending-file button {
+    padding: 2px 8px;
+    font-size: 11px;
+  }
+
   table {
     width: 100%;
     border-collapse: collapse;
@@ -577,7 +600,13 @@
                 <div id="chat-typing">Thinking...</div>
               </div>
               <form id="chat-form" autocomplete="off">
+                <div id="chat-pending-file">
+                  <span id="chat-pending-file-name"></span>
+                  <button type="button" id="chat-pending-file-clear">Remove</button>
+                </div>
                 <div id="chat-input-row">
+                  <input type="file" id="chat-file-input" style="display:none;">
+                  <button type="button" id="chat-attach-btn" title="Attach a file">📎</button>
                   <textarea id="chat-input" rows="1" placeholder="Message the agent..." required></textarea>
                   <button type="submit" class="primary" id="chat-send-btn">Send</button>
                 </div>
@@ -1096,6 +1125,7 @@
         });
       })
       .catch(function () { /* banner already shown by apiFetch */ });
+    checkPendingUpload();
   }
 
   function handleChatSubmit(evt) {
@@ -1119,6 +1149,7 @@
     apiFetchJson("/api/chat", { method: "POST", body: { message: text } })
       .then(function (data) {
         appendChatBubble("assistant", data.reply, new Date().toISOString());
+        hidePendingFile();
       })
       .catch(function (e) {
         if (!e || e.status !== 401) {
@@ -1136,6 +1167,71 @@
     var el = qs("#chat-input");
     el.style.height = "auto";
     el.style.height = Math.min(el.scrollHeight, 140) + "px";
+  }
+
+  function showPendingFile(name) {
+    qs("#chat-pending-file-name").textContent = "\uD83D\uDCCE " + name;
+    qs("#chat-pending-file").style.display = "flex";
+  }
+
+  function hidePendingFile() {
+    qs("#chat-pending-file").style.display = "none";
+    qs("#chat-pending-file-name").textContent = "";
+  }
+
+  function checkPendingUpload() {
+    apiFetchJson("/api/chat/pending_upload")
+      .then(function (data) {
+        var pending = data && data.pending_upload;
+        if (pending && pending.name) {
+          showPendingFile(pending.name);
+        } else {
+          hidePendingFile();
+        }
+      })
+      .catch(function () { /* non-fatal */ });
+  }
+
+  function handleFileSelected(evt) {
+    var input = evt.target;
+    var file = input.files && input.files[0];
+    if (!file) return;
+
+    var attachBtn = qs("#chat-attach-btn");
+    attachBtn.disabled = true;
+    attachBtn.textContent = "\u2026";
+
+    var formData = new FormData();
+    formData.append("file", file);
+
+    fetch("/api/chat/upload", { method: "POST", credentials: "include", body: formData })
+      .then(function (res) {
+        if (res.status === 401) {
+          showBanner("Session expired. Please log in again.");
+          goToLogin();
+          throw new Error("unauthorized");
+        }
+        if (!res.ok) {
+          return res.json().catch(function () { return {}; }).then(function (data) {
+            throw new Error((data && data.detail) || ("upload failed: " + res.status));
+          });
+        }
+        return res.json();
+      })
+      .then(function (data) {
+        showPendingFile(data.name);
+        showConfirm("File attached - tell me what to do with it.");
+      })
+      .catch(function (e) {
+        if (e && e.message !== "unauthorized") {
+          showBanner("Upload failed: " + e.message);
+        }
+      })
+      .finally(function () {
+        attachBtn.disabled = false;
+        attachBtn.textContent = "\uD83D\uDCCE";
+        input.value = "";
+      });
   }
 
   /* ============================================================
@@ -1799,6 +1895,16 @@
         e.preventDefault();
         handleChatSubmit(e);
       }
+    });
+
+    qs("#chat-attach-btn").addEventListener("click", function () {
+      qs("#chat-file-input").click();
+    });
+    qs("#chat-file-input").addEventListener("change", handleFileSelected);
+    qs("#chat-pending-file-clear").addEventListener("click", function () {
+      apiFetch("/api/chat/pending_upload", { method: "DELETE" })
+        .then(function () { hidePendingFile(); })
+        .catch(function () { /* banner already shown by apiFetch */ });
     });
 
     qsa(".nav-item").forEach(function (btn) {

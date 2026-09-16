@@ -213,3 +213,40 @@ def test_chat_works_with_cookie_only(client, monkeypatch):
     resp = client.post("/api/chat", json={"message": "yo"})
     assert resp.status_code == 200
     assert resp.json()["reply"] == "hi from the cookie session"
+
+
+def test_chat_upload_sets_pending_and_attaches(client):
+    """Uploading via the web dashboard uses the exact same pending_upload
+    mechanism as Telegram's F.document handler, so the next chat message
+    auto-attaches the file just like it does on Telegram.
+    """
+    headers = {"X-API-Token": "test-api-token"}
+
+    empty = client.get("/api/chat/pending_upload", headers=headers)
+    assert empty.status_code == 200
+    assert empty.json() == {"pending_upload": None}
+
+    files = {"file": ("numbers.txt", b"12345\n67890\n", "text/plain")}
+    up = client.post("/api/chat/upload", files=files, headers=headers)
+    assert up.status_code == 200
+    body = up.json()
+    assert body["saved"] is True
+    assert body["name"] == "numbers.txt"
+    assert "uploads/" in body["path"]
+
+    pending = client.get("/api/chat/pending_upload", headers=headers)
+    assert pending.status_code == 200
+    assert pending.json()["pending_upload"]["name"] == "numbers.txt"
+
+    cleared = client.delete("/api/chat/pending_upload", headers=headers)
+    assert cleared.status_code == 200
+    assert cleared.json() == {"cleared": True}
+
+    after = client.get("/api/chat/pending_upload", headers=headers)
+    assert after.json() == {"pending_upload": None}
+
+
+def test_chat_upload_requires_auth(client):
+    files = {"file": ("x.txt", b"data", "text/plain")}
+    assert client.post("/api/chat/upload", files=files).status_code == 401
+    assert client.get("/api/chat/pending_upload").status_code == 401
