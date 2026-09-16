@@ -705,13 +705,21 @@ class AgentBot:
             from app.automation import otp_bot
 
             if await otp_bot.is_otp_thread(message.chat.id):
-                await otp_bot.enqueue_file(rel, safe_name)
+                analysis = await otp_bot.enqueue_file(rel, safe_name)
+                countries = analysis["countries"]
+                lines = [f"\U0001F4C1 Saved: {safe_name}", ""]
+                lines.append(f"Detected {len(countries)} country/countries:")
+                for country, count in countries.items():
+                    lines.append(f"  \u2022 {country}: {count} numbers")
                 queue = await otp_bot.get_queue()
-                await message.answer(
-                    f"\U0001F4C1 Saved: {rel}\n\n"
-                    f"Queued for the OTP-bot automation ({len(queue)} file(s) waiting). "
-                    "Send more files, then say \"start\" (or \"done\") when you're finished."
-                )
+                lines += [
+                    "",
+                    f"Queued ({len(queue)} entr{'y' if len(queue) == 1 else 'ies'} total). "
+                    "Send more files, then say \"start\" when you're finished - "
+                    "I'll ask which service each country goes to if I don't "
+                    "already know.",
+                ]
+                await message.answer("\n".join(lines))
             else:
                 await message.answer(
                     f"\U0001F4C1 Saved: {rel}\n\n"

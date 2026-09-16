@@ -192,7 +192,11 @@ class OtpBotConfigRequest(BaseModel):
     quota_command: str | None = None
     quota_threshold: int | None = None
     cleanup_command: str | None = None
+    force_delete_command: str | None = None
+    force_delete_before_add: bool | None = None
+    force_delete_uid: str | None = None
     interval_minutes: int | None = None
+    default_tag: str | None = None
 
 
 class OtpBotTagRequest(BaseModel):
@@ -784,11 +788,19 @@ def create_app() -> FastAPI:
         # Only files dropped into the dedicated OTP thread join its queue -
         # elsewhere an upload is just an attachment for the next instruction.
         queued = False
+        countries: dict[str, int] = {}
         if await otp_bot.is_otp_thread(chat_id):
-            await otp_bot.enqueue_file(rel, safe_name)
+            analysis = await otp_bot.enqueue_file(rel, safe_name)
+            countries = analysis["countries"]
             queued = True
 
-        return {"saved": True, "path": rel, "name": safe_name, "queued_for_otpbot": queued}
+        return {
+            "saved": True,
+            "path": rel,
+            "name": safe_name,
+            "queued_for_otpbot": queued,
+            "countries": countries,
+        }
 
     @app.get("/api/chat/pending_upload", dependencies=[Depends(require_api_access)])
     async def chat_pending_upload() -> dict[str, Any]:

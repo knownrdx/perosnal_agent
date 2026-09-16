@@ -905,6 +905,26 @@
                 </div>
               </div>
 
+              <label class="small" style="margin-top:10px; display:flex; align-items:center; gap:6px;">
+                <input type="checkbox" id="otpbot-frcd-enabled" style="width:auto;">
+                Force-delete each country before re-adding it (/frcd)
+              </label>
+              <p class="small" style="color:var(--text-dim); margin:-2px 0 6px;">
+                Cleanup only clears used/expired numbers. Turn this on to wipe a
+                country's stock outright first - a true replace instead of a
+                top-up, which otherwise just piles up duplicates.
+              </p>
+              <div class="row">
+                <div>
+                  <label for="otpbot-frcd-cmd">Force-delete command</label>
+                  <input type="text" id="otpbot-frcd-cmd" placeholder="/frcd {country} {uid}">
+                </div>
+                <div>
+                  <label for="otpbot-frcd-uid">Your user id (for /frcd)</label>
+                  <input type="text" id="otpbot-frcd-uid" placeholder="blank = force-delete off">
+                </div>
+              </div>
+
               <label for="otpbot-add-cmd">Add-numbers command template</label>
               <input type="text" id="otpbot-add-cmd" placeholder="/fan -t {tag} -l {limit} -c {count}">
 
@@ -2107,6 +2127,9 @@
         qs("#otpbot-threshold").value = cfg.quota_threshold != null ? cfg.quota_threshold : 0;
         qs("#otpbot-quota-cmd").value = cfg.quota_command || "/myquota";
         qs("#otpbot-cleanup-cmd").value = cfg.cleanup_command || "/useddelete";
+        qs("#otpbot-frcd-enabled").checked = !!cfg.force_delete_before_add;
+        qs("#otpbot-frcd-cmd").value = cfg.force_delete_command || "/frcd {country} {uid}";
+        qs("#otpbot-frcd-uid").value = cfg.force_delete_uid || "";
         qs("#otpbot-add-cmd").value = cfg.add_command_template || "";
         qs("#otpbot-default-tag").value = cfg.default_tag || "";
         qs("#otpbot-limit").value = cfg.limit != null ? cfg.limit : 4;
@@ -2168,14 +2191,16 @@
       var label = document.createElement("span");
       label.style.flex = "1";
       var waiting = awaitingTagFor && awaitingTagFor.id === entry.id;
-      label.textContent = entry.name + (entry.tag ? " (tag: " + entry.tag + ")" : waiting ? " - waiting for tag" : " - no tag yet");
+      var where = entry.country ? entry.country + " (" + (entry.count || 0) + ")" : entry.name;
+      label.textContent = where + (entry.tag ? " - " + entry.tag : waiting ? " - waiting for service" : " - no service yet");
+      label.title = entry.source_name || entry.name;
       row.appendChild(label);
 
       var tagInput = document.createElement("input");
       tagInput.type = "text";
-      tagInput.placeholder = "tag";
+      tagInput.placeholder = "service";
       tagInput.value = entry.tag || "";
-      tagInput.style.width = "90px";
+      tagInput.style.width = "110px";
       row.appendChild(tagInput);
 
       var tagBtn = document.createElement("button");
@@ -2212,7 +2237,9 @@
     }
     activeFiles.forEach(function (entry) {
       var p = document.createElement("div");
-      p.textContent = entry.name + " (tag: " + (entry.tag || "General") + ")";
+      var where = entry.country ? entry.country + " (" + (entry.count || 0) + ")" : entry.name;
+      p.textContent = where + " - " + (entry.tag || "General");
+      p.title = entry.source_name || entry.name;
       p.style.marginBottom = "4px";
       el.appendChild(p);
     });
@@ -2250,6 +2277,9 @@
       quota_threshold: parseInt(qs("#otpbot-threshold").value, 10) || 0,
       quota_command: qs("#otpbot-quota-cmd").value.trim() || "/myquota",
       cleanup_command: qs("#otpbot-cleanup-cmd").value.trim() || "/useddelete",
+      force_delete_before_add: qs("#otpbot-frcd-enabled").checked,
+      force_delete_command: qs("#otpbot-frcd-cmd").value.trim() || "/frcd {country} {uid}",
+      force_delete_uid: qs("#otpbot-frcd-uid").value.trim(),
       add_command_template: qs("#otpbot-add-cmd").value.trim(),
       default_tag: qs("#otpbot-default-tag").value.trim(),
       limit: parseInt(qs("#otpbot-limit").value, 10) || 4,

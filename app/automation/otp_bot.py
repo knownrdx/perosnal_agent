@@ -43,7 +43,7 @@ from app.db import repo
 from app.db.base import session_scope
 from app.integrations.telegram_user import UserbotError, get_userbot
 from app.logging_conf import get_logger
-from app.security import safe_path
+from app.security import rel_path, safe_path
 
 log = get_logger(__name__)
 
@@ -63,6 +63,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "quota_command": "/myquota",
     "quota_threshold": 0,        # refill when active quota <= this
     "cleanup_command": "/useddelete",
+    # Force-delete (Owner-level "/frcd <country> <uid>"). /useddelete only
+    # clears used/expired numbers; when a country's stock must be wiped
+    # outright before re-adding, this is the command that does it.
+    "force_delete_command": "/frcd {country} {uid}",
+    "force_delete_before_add": False,
+    "force_delete_uid": "",      # owner's own uid; blank disables force-delete
     "interval_minutes": 10,
     "default_tag": "",           # if set, every new file auto-tags with this, never asks
     "thread_id": "",             # dedicated chat thread; "" = not bound yet
@@ -160,15 +166,33 @@ async def get_last_start_result() -> dict[str, Any] | None:
         return await repo.get_setting(session, LAST_START_KEY)
 
 
-async def _get_last_tag() -> str | None:
+async def _get_last_tag(country: str | None = None) -> str | None:
+    """The tag last used - for THIS country when one is given.
+
+    Service/tag is a per-country decision in practice (Bangladesh stock is
+    not sold as the same service as Nigeria stock), so asking for a specific
+    country must NOT fall back to the global last tag: doing so silently
+    files a new country's numbers under whatever service happened to be used
+    last, which is exactly the mix-up this split exists to prevent.
+    """
     async with session_scope() as session:
         stored = await repo.get_setting(session, LAST_TAG_KEY)
-    return stored.get("tag") if stored else None
+    if not stored:
+        return None
+    if country:
+        return (stored.get("by_country") or {}).get(country)
+    return stored.get("tag")
 
 
-async def _set_last_tag(tag: str) -> None:
+async def _set_last_tag(tag: str, country: str | None = None) -> None:
     async with session_scope() as session:
-        await repo.set_setting(session, LAST_TAG_KEY, {"tag": tag})
+        stored = await repo.get_setting(session, LAST_TAG_KEY) or {}
+        by_country = dict(stored.get("by_country") or {})
+        if country:
+            by_country[country] = tag
+        await repo.set_setting(
+            session, LAST_TAG_KEY, {"tag": tag, "by_country": by_country}
+        )
 
 
 def _infer_tag_from_filename(name: str) -> str | None:
@@ -183,20 +207,33 @@ def _infer_tag_from_filename(name: str) -> str | None:
     return None
 
 
-async def _decide_tag(name: str) -> str | None:
+async def _decide_tag(name: str, country: str | None = None) -> str | None:
     """Best-effort autonomous tag decision for a newly queued file, in order:
-    1. filename says it explicitly (most reliable - the owner named it that way)
-    2. an owner-configured default_tag applies to everything
-    3. whatever tag was used last time (the common case: same campaign, new batch)
+    1. the tag last used for THIS country (strongest signal - same country,
+       same service, new batch is the normal case)
+    2. filename says it explicitly (the owner named it that way)
+    3. an owner-configured default_tag applies to everything
     Returns None only when none of the above give anything - that's the one
     case worth actually asking about.
+
+    Deliberately does NOT fall back to "the last tag used for anything" when
+    the country is known: service is a per-country decision, so inheriting
+    Nigeria's answer for a Bangladesh file would silently file the numbers
+    under the wrong service - worse than asking one short question.
     """
+    if country:
+        remembered = await _get_last_tag(country)
+        if remembered:
+            return remembered
+
     inferred = _infer_tag_from_filename(name)
     if inferred:
         return inferred
     config = await get_config()
     if config.get("default_tag"):
         return config["default_tag"]
+    if country:
+        return None
     return await _get_last_tag()
 
 
@@ -300,22 +337,57 @@ async def get_active_files() -> list[dict[str, Any]]:
 
 
 async def enqueue_file(path: str, name: str) -> dict[str, Any]:
-    """Add an uploaded file to the queue. Tries to decide its tag on its own
-    (filename hint / configured default / last-used tag) - only left
-    untagged when none of those give an answer, which is the one case where
-    asking the owner is actually necessary.
+    """Analyse an uploaded file and queue one entry PER COUNTRY found in it.
+
+    A single upload routinely mixes countries (a "numbers" export can hold
+    Dominican Republic and Bangladesh side by side) and the target bot keeps
+    stock per country, so adding the file whole would file every number under
+    one country's tag. Each country therefore becomes its own queue entry
+    with its own split-out file, and each carries the service/tag last used
+    for that country so the common case needs no questions at all.
     """
-    entry = {
-        "id": secrets.token_hex(4),
-        "path": path,
-        "name": name,
-        "tag": await _decide_tag(name),
-        "uploaded_at": _now_iso(),
-    }
+    from app.automation import phone_countries
+
+    source = safe_path(path, must_exist=True)
+    lines = source.read_text(encoding="utf-8", errors="ignore").splitlines()
+    grouped = phone_countries.split_by_country(lines)
+
     queue = await get_queue()
-    queue.append(entry)
+    created: list[dict[str, Any]] = []
+    batch_id = secrets.token_hex(4)
+
+    for country, numbers in grouped.items():
+        split_path = path
+        if len(grouped) > 1:
+            # Write the country's own file so the bot only ever receives
+            # numbers that match the country/tag the command declares.
+            safe_country = re.sub(r"[^A-Za-z0-9]+", "_", country).strip("_") or "unknown"
+            stem = name.rsplit(".", 1)[0]
+            split_name = f"{stem}__{safe_country}.txt"
+            target = safe_path(f"uploads/{split_name}")
+            target.write_text("\n".join(numbers) + "\n", encoding="utf-8")
+            split_path = rel_path(target)
+
+        entry = {
+            "id": secrets.token_hex(4),
+            "batch_id": batch_id,
+            "path": split_path,
+            "name": name if len(grouped) == 1 else f"{name} [{country}]",
+            "source_name": name,
+            "country": country,
+            "count": len(numbers),
+            "tag": await _decide_tag(name, country),
+            "uploaded_at": _now_iso(),
+        }
+        queue.append(entry)
+        created.append(entry)
+
     await _save_files(QUEUE_KEY, queue)
-    return entry
+    return {
+        "batch_id": batch_id,
+        "entries": created,
+        "countries": {c: len(n) for c, n in grouped.items()},
+    }
 
 
 async def set_queue_tag(entry_id: str, tag: str) -> dict[str, Any] | None:
@@ -324,7 +396,9 @@ async def set_queue_tag(entry_id: str, tag: str) -> dict[str, Any] | None:
         if entry["id"] == entry_id:
             entry["tag"] = tag.strip()[:60]
             await _save_files(QUEUE_KEY, queue)
-            await _set_last_tag(entry["tag"])
+            # Remembered per country, so the next Bangladesh file does not
+            # inherit the tag that happened to be used for a Nigeria file.
+            await _set_last_tag(entry["tag"], entry.get("country"))
             return entry
     return None
 
@@ -442,6 +516,26 @@ async def _wait_for_new_bot_reply(
     return None
 
 
+async def _force_delete_country(target: str, country: str, cfg: dict[str, Any]) -> str:
+    """Owner-level /frcd for one country, when configured.
+
+    /useddelete only removes used/expired numbers. Re-adding a country whose
+    stock is still live would just pile duplicates on top (the bot reports
+    them as "dup"), so when the owner wants a genuine replace rather than a
+    top-up, this wipes that country's numbers first.
+    """
+    uid = str(cfg.get("force_delete_uid") or "").strip()
+    if not uid:
+        return ""
+    command = cfg["force_delete_command"].format(country=country, uid=uid)
+
+    previous = await _last_bot_message(target)
+    previous_id = int(previous.get("id", 0)) if previous else None
+    await get_userbot().send_message(target, command)
+    reply = await _wait_for_new_bot_reply(target, after_id=previous_id, timeout_s=45.0)
+    return (reply.get("text") or "") if reply else ""
+
+
 async def _add_one_file(target: str, entry: dict[str, Any], cfg: dict[str, Any]) -> str:
     """Send one file as a reply-based add; returns the bot's reply text.
     Raises AddRejected if the bot's own reply indicates the add failed
@@ -450,6 +544,10 @@ async def _add_one_file(target: str, entry: dict[str, Any], cfg: dict[str, Any])
     file would hide the exact bug this automation exists to avoid.
     """
     target_path = safe_path(entry["path"], must_exist=True)
+
+    if cfg.get("force_delete_before_add") and entry.get("country"):
+        await _force_delete_country(target, entry["country"], cfg)
+        await _sleep(2)
 
     # Remember where the conversation stood before we touch it, so we can
     # tell this file's reply apart from whatever the bot said last.
@@ -460,7 +558,10 @@ async def _add_one_file(target: str, entry: dict[str, Any], cfg: dict[str, Any])
     await _sleep(2)
 
     command_text = cfg["add_command_template"].format(
-        tag=entry.get("tag") or "General", limit=cfg["limit"], count=cfg["count"]
+        tag=entry.get("tag") or "General",
+        limit=cfg["limit"],
+        count=cfg["count"],
+        country=entry.get("country") or "",
     )
     await get_userbot().send_message(target, command_text, reply_to=sent_file.get("message_id"))
 
@@ -496,7 +597,15 @@ async def start_automation() -> dict[str, Any]:
         return {
             "ok": False,
             "error": "every queued file needs a tag before starting",
-            "missing_tags": [{"id": e["id"], "name": e["name"]} for e in missing],
+            "missing_tags": [
+                {
+                    "id": e["id"],
+                    "name": e["name"],
+                    "country": e.get("country"),
+                    "count": e.get("count"),
+                }
+                for e in missing
+            ],
         }
 
     target = cfg["target_bot"]
@@ -508,7 +617,13 @@ async def start_automation() -> dict[str, Any]:
 
         for entry in queue:
             reply = await _add_one_file(target, entry, cfg)
-            result["files"].append({"name": entry["name"], "tag": entry["tag"], "reply": reply})
+            result["files"].append({
+                "name": entry["name"],
+                "country": entry.get("country"),
+                "count": entry.get("count"),
+                "tag": entry["tag"],
+                "reply": reply,
+            })
 
         await save_config({"enabled": True, "awaiting_tag_entry_id": None})
         await _save_files(ACTIVE_KEY, queue)
@@ -601,13 +716,32 @@ def _format_start_success(result: dict[str, Any]) -> str:
         f"{result['target_bot']}-e."
     ]
     for f in result["files"]:
-        lines.append(f"  {f['name']} (tag: {f['tag']}) -> {f['reply'][:150]}")
+        country = f.get("country") or "?"
+        lines.append(f"  {country} - {f['count']} number (tag: {f['tag']})")
+        lines.append(f"     {f['reply'][:150]}")
     lines.append("")
     lines.append(
         "Ekhon periodically quota check hobe, quota shesh hole nijei cleanup+re-add "
         "korbe. 'off' bolle bondho hobe."
     )
     return "\n".join(lines)
+
+
+def _tag_question(entry: dict[str, Any]) -> str:
+    """Ask for one country's service/tag, showing what was actually detected.
+
+    The owner needs to see WHICH country and how many numbers before naming a
+    service - the same upload can contain several countries, and the answer
+    differs per country.
+    """
+    country = entry.get("country") or "?"
+    count = entry.get("count")
+    detail = f"{count} number" if count else "numbers"
+    return (
+        f"\U0001F30D {country} - {detail}\n"
+        f"(file: {entry.get('source_name') or entry['name']})\n\n"
+        "Ei country-r jonno kon service/tag e add korbo? (jemon: WhatsApp, Telegram)"
+    )
 
 
 async def handle_start_trigger() -> str:
@@ -617,7 +751,7 @@ async def handle_start_trigger() -> str:
     entry = await next_untagged_entry()
     if entry is not None:
         await set_awaiting_tag_entry(entry["id"])
-        return f"File: {entry['name']}\nEi file-er jonno ki tag dibo? (jemon: BD, IN, General)"
+        return _tag_question(entry)
 
     queue = await get_queue()
     if not queue:
@@ -650,10 +784,8 @@ async def handle_tag_answer(text: str) -> str:
     next_entry = await next_untagged_entry()
     if next_entry is not None:
         await set_awaiting_tag_entry(next_entry["id"])
-        return (
-            f"Thik ache: {entry['name']} -> tag '{text.strip()[:60]}'.\n\n"
-            f"Aro ekta file: {next_entry['name']}\nEta-r tag ki?"
-        )
+        confirmed = f"{entry.get('country') or entry['name']} -> {text.strip()[:60]}"
+        return f"\u2705 {confirmed}\n\n{_tag_question(next_entry)}"
 
     result = await start_automation()
     if result["ok"]:

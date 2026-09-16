@@ -96,15 +96,43 @@ async def _bind_otp_thread(chat_id: int = OTP_CHAT_ID) -> str:
     return await otp_bot.ensure_thread(chat_id)
 
 
-async def _write_numbers_file(name: str = "numbers.txt") -> str:
+async def _write_numbers_file(name: str = "numbers.txt", prefix: str = "+880") -> str:
+    """One country's worth of numbers, unless a test asks for something else."""
     from app.config import get_settings
     from app.security import rel_path
 
     uploads = get_settings().workspace / "uploads"
     uploads.mkdir(parents=True, exist_ok=True)
     path = uploads / name
-    path.write_text("+880****1111\n+880****2222\n", encoding="utf-8")
+    path.write_text(f"{prefix}1711111111\n{prefix}1722222222\n", encoding="utf-8")
     return rel_path(path)
+
+
+async def _write_mixed_country_file(name: str = "mixed.txt") -> str:
+    """Bangladesh + Dominican Republic in one file, as real exports do."""
+    from app.config import get_settings
+    from app.security import rel_path
+
+    uploads = get_settings().workspace / "uploads"
+    uploads.mkdir(parents=True, exist_ok=True)
+    path = uploads / name
+    path.write_text(
+        "\n".join([
+            "+8801711111111",
+            "+8801722222222",
+            "+8801733333333",
+            "+18091234567",
+            "+18491234567",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    return rel_path(path)
+
+
+async def _enqueue_single(rel: str, name: str) -> dict[str, Any]:
+    """Queue a single-country file and hand back its one entry."""
+    analysis = await otp_bot.enqueue_file(rel, name)
+    return analysis["entries"][0]
 
 
 async def test_config_roundtrip(environment):
@@ -154,6 +182,142 @@ async def test_start_reports_a_crash_as_a_crash_not_a_bot_rejection(environment,
     assert result["ok"] is False
     assert "unexpected error (ValueError)" in result["error"]
     assert "rejected" not in result["error"]
+
+
+# --------------------------------------------------------------------------- #
+# Multi-country files: one upload can hold several countries, and the target
+# bot keeps stock per country, so each must be added under its own tag.
+# --------------------------------------------------------------------------- #
+async def test_mixed_country_file_is_split_into_one_entry_per_country(environment):
+    rel = await _write_mixed_country_file("export.txt")
+    analysis = await otp_bot.enqueue_file(rel, "export.txt")
+
+    assert analysis["countries"] == {"Bangladesh": 3, "Dominican Republic": 2}
+    queue = await otp_bot.get_queue()
+    assert len(queue) == 2
+
+    by_country = {e["country"]: e for e in queue}
+    assert by_country["Bangladesh"]["count"] == 3
+    assert by_country["Dominican Republic"]["count"] == 2
+    # Both entries came from the same upload.
+    assert len({e["batch_id"] for e in queue}) == 1
+
+
+async def test_split_files_contain_only_their_own_country(environment):
+    from app.security import safe_path
+
+    rel = await _write_mixed_country_file("export.txt")
+    await otp_bot.enqueue_file(rel, "export.txt")
+
+    for entry in await otp_bot.get_queue():
+        content = safe_path(entry["path"], must_exist=True).read_text(encoding="utf-8")
+        numbers = [n for n in content.splitlines() if n.strip()]
+        assert len(numbers) == entry["count"]
+        # Every number in the split file really is that country's.
+        from app.automation import phone_countries
+
+        assert {phone_countries.country_of(n) for n in numbers} == {entry["country"]}
+
+
+async def test_single_country_file_is_not_split(environment):
+    rel = await _write_numbers_file("bd_only.txt", prefix="+880")
+    analysis = await otp_bot.enqueue_file(rel, "bd_only.txt")
+
+    assert list(analysis["countries"]) == ["Bangladesh"]
+    queue = await otp_bot.get_queue()
+    assert len(queue) == 1
+    # No pointless copy of a file that needed no splitting.
+    assert queue[0]["path"] == rel
+
+
+async def test_tag_is_remembered_per_country_not_globally(environment):
+    """A Nigeria answer must not silently become Bangladesh's tag."""
+    rel_ng = await _write_numbers_file("ng.txt", prefix="+234")
+    entry_ng = await _enqueue_single(rel_ng, "ng.txt")
+    await otp_bot.set_queue_tag(entry_ng["id"], "WhatsApp")
+
+    rel_bd = await _write_numbers_file("bd.txt", prefix="+880")
+    entry_bd = await _enqueue_single(rel_bd, "bd.txt")
+    # Bangladesh has never been tagged, so it must not inherit Nigeria's.
+    assert entry_bd["tag"] != "WhatsApp" or entry_bd["country"] == "Nigeria"
+
+    await otp_bot.set_queue_tag(entry_bd["id"], "Telegram")
+
+    # A second Bangladesh file now answers itself.
+    rel_bd2 = await _write_numbers_file("bd2.txt", prefix="+880")
+    entry_bd2 = await _enqueue_single(rel_bd2, "bd2.txt")
+    assert entry_bd2["country"] == "Bangladesh"
+    assert entry_bd2["tag"] == "Telegram"
+
+    # And so does a second Nigeria file, with its own answer.
+    rel_ng2 = await _write_numbers_file("ng2.txt", prefix="+234")
+    entry_ng2 = await _enqueue_single(rel_ng2, "ng2.txt")
+    assert entry_ng2["country"] == "Nigeria"
+    assert entry_ng2["tag"] == "WhatsApp"
+
+
+async def test_tag_question_names_the_country_and_count(environment):
+    rel = await _write_mixed_country_file("export.txt")
+    await otp_bot.enqueue_file(rel, "export.txt")
+
+    question = await otp_bot.handle_start_trigger()
+    # The owner must be able to see WHAT they are naming a service for.
+    assert "Bangladesh" in question or "Dominican Republic" in question
+    assert "service" in question.lower() or "tag" in question.lower()
+
+
+async def test_add_command_can_reference_the_country(environment):
+    """The add template exposes {country}, for bots whose command needs it."""
+    rel = await _write_numbers_file("bd.txt", prefix="+880")
+    entry = await _enqueue_single(rel, "bd.txt")
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    await otp_bot.save_config({"add_command_template": "/fan -t {tag} -c {country}"})
+
+    fake = FakeUserbot([{"text": "Added.", "out": False}])
+    set_userbot(fake)
+    result = await otp_bot.start_automation()
+
+    assert result["ok"] is True
+    add_commands = [t for _, t, reply_to in fake.sent_messages if reply_to is not None]
+    assert add_commands and "Bangladesh" in add_commands[0]
+
+
+# --------------------------------------------------------------------------- #
+# /frcd force-delete: wipe a country's stock before re-adding it
+# --------------------------------------------------------------------------- #
+async def test_force_delete_is_skipped_unless_configured(environment):
+    rel = await _write_numbers_file("bd.txt", prefix="+880")
+    entry = await _enqueue_single(rel, "bd.txt")
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+
+    fake = FakeUserbot([{"text": "Added.", "out": False}])
+    set_userbot(fake)
+    await otp_bot.start_automation()
+
+    sent = [t for _, t, _ in fake.sent_messages]
+    assert not any(t.startswith("/frcd") for t in sent)
+
+
+async def test_force_delete_runs_per_country_before_the_add(environment):
+    rel = await _write_numbers_file("bd.txt", prefix="+880")
+    entry = await _enqueue_single(rel, "bd.txt")
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    await otp_bot.save_config({
+        "force_delete_before_add": True,
+        "force_delete_uid": "789019025",
+    })
+
+    fake = FakeUserbot([{"text": "Deleted.", "out": False}, {"text": "Added.", "out": False}])
+    set_userbot(fake)
+    result = await otp_bot.start_automation()
+
+    assert result["ok"] is True
+    sent = [t for _, t, _ in fake.sent_messages]
+    frcd = [t for t in sent if t.startswith("/frcd")]
+    assert frcd == ["/frcd Bangladesh 789019025"]
+    # It must happen BEFORE the add command for that file.
+    add_index = next(i for i, t in enumerate(sent) if t.startswith("/fan"))
+    assert sent.index(frcd[0]) < add_index
 
 
 # --------------------------------------------------------------------------- #
@@ -230,7 +394,7 @@ async def test_ensure_thread_backfills_a_missing_title(environment):
 # --------------------------------------------------------------------------- #
 async def test_enqueue_infers_tag_from_filename(environment):
     rel = await _write_numbers_file("numbers_BD_batch2.txt")
-    entry = await otp_bot.enqueue_file(rel, "numbers_BD_batch2.txt")
+    entry = await _enqueue_single(rel, "numbers_BD_batch2.txt")
     assert entry["tag"] == "BD"
     # No prompt needed - it decided on its own.
     assert await otp_bot.get_awaiting_tag_entry() is None
@@ -239,24 +403,24 @@ async def test_enqueue_infers_tag_from_filename(environment):
 async def test_enqueue_uses_default_tag_when_configured(environment):
     await otp_bot.save_config({"default_tag": "MyCampaign"})
     rel = await _write_numbers_file("plain.txt")
-    entry = await otp_bot.enqueue_file(rel, "plain.txt")
+    entry = await _enqueue_single(rel, "plain.txt")
     assert entry["tag"] == "MyCampaign"
 
 
 async def test_enqueue_reuses_last_tag(environment):
     rel1 = await _write_numbers_file("numbers_IN.txt")
-    entry1 = await otp_bot.enqueue_file(rel1, "numbers_IN.txt")
+    entry1 = await _enqueue_single(rel1, "numbers_IN.txt")
     assert entry1["tag"] == "IN"
     await otp_bot.set_queue_tag(entry1["id"], entry1["tag"])
 
     rel2 = await _write_numbers_file("plain_batch2.txt")
-    entry2 = await otp_bot.enqueue_file(rel2, "plain_batch2.txt")
+    entry2 = await _enqueue_single(rel2, "plain_batch2.txt")
     assert entry2["tag"] == "IN"  # reused, no prompt
 
 
 async def test_enqueue_leaves_untagged_when_nothing_to_go_on(environment):
     rel = await _write_numbers_file("plain.txt")
-    entry = await otp_bot.enqueue_file(rel, "plain.txt")
+    entry = await _enqueue_single(rel, "plain.txt")
     assert entry["tag"] is None
 
 
@@ -281,7 +445,7 @@ async def test_start_asks_for_missing_tags_before_running(environment):
 
 async def test_start_sends_cleanup_then_reply_based_add_per_file(environment):
     rel = await _write_numbers_file("numbers_BD.txt")
-    entry = await otp_bot.enqueue_file(rel, "numbers_BD.txt")
+    entry = await _enqueue_single(rel, "numbers_BD.txt")
     assert entry["tag"] == "BD"  # inferred, start() should proceed with no prompt
 
     fake = FakeUserbot([{"text": "\u2705 Added 2 numbers.", "out": False}])
