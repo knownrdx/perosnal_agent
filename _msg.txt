@@ -1,64 +1,21 @@
-Per-country scheduling, /st stock reads, presets, stock-empty alerts
+Deliver button presses: callback_query was missing from allowed_updates
 
-Running several countries at once exposed that the automation treated the
-active set as one batch on one clock. Bangladesh can drain in minutes while
-a Central African Republic batch lasts hours; one shared interval either
-hammers the bot for nothing or starves the fast country.
+Every inline button in the OTP panel did nothing. There was no error and no
+log line, which is what made it confusing: start_polling was called with
+allowed_updates=["message"], so Telegram dropped callback_query updates
+server-side and the handler was never reached at all. The handler, the
+keyboards and the callback payloads were all correct - the updates simply
+never arrived.
 
-Read stock with /st instead of /myquota
-  /myquota returns a single "Active : 96336" total, which cannot tell you
-  WHICH country ran out. /st (alias of /stats) reports every country in one
-  reply:
+Added a test that drives the real handler for each button (interval,
+cleanup, service, skip, per-country interval, preset, clear queue, refresh
+countries) plus the delivery config itself, and verified it by
+reintroducing the bug: the allowed_updates assertion fails with
+["message"] and passes with callback_query included.
 
-      Country Stock (yours):
-        Central African Republic: 90712 (+416 taken)
-        Bangladesh: 0
+Also covered the cases that only show up in a live chat: an unauthorised
+user tapping a button, a button tapped long after its country was removed
+(buttons live forever in chat history), and malformed payloads - none of
+which may raise inside the handler.
 
-  So one round-trip now answers for any number of countries, and only the
-  empty ones get refilled - previously an empty total re-added everything.
-
-  The parser only reads lines under the country header: the block above it
-  has a global "Available: 416036" that would otherwise be mistaken for a
-  country and mask an empty one behind a healthy-looking total. Add-notices
-  ("Bangladesh: 0 added") contain the same shape and are rejected too.
-  A /myquota-style reply still works, so an owner who kept it configured is
-  not stranded.
-
-Per-country timers and settings (app/automation/otp_schedule.py)
-  Each country gets its own interval, threshold, limit, count, service and
-  cleanup mode - all optional, falling back to the global config, so a
-  country nobody touched behaves exactly as before. Due times are persisted,
-  so a redeploy does not reset every country to "due now" and stampede the
-  bot. The scheduler now polls at the SHORTEST country interval; polling on
-  the global one would silently cap a 5-minute country at 30 minutes, which
-  is the bug this exists to fix.
-
-The country list comes from the bot, not from our prefix table
-  The phone-prefix table is only a guess used to split an upload. Every
-  per-country command (/frcd, /setlimit) and the stock report key on the
-  bot's own spelling, so a name we invented would never match. Countries are
-  now learned from each /st reply and uploads adopt that spelling; matching
-  ignores punctuation so "Central African Rep." and "...Republic" are one
-  country, not two. A "Refresh countries" button populates the list on
-  demand. Unknown countries still work - they just get corrected the first
-  time the bot reports them.
-
-Stock-empty alerts
-  A file is spent when the bot holds no stock AND the re-add contributes
-  nothing ("0 added (20000 dup)") - a successful command that changed
-  nothing. Without reading that count, a dead file would cycle forever and
-  the owner would never learn. They now get told which country ran dry and
-  that a new file is needed, deduped per country so a dead file does not
-  re-alert every cycle (which just trains people to ignore alerts) while a
-  different country running dry still gets through.
-
-Presets
-  Four built-ins (fast burn / steady / slow / replace stock) plus the
-  owner's own, appliable per country from either UI. Built-ins can be
-  overwritten but not deleted, so a wrong default is correctable.
-
-Both UIs: Telegram gets per-country, preset and refresh buttons; the web
-panel gets a per-country schedule table with inline interval/limit editing
-and a preset manager.
-
-668 passing, smoke 10/10.
+682 passing.

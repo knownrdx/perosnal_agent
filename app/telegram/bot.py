@@ -1083,7 +1083,14 @@ class AgentBot:
             return
         await self.bot.delete_webhook(drop_pending_updates=True)
         self._task = asyncio.create_task(
-            self.dp.start_polling(self.bot, handle_signals=False, allowed_updates=["message"])
+            # callback_query is required or Telegram never delivers a button
+            # press - the update is dropped server-side, so the symptom is a
+            # button that does nothing and logs nothing at all.
+            self.dp.start_polling(
+                self.bot,
+                handle_signals=False,
+                allowed_updates=["message", "callback_query"],
+            )
         )
         log.info("telegram_started", extra={"allowed_users": len(self.settings.allowed_user_ids)})
 
