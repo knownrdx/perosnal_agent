@@ -58,6 +58,7 @@ async def _session_snapshot(chat_id: int) -> dict[str, Any]:
     async with session_scope() as session:
         row = await repo.ensure_session(session, chat_id)
         mode, active_id, last_id = row.mode, row.active_task_id, row.last_task_id
+        pending_upload = dict(row.context or {}).get("pending_upload")
 
         active_request, active_status = "", ""
         if active_id:
@@ -82,6 +83,7 @@ async def _session_snapshot(chat_id: int) -> dict[str, Any]:
         "active_request": active_request,
         "active_status": active_status,
         "turns": turns,
+        "pending_upload": pending_upload,
     }
 
 
@@ -259,10 +261,19 @@ async def handle_message(
 
     # ------------------------------------------------------------------ #
     # New task
+    request_text = text
+    pending_upload = snapshot.get("pending_upload")
+    if pending_upload and pending_upload.get("path"):
+        request_text = (
+            f"{text}\n\n"
+            f"[Attached file: {pending_upload['path']} "
+            f"(uploaded as \"{pending_upload.get('name', '')}\")]"
+        )
+
     async with session_scope() as session:
         task = await repo.create_task(
             session,
-            user_request=text,
+            user_request=request_text,
             title=text[:80],
             chat_id=chat_id,
             user_id=user_id,
@@ -273,12 +284,16 @@ async def handle_message(
         )
         task_id = task.id
         row = await repo.ensure_session(session, chat_id)
+        session_ctx = dict(row.context or {})
+        if pending_upload:
+            session_ctx.pop("pending_upload", None)
         await repo.update_session(
             session, chat_id,
             active_task_id=task_id,
             last_task_id=task_id,
             turn_count=row.turn_count + 1,
             title=row.title or text[:80],
+            context=session_ctx,
         )
 
     answer = (

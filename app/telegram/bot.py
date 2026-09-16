@@ -288,11 +288,25 @@ class AgentBot:
                     return
                 context = dict(task.context or {})
                 context.setdefault("user_replies", []).append(answer)
+
+                answer_text = answer
+                chat_row = await repo.ensure_session(session, message.chat.id)
+                chat_ctx = dict(chat_row.context or {})
+                pending_upload = chat_ctx.get("pending_upload")
+                if pending_upload and pending_upload.get("path"):
+                    answer_text = (
+                        f"{answer}\n\n"
+                        f"[Attached file: {pending_upload['path']} "
+                        f"(uploaded as \"{pending_upload.get('name', '')}\")]"
+                    )
+                    chat_ctx.pop("pending_upload", None)
+                    await repo.update_session(session, message.chat.id, context=chat_ctx)
+
                 await repo.update_task(
                     session,
                     task.id,
                     context=context,
-                    user_request=f"{task.user_request}\n\n[owner reply] {answer}",
+                    user_request=f"{task.user_request}\n\n[owner reply] {answer_text}",
                     status=TaskStatus.PENDING.value,
                     run_after=None,
                 )
@@ -542,9 +556,17 @@ class AgentBot:
 
             from app.security import rel_path
 
+            rel = rel_path(target)
+            async with session_scope() as db_session:
+                row = await repo.ensure_session(db_session, message.chat.id)
+                ctx = dict(row.context or {})
+                ctx["pending_upload"] = {"path": rel, "name": safe_name}
+                await repo.update_session(db_session, message.chat.id, context=ctx)
+
             await message.answer(
-                f"\U0001F4C1 Saved: {rel_path(target)}\n\n"
-                "Tell me what to do with it, e.g. \"add these numbers to @PBDxbot\"."
+                f"\U0001F4C1 Saved: {rel}\n\n"
+                "Tell me what to do with it, e.g. \"add these numbers to @PBDxbot\" "
+                "- I will attach this file automatically to your next instruction."
             )
 
         @dp.message(F.text & ~F.text.startswith("/"))

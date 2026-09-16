@@ -131,6 +131,48 @@ async def test_three_greetings_still_create_no_tasks(environment, echo_llm):
 
 
 # --------------------------------------------------------------------------- #
+# A file the owner uploaded before instructing gets attached automatically
+# --------------------------------------------------------------------------- #
+async def test_pending_upload_is_attached_to_the_next_task(environment, echo_llm):
+    """Regression: /tglogin bug's sibling - uploading a file then instructing
+    in a separate message left the agent with no reference to the file at
+    all, so it asked the owner "which file?" even though they had just sent
+    one. The Telegram document handler stores {"pending_upload": {...}} on
+    the chat session's context; handle_message must fold that into the new
+    task's request and then clear it so a later unrelated task does not
+    re-attach a stale file.
+    """
+    async with session_scope() as session:
+        row = await repo.ensure_session(session, CHAT_ID)
+        await repo.update_session(
+            session, CHAT_ID,
+            context={"pending_upload": {"path": "uploads/numbers.txt", "name": "numbers.txt"}},
+        )
+
+    reply = await handle_message(
+        CHAT_ID, USER_ID, "add these numbers to @PBDxbot", llm=echo_llm
+    )
+    assert reply.created_task is True
+
+    async with session_scope() as session:
+        task = await repo.get_task(session, reply.task_id)
+        chat_row = await repo.get_session(session, CHAT_ID)
+
+    assert "uploads/numbers.txt" in task.user_request
+    # Consumed, not left dangling for the next unrelated message to inherit.
+    assert "pending_upload" not in (chat_row.context or {})
+
+
+async def test_no_pending_upload_leaves_request_untouched(environment, echo_llm):
+    reply = await handle_message(
+        CHAT_ID, USER_ID, "search the web for mikrotik hotspot setup", llm=echo_llm
+    )
+    async with session_scope() as session:
+        task = await repo.get_task(session, reply.task_id)
+    assert "Attached file" not in task.user_request
+
+
+# --------------------------------------------------------------------------- #
 # Follow-ups attach instead of duplicating
 # --------------------------------------------------------------------------- #
 async def test_follow_up_attaches_to_running_task(environment, echo_llm):

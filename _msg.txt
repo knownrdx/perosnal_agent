@@ -1,0 +1,29 @@
+Attach an uploaded file to the very next instruction automatically
+
+The owner sent a .txt file, then in a separate message said "add these
+numbers to @PBDxbot". The agent had no idea a file existed - task_create
+only ever saw the text of the instruction, never what had been uploaded
+moments earlier - so it stalled on WAITING_FOR_USER asking which file.
+
+Telegram splits "here's a file" and "here's what to do with it" into two
+messages by design (you cannot caption a document with your real intent
+and expect an agent to parse that intent out of a caption reliably), so the
+fix has to bridge them without the owner repeating the path back.
+
+The document handler already had nowhere to put "I just saved this" other
+than a reply string. Now it also writes {"pending_upload": {path, name}}
+onto the chat session's JSON context - the same context row conversation.py
+already reads every turn for mode/active-task state. handle_message folds
+it into the new task's request as a bracketed [Attached file: ...] note
+and clears it immediately, so a later unrelated task never inherits a
+stale reference. /reply gets the identical treatment, since a task sitting
+in WAITING_FOR_USER asking "which file?" is exactly the case this exists
+to prevent.
+
+Two new tests prove both directions: the attach happens when a pending
+upload exists, and requests are left untouched (no phantom "[Attached
+file: ...]" text) when there isn't one - a chat asking to search the web
+right after an unrelated upload from days ago must not silently pull that
+old file in.
+
+548 tests (2 new), full suite green.
