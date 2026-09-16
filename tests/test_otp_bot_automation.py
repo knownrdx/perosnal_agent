@@ -128,6 +128,10 @@ async def test_thread_is_titled_so_it_is_findable(environment):
         threads = await repo.list_threads(session, OTP_CHAT_ID, limit=10)
     match = [t for t in threads if t["thread_id"] == thread_id]
     assert match, "the dedicated thread must show up in the thread list"
+    # A nameless "New chat" entry would defeat the whole point - the owner
+    # has to be able to spot this thread in the list without guessing.
+    assert match[0]["title"].startswith(otp_bot.THREAD_TITLE[:20])
+    assert match[0]["title"] != "New chat"
 
 
 # --------------------------------------------------------------------------- #

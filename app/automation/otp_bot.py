@@ -232,10 +232,17 @@ async def ensure_thread(chat_id: int) -> str:
                 return bound
 
         new_thread = await repo.reset_session(session, chat_id)
+        # Seeded with role="user" deliberately: list_threads titles a thread
+        # from its first USER message, so an assistant-role seed would leave
+        # this showing as a nameless "New chat" in the thread list - exactly
+        # the "which chat was it again?" problem this thread exists to solve.
+        await repo.add_message(
+            session, chat_id=chat_id, role="user",
+            content=THREAD_TITLE, thread_id=new_thread,
+        )
         await repo.add_message(
             session, chat_id=chat_id, role="assistant",
             content=(
-                f"{THREAD_TITLE}\n\n"
                 "Send number files here (one at a time is fine), then say "
                 "\"start\" when you're done. Anything sent in this thread goes "
                 "straight into the OTP-bot queue - files sent in other threads "
