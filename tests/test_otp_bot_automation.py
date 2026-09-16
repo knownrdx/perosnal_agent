@@ -815,6 +815,211 @@ async def test_settings_listing_shows_current_values(environment):
 
 
 # --------------------------------------------------------------------------- #
+# Finishing on its own: N re-adds, or N minutes, then optionally delete
+# --------------------------------------------------------------------------- #
+async def _active_country(name: str = "bd.txt", prefix: str = "+880") -> dict:
+    rel = await _write_numbers_file(name, prefix=prefix)
+    entry = (await otp_bot.enqueue_file(rel, name))["entries"][0]
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    await otp_bot.start_automation()
+    return entry
+
+
+def _empty_stock_bot() -> FakeUserbot:
+    """Bot with zero Bangladesh stock, so every cycle wants to refill."""
+    return FakeUserbot([
+        {"text": REAL_ST_REPLY, "out": False},
+        {"text": "\u2705 500 added", "out": False},
+    ])
+
+
+async def test_a_country_stops_after_its_refill_limit(environment):
+    """"Run it 2 times" must mean 2, not 3 - the check happens before the
+    re-add, not after.
+    """
+    from app.automation import otp_schedule
+
+    await _active_country()
+    await otp_schedule.set_country_settings("Bangladesh", {"max_refills": 2})
+
+    for _ in range(2):
+        await _make_everything_due()
+        set_userbot(_empty_stock_bot())
+        result = await otp_bot.run_cycle(await otp_bot.get_config())
+        assert result.finished == []
+
+    await _make_everything_due()
+    set_userbot(_empty_stock_bot())
+    third = await otp_bot.run_cycle(await otp_bot.get_config())
+
+    assert [f["country"] for f in third.finished] == ["Bangladesh"]
+    assert "2 bar" in third.finished[0]["reason"]
+    # And it stops being monitored.
+    assert await otp_bot.get_active_files() == []
+
+
+async def test_a_country_stops_after_its_time_limit(environment):
+    from app.automation import otp_schedule
+
+    await _active_country()
+    await otp_schedule.set_country_settings("Bangladesh", {"run_minutes": 30})
+
+    # Backdate the run so the limit has passed.
+    state = await otp_schedule._get_run_state()
+    state["bangladesh"]["started_at"] = (
+        datetime.now(timezone.utc) - timedelta(minutes=31)
+    ).isoformat()
+    await otp_schedule._save_run_state(state)
+
+    await _make_everything_due()
+    set_userbot(_empty_stock_bot())
+    result = await otp_bot.run_cycle(await otp_bot.get_config())
+
+    assert [f["country"] for f in result.finished] == ["Bangladesh"]
+    assert "30 min" in result.finished[0]["reason"]
+
+
+async def test_no_limits_means_it_keeps_running(environment):
+    """The default must stay "run until told to stop"."""
+    await _active_country()
+
+    for _ in range(3):
+        await _make_everything_due()
+        set_userbot(_empty_stock_bot())
+        result = await otp_bot.run_cycle(await otp_bot.get_config())
+        assert result.finished == []
+
+    assert len(await otp_bot.get_active_files()) == 1
+
+
+async def test_finishing_deletes_the_numbers_when_asked(environment):
+    from app.automation import otp_schedule
+
+    await _active_country()
+    await otp_schedule.set_country_settings(
+        "Bangladesh", {"max_refills": 1, "delete_when_done": True}
+    )
+    await otp_bot.save_config({"force_delete_uid": "12345"})
+
+    await _make_everything_due()
+    set_userbot(_empty_stock_bot())
+    await otp_bot.run_cycle(await otp_bot.get_config())
+
+    await _make_everything_due()
+    bot = FakeUserbot([
+        {"text": REAL_ST_REPLY, "out": False},
+        {"text": "\U0001F5D1 Deleted 500 numbers", "out": False},
+    ])
+    set_userbot(bot)
+    result = await otp_bot.run_cycle(await otp_bot.get_config())
+
+    assert result.finished[0]["deleted"] is True
+    sent = " ".join(text for _, text, *_rest in bot.sent_messages)
+    assert "/frcd Bangladesh 12345" in sent
+
+
+async def test_finishing_does_not_delete_by_default(environment):
+    """Deleting is irreversible on the bot, so a run merely ending must not
+    trigger it.
+    """
+    from app.automation import otp_schedule
+
+    await _active_country()
+    await otp_schedule.set_country_settings("Bangladesh", {"max_refills": 1})
+
+    await _make_everything_due()
+    set_userbot(_empty_stock_bot())
+    await otp_bot.run_cycle(await otp_bot.get_config())
+
+    await _make_everything_due()
+    bot = _empty_stock_bot()
+    set_userbot(bot)
+    result = await otp_bot.run_cycle(await otp_bot.get_config())
+
+    assert result.finished[0]["deleted"] is False
+    assert "/frcd" not in " ".join(text for _, text, *_r in bot.sent_messages)
+
+
+async def test_delete_without_a_uid_reports_it_instead_of_sending_junk(environment):
+    """Sending "/frcd Bangladesh {uid}" literally is a silent no-op that
+    looks like it worked.
+    """
+    from app.automation import otp_schedule
+
+    await _active_country()
+    await otp_schedule.set_country_settings(
+        "Bangladesh", {"max_refills": 1, "delete_when_done": True}
+    )
+    await otp_bot.save_config({"force_delete_uid": ""})
+
+    await _make_everything_due()
+    set_userbot(_empty_stock_bot())
+    await otp_bot.run_cycle(await otp_bot.get_config())
+
+    await _make_everything_due()
+    bot = _empty_stock_bot()
+    set_userbot(bot)
+    result = await otp_bot.run_cycle(await otp_bot.get_config())
+
+    assert result.finished[0]["deleted"] is False
+    assert "user id" in result.finished[0]["error"]
+    assert "{uid}" not in " ".join(text for _, text, *_r in bot.sent_messages)
+    # The run still ends - a failed delete must not leave it cycling.
+    assert await otp_bot.get_active_files() == []
+
+
+async def test_limits_are_per_country(environment):
+    """One country finishing must not retire a sibling that is still going."""
+    from app.automation import otp_schedule
+
+    # Both countries queued BEFORE starting: start_automation replaces the
+    # active set, so starting twice would drop the first country.
+    for name, prefix in (("bd.txt", "+880"), ("ng.txt", "+234")):
+        rel = await _write_numbers_file(name, prefix=prefix)
+        entry = (await otp_bot.enqueue_file(rel, name))["entries"][0]
+        await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    await otp_bot.start_automation()
+    assert len(await otp_bot.get_active_files()) == 2
+
+    await otp_schedule.set_country_settings("Bangladesh", {"max_refills": 0})
+    await otp_schedule.set_country_settings("Nigeria", {"max_refills": 1})
+
+    for _ in range(2):
+        await _make_everything_due()
+        set_userbot(FakeUserbot([
+            {"text": REAL_ST_REPLY, "out": False},
+            {"text": "\u2705 500 added", "out": False},
+        ]))
+        await otp_bot.run_cycle(await otp_bot.get_config())
+
+    remaining = {e.get("country") for e in await otp_bot.get_active_files()}
+    assert "Bangladesh" in remaining
+    assert "Nigeria" not in remaining
+
+
+async def test_the_owner_is_told_when_a_run_finishes(environment):
+    from app.automation import otp_schedule
+
+    await _active_country()
+    await otp_schedule.set_country_settings("Bangladesh", {"max_refills": 1})
+
+    await _make_everything_due()
+    set_userbot(_empty_stock_bot())
+    await otp_bot.run_cycle(await otp_bot.get_config())
+
+    await _make_everything_due()
+    set_userbot(_empty_stock_bot())
+    notifier = _CapturingNotifier()
+    await _run_scheduler_once(notifier)
+
+    joined = " ".join(n["text"] for n in notifier.sent)
+    assert "shesh" in joined
+    assert "Bangladesh" in joined
+
+
+# --------------------------------------------------------------------------- #
 # Removing things the owner decided against
 # --------------------------------------------------------------------------- #
 async def test_skip_during_the_tag_question_drops_that_country(environment):

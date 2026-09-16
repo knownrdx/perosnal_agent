@@ -271,6 +271,87 @@ async def test_an_unknown_action_is_acknowledged(runner):
     assert query.acks
 
 
+async def test_threshold_button_sets_the_restock_point(runner):
+    """Restocking only at zero means the country goes dead between checks;
+    this is how the owner picks "top up at N left" instead.
+    """
+    entry = await _queue_one()
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+
+    await _handler(runner)(_Query("otp:cthr:0:500", await _owner_id(runner)))
+
+    settings = await otp_schedule.get_country_settings("Bangladesh")
+    assert settings["quota_threshold"] == 500
+
+
+async def test_a_custom_interval_is_asked_for_then_applied(runner):
+    """The listed values are shortcuts - without a custom path the owner
+    cannot pick 7 or 90 minutes from Telegram at all.
+    """
+    from app.agent import conversation
+
+    entry = await _queue_one()
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+
+    query = _Query("otp:cintc:0", await _owner_id(runner))
+    await _handler(runner)(query)
+    pending = await otp_bot.get_pending_input()
+    assert pending["field"] == "interval_minutes"
+    assert pending["country"] == "Bangladesh"
+
+    # The next message in the OTP thread is the answer.
+    reply = await otp_bot.handle_pending_input("7")
+    assert "7" in reply
+    settings = await otp_schedule.get_country_settings("Bangladesh")
+    assert settings["interval_minutes"] == 7
+    assert not (await otp_bot.get_pending_input() or {}).get("field")
+
+
+async def test_a_custom_threshold_is_asked_for_then_applied(runner):
+    entry = await _queue_one()
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+
+    await _handler(runner)(_Query("otp:cthrc:0", await _owner_id(runner)))
+    await otp_bot.handle_pending_input("1500")
+
+    settings = await otp_schedule.get_country_settings("Bangladesh")
+    assert settings["quota_threshold"] == 1500
+
+
+async def test_a_bad_custom_value_keeps_the_question_open(runner):
+    """Dropping the question on a typo loses the context and the owner has
+    to start the whole button flow again.
+    """
+    entry = await _queue_one()
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    await _handler(runner)(_Query("otp:cintc:0", await _owner_id(runner)))
+
+    reply = await otp_bot.handle_pending_input("onek tara tari")
+    assert "\u274c" in reply.lower() or "number" in reply.lower()
+    # Still pending, so the next message is still read as the answer.
+    assert (await otp_bot.get_pending_input())["field"] == "interval_minutes"
+
+    assert "10" in await otp_bot.handle_pending_input("10")
+
+
+async def test_a_custom_value_can_be_abandoned(runner):
+    await _handler(runner)(_Query("otp:intc:", await _owner_id(runner)))
+    assert (await otp_bot.get_pending_input())["field"] == "interval_minutes"
+
+    await otp_bot.handle_pending_input("bad")
+    assert not (await otp_bot.get_pending_input() or {}).get("field")
+
+
+async def test_nothing_pending_means_ordinary_chat_is_untouched(environment):
+    """handle_pending_input must return None, not swallow the message."""
+    assert await otp_bot.handle_pending_input("kemon acho") is None
+
+
+async def test_global_threshold_button_sets_the_default(runner):
+    await _handler(runner)(_Query("otp:thr:1000", await _owner_id(runner)))
+    assert (await otp_bot.get_config())["quota_threshold"] == 1000
+
+
 class _Command:
     """Stands in for aiogram's CommandObject."""
 

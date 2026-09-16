@@ -689,6 +689,42 @@ class AgentBot:
                     )
                 return
 
+            if action == "ask_thr":
+                cfg = await otp_bot.get_config()
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        "\U0001F4E6 Koto number baki thakle restock korbo? "
+                        "(Country-r nijer setting thakle oita age)",
+                        reply_markup=otp_panel.threshold_keyboard(cfg["quota_threshold"]),
+                    )
+                return
+
+            if action == "thr":
+                threshold = int(rest)
+                await otp_bot.save_config({"quota_threshold": threshold})
+                await query.answer(f"Restock at {threshold}")
+                await refresh_panel(
+                    "\U0001F4E6 Default: khali hole restock hobe."
+                    if threshold == 0
+                    else f"\U0001F4E6 Default: {threshold} baki thakle restock hobe."
+                )
+                return
+
+            if action in {"intc", "thrc"}:
+                field = "interval_minutes" if action == "intc" else "quota_threshold"
+                await otp_bot.set_pending_input(field, None)
+                await query.answer()
+                prompt = (
+                    "\u23F1 Koto min por por check korbo? Number likho (1-1440)."
+                    if field == "interval_minutes"
+                    else "\U0001F4E6 Koto number baki thakle restock korbo? "
+                    "Number likho (0 = khali hole)."
+                )
+                with contextlib.suppress(Exception):
+                    await query.message.answer(f"{prompt}\n\n(Bad dite 'bad' likho.)")
+                return
+
             if action == "ask_clean":
                 cfg = await otp_bot.get_config()
                 await query.answer()
@@ -721,9 +757,9 @@ class AgentBot:
                 return
 
             if action == "ask_country":
-                # Per-country settings: pick the country, then the interval.
+                # Per-country settings: pick the country, then what to change.
                 entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                markup = otp_panel.country_keyboard(entries, "pickc")
+                markup = otp_panel.country_keyboard(entries, "fields")
                 await query.answer()
                 if markup is None:
                     with contextlib.suppress(Exception):
@@ -732,6 +768,30 @@ class AgentBot:
                 with contextlib.suppress(Exception):
                     await query.message.answer(
                         "\U0001F30D Kon country-r setting bodlabo?", reply_markup=markup
+                    )
+                return
+
+            if action == "fields":
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                index = int(rest)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                country = names[index]
+                cfg = await otp_bot.get_config()
+                current = await otp_schedule.effective_config(country, cfg)
+                threshold = current.get("quota_threshold")
+                await query.answer()
+                summary = (
+                    f"\U0001F30D {country}\n"
+                    f"Ekhon: {current.get('interval_minutes')} min por por check, "
+                    + ("khali hole restock" if not threshold else f"{threshold} baki thakle restock")
+                )
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        f"{summary}\n\nKi bodlate chao?",
+                        reply_markup=otp_panel.country_field_keyboard(index, country),
                     )
                 return
 
@@ -753,6 +813,72 @@ class AgentBot:
                             index, current.get("interval_minutes")
                         ),
                     )
+                return
+
+            if action == "pickt":
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                index = int(rest)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                country = names[index]
+                cfg = await otp_bot.get_config()
+                current = await otp_schedule.effective_config(country, cfg)
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        f"\U0001F4E6 {country}: koto number baki thakle restock korbo?",
+                        reply_markup=otp_panel.country_threshold_keyboard(
+                            index, current.get("quota_threshold")
+                        ),
+                    )
+                return
+
+            if action == "cthr":
+                index_raw, value_raw = rest.split(":", 1)
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                index = int(index_raw)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                country = names[index]
+                threshold = int(value_raw)
+                await otp_schedule.set_country_settings(
+                    country, {"quota_threshold": threshold}
+                )
+                await query.answer(f"{country}: restock at {threshold}")
+                note = (
+                    f"\U0001F4E6 {country}: khali hole restock hobe."
+                    if threshold == 0
+                    else f"\U0001F4E6 {country}: {threshold} baki thakle restock hobe."
+                )
+                await refresh_panel(note)
+                return
+
+            if action in {"cintc", "cthrc"}:
+                # Custom value: ask for it and consume the owner's next
+                # message (handled in conversation.py, so it works from the
+                # web chat too).
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                index = int(rest)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                country = names[index]
+                field = "interval_minutes" if action == "cintc" else "quota_threshold"
+                await otp_bot.set_pending_input(field, country)
+                await query.answer()
+                prompt = (
+                    f"\u23F1 {country}: koto min por por check korbo? Number likho (1-1440)."
+                    if field == "interval_minutes"
+                    else f"\U0001F4E6 {country}: koto number baki thakle restock korbo? "
+                    "Number likho (0 = khali hole)."
+                )
+                with contextlib.suppress(Exception):
+                    await query.message.answer(f"{prompt}\n\n(Bad dite 'bad' likho.)")
                 return
 
             if action == "cint":

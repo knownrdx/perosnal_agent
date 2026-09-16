@@ -50,7 +50,34 @@ def interval_keyboard(current: int | None = None) -> InlineKeyboardMarkup:
         )
         for minutes in otp_bot.INTERVAL_CHOICES
     ]
-    return InlineKeyboardMarkup(inline_keyboard=_rows(buttons, per_row=3))
+    rows = _rows(buttons, per_row=3)
+    rows.append([
+        InlineKeyboardButton(
+            text="\u270F\uFE0F Onno somoy (custom)", callback_data=f"{PREFIX}:intc:"
+        )
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def threshold_keyboard(current: int | None = None) -> InlineKeyboardMarkup:
+    """Default restock point for every country without its own setting."""
+    buttons = [
+        InlineKeyboardButton(
+            text=(
+                ("\u2705 " if t == current else "")
+                + ("Khali hole" if t == 0 else f"{t:,} baki")
+            ),
+            callback_data=f"{PREFIX}:thr:{t}",
+        )
+        for t in otp_bot.THRESHOLD_CHOICES
+    ]
+    rows = _rows(buttons, per_row=3)
+    rows.append([
+        InlineKeyboardButton(
+            text="\u270F\uFE0F Onno number (custom)", callback_data=f"{PREFIX}:thrc:"
+        )
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def cleanup_keyboard(force_enabled: bool = False) -> InlineKeyboardMarkup:
@@ -77,10 +104,13 @@ def control_keyboard(enabled: bool) -> InlineKeyboardMarkup:
         [toggle, InlineKeyboardButton(text="\U0001F504 Check now", callback_data=f"{PREFIX}:run:")],
         [
             InlineKeyboardButton(text="\u23F1 Interval", callback_data=f"{PREFIX}:ask_int:"),
-            InlineKeyboardButton(text="\U0001F9F9 Cleanup", callback_data=f"{PREFIX}:ask_clean:"),
+            InlineKeyboardButton(text="\U0001F4E6 Restock at", callback_data=f"{PREFIX}:ask_thr:"),
         ],
         [
+            InlineKeyboardButton(text="\U0001F9F9 Cleanup", callback_data=f"{PREFIX}:ask_clean:"),
             InlineKeyboardButton(text="\U0001F30D Per country", callback_data=f"{PREFIX}:ask_country:"),
+        ],
+        [
             InlineKeyboardButton(text="\U0001F4D0 Presets", callback_data=f"{PREFIX}:ask_preset:"),
         ],
         [
@@ -147,7 +177,61 @@ def country_interval_keyboard(country_index: int, current: int | None) -> Inline
         )
         for m in otp_bot.INTERVAL_CHOICES
     ]
-    return InlineKeyboardMarkup(inline_keyboard=_rows(buttons, per_row=3))
+    rows = _rows(buttons, per_row=3)
+    # The listed values are shortcuts, not the whole range - without this the
+    # owner cannot pick 7 or 90 minutes from Telegram at all.
+    rows.append([
+        InlineKeyboardButton(
+            text="\u270F\uFE0F Onno somoy (custom)",
+            callback_data=f"{PREFIX}:cintc:{country_index}",
+        )
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def country_threshold_keyboard(country_index: int, current: int | None) -> InlineKeyboardMarkup:
+    """When to restock this country - by numbers left, not only at zero."""
+    buttons = [
+        InlineKeyboardButton(
+            text=(
+                ("\u2705 " if t == current else "")
+                + ("Khali hole" if t == 0 else f"{t:,} baki")
+            ),
+            callback_data=f"{PREFIX}:cthr:{country_index}:{t}",
+        )
+        for t in otp_bot.THRESHOLD_CHOICES
+    ]
+    rows = _rows(buttons, per_row=3)
+    rows.append([
+        InlineKeyboardButton(
+            text="\u270F\uFE0F Onno number (custom)",
+            callback_data=f"{PREFIX}:cthrc:{country_index}",
+        )
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def country_field_keyboard(country_index: int, country: str) -> InlineKeyboardMarkup:
+    """What about this country do you want to change?"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="\u23F1 Koto por por check",
+                callback_data=f"{PREFIX}:pickc:{country_index}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="\U0001F4E6 Koto baki thakte restock",
+                callback_data=f"{PREFIX}:pickt:{country_index}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="\U0001F4D0 Preset", callback_data=f"{PREFIX}:prec:{country_index}"
+            ),
+        ],
+    ])
 
 
 def removal_keyboard(entries: list[dict[str, Any]]) -> InlineKeyboardMarkup | None:
@@ -186,6 +270,7 @@ async def status_text() -> str:
         f"Running: {'yes' if config['enabled'] else 'no'}",
         f"Target: {config['target_bot']}",
         f"Stock check: {config['quota_command']}",
+        f"Restock when: {'khali hole' if not config['quota_threshold'] else str(config['quota_threshold']) + ' baki'}",
         f"Cleanup: {'wipe country first (/frcd)' if config.get('force_delete_before_add') else 'used/expired only'}",
     ]
 
@@ -205,9 +290,14 @@ async def status_text() -> str:
             due = row.get("due_in_seconds")
             when = "due now" if due is None or due <= 0 else f"in {max(1, due // 60)}m"
             mark = " *" if row.get("customised") else ""
+            restock = (
+                "khali hole" if not row.get("quota_threshold")
+                else f"{row['quota_threshold']} baki"
+            )
             lines.append(
                 f"  {country} ({entry.get('count') or 0}) - {entry.get('tag') or 'General'}"
-                f" | every {row.get('interval_minutes')}m, next {when}{mark}"
+                f" | every {row.get('interval_minutes')}m, restock {restock},"
+                f" next {when}{mark}"
             )
         if any(overview.get(c, {}).get("customised") for c in overview):
             lines.append("  (* = custom settings for that country)")

@@ -192,6 +192,9 @@ class OtpCountryRequest(BaseModel):
     quota_threshold: int | None = Field(default=None, ge=0)
     limit: int | None = Field(default=None, ge=1, le=10000)
     count: int | None = Field(default=None, ge=1, le=10000)
+    max_refills: int | None = Field(default=None, ge=0, le=10000)
+    run_minutes: int | None = Field(default=None, ge=0, le=100000)
+    delete_when_done: bool | None = None
     tag: str | None = Field(default=None, max_length=60)
     force_delete_before_add: bool | None = None
     note: str | None = Field(default=None, max_length=200, alias="_note")
@@ -215,6 +218,10 @@ class OtpBotConfigRequest(BaseModel):
     force_delete_command: str | None = None
     force_delete_before_add: bool | None = None
     force_delete_uid: str | None = None
+    max_refills: int | None = Field(default=None, ge=0, le=10000)
+    run_minutes: int | None = Field(default=None, ge=0, le=100000)
+    delete_when_done: bool | None = None
+    delete_done_command: str | None = None
     interval_minutes: int | None = None
     default_tag: str | None = None
 

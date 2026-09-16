@@ -44,6 +44,11 @@ OVERRIDABLE = (
     "count",
     "tag",
     "force_delete_before_add",
+    # Lifecycle: when should this country stop on its own? Without these a
+    # started country runs until the owner remembers to stop it.
+    "max_refills",       # stop after N re-adds (0 = no limit)
+    "run_minutes",       # stop N minutes after starting (0 = no limit)
+    "delete_when_done",  # clear the country's numbers off the bot at the end
 )
 
 # Starting points, not a closed list - the owner edits these or adds their
@@ -84,6 +89,19 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "_note": (
             "Refills at 200 left instead of waiting for zero, so the country "
             "never actually runs dry. Wipes with /frcd first - needs your uid."
+        ),
+    },
+    "One-shot burst": {
+        "interval_minutes": 5,
+        "quota_threshold": 200,
+        "limit": 4,
+        "count": 4,
+        "max_refills": 5,
+        "delete_when_done": True,
+        "force_delete_before_add": False,
+        "_note": (
+            "Short campaign: refills at 200 left, stops after 5 re-adds, then "
+            "clears the country off the bot. Needs your uid for the delete."
         ),
     },
     "Replace stock": {
@@ -248,6 +266,82 @@ async def due_countries(countries: list[str], base: dict[str, Any]) -> list[str]
     if dirty:
         await _save_due_map(due_map)
     return ready
+
+
+RUN_STATE_KEY = "otp_bot_country_runstate"
+
+
+async def _get_run_state() -> dict[str, dict[str, Any]]:
+    async with session_scope() as session:
+        stored = await repo.get_setting(session, RUN_STATE_KEY)
+    return dict(stored or {})
+
+
+async def _save_run_state(state: dict[str, dict[str, Any]]) -> None:
+    async with session_scope() as session:
+        await repo.set_setting(session, RUN_STATE_KEY, state)
+
+
+async def begin_run(country: str) -> None:
+    """Mark a country as freshly started: zero refills, clock from now."""
+    state = await _get_run_state()
+    state[_key(country)] = {
+        "started_at": _now().isoformat(),
+        "refills": 0,
+        "display_name": country.strip(),
+    }
+    await _save_run_state(state)
+
+
+async def record_refill(country: str) -> int:
+    """Count one re-add for this country. Returns the new total."""
+    state = await _get_run_state()
+    entry = state.get(_key(country)) or {
+        "started_at": _now().isoformat(),
+        "refills": 0,
+        "display_name": country.strip(),
+    }
+    entry["refills"] = int(entry.get("refills", 0)) + 1
+    entry["last_refill_at"] = _now().isoformat()
+    state[_key(country)] = entry
+    await _save_run_state(state)
+    return entry["refills"]
+
+
+async def get_run_state(country: str) -> dict[str, Any]:
+    return (await _get_run_state()).get(_key(country), {})
+
+
+async def clear_run_state(country: str) -> None:
+    state = await _get_run_state()
+    if state.pop(_key(country), None) is not None:
+        await _save_run_state(state)
+
+
+async def finished_reason(country: str, base: dict[str, Any]) -> str | None:
+    """Why this country should stop now, or None to keep going.
+
+    Checked BEFORE a refill, not after: stopping after the limit-th re-add
+    would do one more than the owner asked for.
+    """
+    cfg = await effective_config(country, base)
+    state = await get_run_state(country)
+    if not state:
+        return None
+
+    max_refills = int(cfg.get("max_refills") or 0)
+    if max_refills and int(state.get("refills", 0)) >= max_refills:
+        return f"{max_refills} bar re-add shesh"
+
+    run_minutes = int(cfg.get("run_minutes") or 0)
+    if run_minutes:
+        try:
+            started = datetime.fromisoformat(state["started_at"])
+        except (KeyError, ValueError):
+            return None
+        if _now() >= started + timedelta(minutes=run_minutes):
+            return f"{run_minutes} min shomoy shesh"
+    return None
 
 
 async def shortest_interval_minutes(base: dict[str, Any]) -> int:

@@ -75,6 +75,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "force_delete_uid": "",      # owner's own uid; blank disables force-delete
     "interval_minutes": 10,
     "default_tag": "",           # if set, every new file auto-tags with this, never asks
+    # Lifecycle limits. 0 = no limit, which is the old behaviour: run until
+    # the owner says stop.
+    "max_refills": 0,
+    "run_minutes": 0,
+    # Clearing numbers off the bot at the end is irreversible there, so it
+    # is opt-in even when a run does finish on its own.
+    "delete_when_done": False,
+    "delete_done_command": "/frcd {country} {uid}",
     "thread_id": "",             # dedicated chat thread; "" = not bound yet
     "awaiting_tag_entry_id": None,  # set while a "what tag for X" prompt is pending
 }
@@ -278,6 +286,30 @@ SETTABLE_FIELDS: dict[str, dict[str, Any]] = {
         "max": 10000,
         "example": "4",
     },
+    "max_refills": {
+        "type": "int",
+        "label": "Stop after N re-adds (0 = no limit)",
+        "min": 0,
+        "max": 10000,
+        "example": "5",
+    },
+    "run_minutes": {
+        "type": "int",
+        "label": "Stop after N minutes (0 = no limit)",
+        "min": 0,
+        "max": 100000,
+        "example": "120",
+    },
+    "delete_when_done": {
+        "type": "bool",
+        "label": "Delete the numbers off the bot when finished",
+        "example": "on / off",
+    },
+    "delete_done_command": {
+        "type": "str",
+        "label": "Delete-when-done command ({country}, {uid})",
+        "example": "/frcd {country} {uid}",
+    },
     "default_tag": {
         "type": "str",
         "label": "Default service (blank = ask/auto)",
@@ -327,6 +359,8 @@ def coerce_setting(key: str, raw: str) -> Any:
         raise ValueError("add_command_template e {tag} thakte hobe.")
     if key == "force_delete_command" and "{country}" not in value:
         raise ValueError("force_delete_command e {country} thakte hobe.")
+    if key == "delete_done_command" and "{country}" not in value:
+        raise ValueError("delete_done_command e {country} thakte hobe.")
     if key == "target_bot" and not value.startswith("@"):
         raise ValueError("target_bot '@' diye shuru hobe (jemon @PBDxbot).")
     return value[:200]
@@ -382,6 +416,59 @@ async def set_country_setting_from_chat(country: str, key: str, raw: str) -> str
         await otp_schedule.arm_country(canonical, int(value))
     shown = "on" if value is True else "off" if value is False else value
     return f"\u2705 {canonical}: {key} = {shown}"
+
+
+PENDING_INPUT_KEY = f"{SETTING_KEY}_pending_input"
+
+
+async def get_pending_input() -> dict[str, Any] | None:
+    """A question the owner is mid-way through answering, if any.
+
+    Custom values (an interval or restock level not on the button list) need
+    a free-text answer, and the next message in the OTP thread is that
+    answer - so it has to be remembered across messages rather than parsed
+    out of a command.
+    """
+    async with session_scope() as session:
+        stored = await repo.get_setting(session, PENDING_INPUT_KEY)
+    return dict(stored) if stored else None
+
+
+async def set_pending_input(field: str | None, country: str | None = None) -> None:
+    async with session_scope() as session:
+        await repo.set_setting(
+            session,
+            PENDING_INPUT_KEY,
+            {"field": field, "country": country} if field else {},
+        )
+
+
+async def handle_pending_input(text: str) -> str | None:
+    """Consume a free-text answer to a custom-value question.
+
+    Returns None when nothing was pending, so ordinary chat is unaffected.
+    """
+    pending = await get_pending_input()
+    if not pending or not pending.get("field"):
+        return None
+
+    field, country = pending["field"], pending.get("country")
+    if is_skip_trigger(text):
+        await set_pending_input(None)
+        return "Thik ache, bad dilam."
+
+    try:
+        if country:
+            reply = await set_country_setting_from_chat(country, field, text)
+        else:
+            reply = await set_setting_from_chat(field, text)
+    except ValueError as exc:
+        # Keep the question open: the owner meant to answer it, they just
+        # typed something unusable, and dropping it would lose the context.
+        return f"\u274C {exc}\n\nAbar likho, othoba 'bad' bolo."
+
+    await set_pending_input(None)
+    return reply
 
 
 async def get_known_countries() -> dict[str, Any]:
@@ -481,6 +568,8 @@ class CycleResult:
     exhausted: list[dict[str, Any]] = field(default_factory=list)
     # Countries the bot reported that we had not seen before.
     new_countries: list[str] = field(default_factory=list)
+    # Countries that hit their own finish line (max re-adds / time limit).
+    finished: list[dict[str, Any]] = field(default_factory=list)
     files_processed: list[str] = field(default_factory=list)
     error: str = ""
     ran_at: str = field(default_factory=_now_iso)
@@ -963,6 +1052,60 @@ async def _force_delete_country(target: str, country: str, cfg: dict[str, Any]) 
     return (reply.get("text") or "") if reply else ""
 
 
+async def _finish_country(
+    target: str, entry: dict[str, Any], cfg: dict[str, Any], reason: str
+) -> dict[str, Any]:
+    """Retire one country: stop monitoring it and optionally clear its
+    numbers off the target bot.
+
+    Deleting is opt-in (delete_when_done). It is irreversible on the bot's
+    side, so it must never be what happens by default just because a run
+    ended.
+    """
+    country = entry.get("country") or entry["name"]
+    outcome: dict[str, Any] = {
+        "country": country,
+        "name": entry["name"],
+        "reason": reason,
+        "deleted": False,
+        "delete_reply": "",
+        "error": "",
+    }
+
+    if cfg.get("delete_when_done"):
+        command = (cfg.get("delete_done_command") or "").strip()
+        uid = str(cfg.get("force_delete_uid") or "").strip()
+        if not command:
+            outcome["error"] = "no delete command configured"
+        elif "{uid}" in command and not uid:
+            # Sending "/frcd Bangladesh {uid}" literally would be a silent
+            # no-op that looks like it worked.
+            outcome["error"] = "delete needs your user id (force_delete_uid)"
+        else:
+            try:
+                previous = await _last_bot_message(target)
+                previous_id = int(previous.get("id", 0)) if previous else None
+                await get_userbot().send_message(
+                    target, command.format(country=country, uid=uid)
+                )
+                reply = await _wait_for_new_bot_reply(
+                    target, after_id=previous_id, timeout_s=60.0
+                )
+                outcome["deleted"] = True
+                outcome["delete_reply"] = (reply or {}).get("text", "")[:300]
+            except UserbotError as exc:
+                outcome["error"] = f"delete failed: {exc}"
+            except Exception as exc:  # noqa: BLE001 - finishing must not crash a cycle
+                log.exception("otp_bot_finish_delete_error")
+                outcome["error"] = f"delete failed ({type(exc).__name__}): {exc}"
+
+    # Stop monitoring it either way - the run is over even if the delete
+    # could not be done.
+    await remove_active_file(entry["id"])
+    await otp_schedule.clear_run_state(country)
+    return outcome
+
+
 async def _add_one_file(target: str, entry: dict[str, Any], cfg: dict[str, Any]) -> str:
     """Send one file as a reply-based add; returns the bot's reply text.
     Raises AddRejected if the bot's own reply indicates the add failed
@@ -1082,6 +1225,9 @@ async def start_automation() -> dict[str, Any]:
             await otp_schedule.arm_country(
                 country, int(entry_cfg.get("interval_minutes", 10))
             )
+            # Fresh run: the refill count and the time limit both start now,
+            # not from whenever this country last ran.
+            await otp_schedule.begin_run(country)
             result["files"].append({
                 "name": entry["name"],
                 "country": entry.get("country"),
@@ -1168,6 +1314,10 @@ _SKIP_WORDS = {
 # closed list.
 SERVICE_CHOICES = ("WhatsApp", "Telegram", "Facebook", "Google", "Instagram", "Signal")
 INTERVAL_CHOICES = (5, 10, 15, 30, 60)
+# Restock points offered as buttons. 0 means "wait until it is actually
+# empty"; anything above refills while numbers are still left, so the
+# country never goes dead between checks.
+THRESHOLD_CHOICES = (0, 100, 200, 500, 1000, 5000)
 # Cleanup style, phrased as the decision rather than the command: "just tidy
 # up" vs "wipe and replace". The second needs /frcd, which needs the uid.
 CLEANUP_CHOICES = (
@@ -1535,7 +1685,17 @@ async def run_cycle(config: dict[str, Any] | None = None, *, force: bool = False
         for entry in refill:
             country = entry.get("country") or entry["name"]
             entry_cfg = await otp_schedule.effective_config(country, cfg)
+
+            # Has this country reached its own finish line? Checked before
+            # the re-add, so "3 refills" means 3, not 4.
+            done_reason = await otp_schedule.finished_reason(country, cfg)
+            if done_reason:
+                finished = await _finish_country(target, entry, entry_cfg, done_reason)
+                result.finished.append(finished)
+                continue
+
             reply = await _add_one_file(target, entry, entry_cfg)
+            await otp_schedule.record_refill(country)
             result.files_processed.append(entry["name"])
             if reply:
                 replies.append(f"{country}: {reply}")

@@ -216,12 +216,30 @@ class SchedulerRunner:
             )
             return result.ok
 
-        # A country whose file is spent needs the owner to act - nothing the
-        # automation can do will produce more numbers. This is the one case
-        # worth interrupting them for, so it is reported separately from a
-        # routine refill and says exactly what is needed.
+        # A country that reached its own finish line is a completed run, not
+        # a problem - reported separately so it never reads as a failure.
+        if result.finished:
+            lines = ["\U0001F3C1 Task shesh", ""]
+            for item in result.finished:
+                lines.append(f"\u2022 {item['country']} - {item['reason']}")
+                if item.get("deleted"):
+                    lines.append("    Number gulo bot theke delete kora holo.")
+                elif item.get("error"):
+                    lines.append(f"    \u26A0\uFE0F Delete hoyni: {item['error']}")
+            lines += [
+                "",
+                "Abar chalate chaile file dao ar 'start' bolo.",
+            ]
+            await self.notifier.send(
+                self.settings.owner_chat_id,
+                "\n".join(lines),
+                dedupe_key=f"otp_finished:{result.ran_at}",
+            )
+
         if result.exhausted:
             names = ", ".join(e["country"] for e in result.exhausted)
+            # A country whose file is spent needs the owner to act - nothing
+            # the automation can do will produce more numbers.
             # "Stock gone" and "file spent but stock still left" are different
             # situations - with a low-stock threshold the second is the normal
             # one, and calling it "shesh" while the bot still holds numbers

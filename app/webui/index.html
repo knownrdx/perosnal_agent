@@ -889,6 +889,11 @@
               <p class="small">
                 Save a set of settings once and apply it to any country.
               </p>
+              <p class="small">
+                Any value works - the buttons in Telegram are just shortcuts.
+                "Refill at" is how many numbers may be left before restocking;
+                0 waits until the country is completely empty.
+              </p>
               <div id="otpbot-preset-list">Loading...</div>
               <div class="row mt8">
                 <div>
@@ -946,7 +951,26 @@
 
               <div class="row mt8">
                 <div>
-                  <label for="otpbot-quota-cmd">Quota-check command</label>
+                  <label for="otpbot-max-refills">Stop after N re-adds</label>
+                  <input type="number" id="otpbot-max-refills" min="0" value="0"
+                         title="0 = no limit: keep refilling until you stop it.">
+                </div>
+                <div>
+                  <label for="otpbot-run-minutes">Stop after N minutes</label>
+                  <input type="number" id="otpbot-run-minutes" min="0" value="0"
+                         title="0 = no limit.">
+                </div>
+              </div>
+              <div class="row mt8">
+                <label class="small" style="margin:0; display:flex; align-items:center; gap:6px;">
+                  <input type="checkbox" id="otpbot-delete-when-done">
+                  Delete the numbers off the bot when a run finishes
+                </label>
+              </div>
+
+              <div class="row mt8">
+                <div>
+                  <label for="otpbot-quota-cmd">Stock-check command</label>
                   <input type="text" id="otpbot-quota-cmd">
                 </div>
                 <div>
@@ -2218,6 +2242,9 @@
         qs("#otpbot-threshold").value = cfg.quota_threshold != null ? cfg.quota_threshold : 0;
         qs("#otpbot-quota-cmd").value = cfg.quota_command || "/myquota";
         qs("#otpbot-cleanup-cmd").value = cfg.cleanup_command || "/useddelete";
+        qs("#otpbot-max-refills").value = cfg.max_refills != null ? cfg.max_refills : 0;
+        qs("#otpbot-run-minutes").value = cfg.run_minutes != null ? cfg.run_minutes : 0;
+        qs("#otpbot-delete-when-done").checked = !!cfg.delete_when_done;
         qs("#otpbot-frcd-enabled").checked = !!cfg.force_delete_before_add;
         qs("#otpbot-frcd-cmd").value = cfg.force_delete_command || "/frcd {country} {uid}";
         qs("#otpbot-frcd-uid").value = cfg.force_delete_uid || "";
@@ -2398,6 +2425,11 @@
       quota_threshold: parseInt(qs("#otpbot-threshold").value, 10) || 0,
       quota_command: qs("#otpbot-quota-cmd").value.trim() || "/myquota",
       cleanup_command: qs("#otpbot-cleanup-cmd").value.trim() || "/useddelete",
+      max_refills: isNaN(parseInt(qs("#otpbot-max-refills").value, 10))
+        ? 0 : parseInt(qs("#otpbot-max-refills").value, 10),
+      run_minutes: isNaN(parseInt(qs("#otpbot-run-minutes").value, 10))
+        ? 0 : parseInt(qs("#otpbot-run-minutes").value, 10),
+      delete_when_done: qs("#otpbot-delete-when-done").checked,
       force_delete_before_add: qs("#otpbot-frcd-enabled").checked,
       force_delete_command: qs("#otpbot-frcd-cmd").value.trim() || "/frcd {country} {uid}",
       force_delete_uid: qs("#otpbot-frcd-uid").value.trim(),

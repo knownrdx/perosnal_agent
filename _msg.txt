@@ -1,47 +1,46 @@
-Settings from Telegram; low-stock presets; fix "Check now" doing nothing
+Runs that end on their own: re-add limits, time limits, auto-delete
 
-"Check now" answered "not due yet"
-  Per-country timers were applied to manual checks too, so pressing the
-  button (or /otpbot run) usually did nothing at all and left a stale error
-  on screen. A human asking for a check is asking for it NOW: run_cycle
-  gained force=True, used by the button, the API and the Telegram command,
-  while the scheduler still respects each country's own pace. A forced check
-  re-arms the timers, so it does not leave every country due and cause the
-  next scheduler tick to repeat the work.
+A started country ran until the owner remembered to stop it, and every
+interval/restock value had to be one of the fixed button choices.
 
-  The stale error that prompted this - "no reply from the bot to the quota
-  command" - was from before the /st switch. The message now names the
-  command and the bot it actually sent to, since both are configurable and
-  the old wording said neither.
+Finish conditions, per country
+  max_refills stops after N re-adds; run_minutes stops N minutes after the
+  run started. 0 means no limit, so the previous behaviour is the default.
+  Both are checked BEFORE a re-add rather than after - "run it twice" has to
+  mean twice, not three times.
 
-Settings from Telegram
-  Everything was web-only. /otpset lists every setting with its current
-  value; /otpset <key> <value> changes one globally; /otpset <country> <key>
-  <value> overrides it for one country. Country names can be several words
-  ("/otpset Central African Republic interval_minutes 5"), so the key is
-  located in the argument list rather than assumed to be the second word,
-  and the name is resolved to the bot's own spelling.
+  Refill counts and start times are tracked per country and persisted, so a
+  restart does not reset a half-finished run. One country reaching its limit
+  retires only that country; siblings keep going.
 
-  The settable fields live in one table (SETTABLE_FIELDS) that Telegram, the
-  help text and validation all read, so they cannot drift apart. Values are
-  validated before they are stored - a bad value stored silently is worse
-  than a rejected one. Templates must keep the placeholders that are
-  actually substituted: an add_command_template without {tag} still "works",
-  it just sends the wrong command forever.
+delete_when_done
+  When a run ends, optionally clear that country's numbers off the target
+  bot with /frcd. Opt-in: the deletion is irreversible on the bot's side, so
+  a run merely ending must never trigger it by default.
 
-Presets with a custom refill threshold
-  Added "Low-stock refill": tops up at 200 remaining instead of waiting for
-  zero, so a country never actually runs dry, wiping with /frcd first.
+  Two failure modes are handled rather than silently ignored: with no uid
+  configured the command would go out as a literal "/frcd Bangladesh {uid}",
+  which the bot accepts and does nothing with - that now reports the missing
+  uid instead of sending junk. And if the delete fails for any reason the
+  run still ends, so a failed cleanup cannot leave a country cycling
+  forever.
 
-  The threshold was not settable when creating a preset - the web form had
-  no field for it. Added there and to the per-country row, plus /otppreset
-  save/use/delete for Telegram. Both UIs use an explicit NaN check rather
-  than `|| default`, because 0 is a legitimate threshold ("wait until
-  empty") that truthiness would silently rewrite.
+  Finishing is reported as its own "Task shesh" notification, separate from
+  the stock-empty alert, so a completed run never reads as a failure.
 
-  With a non-zero threshold a new case appears: the file is spent while the
-  bot still holds stock. The alert now distinguishes "stock shesh" from
-  "file shesh" and reports how many are left, rather than claiming a country
-  is empty when 150 remain.
+Custom values everywhere
+  The button lists (5/10/15/30/60 min, 0/100/200/500/1000/5000 left) are
+  shortcuts, not the range. Each keyboard gained a custom option that asks
+  for a value and reads the owner's next message, so 7 minutes or 1500 left
+  are reachable from Telegram. A rejected value keeps the question open
+  rather than dropping it, since the owner clearly meant to answer it.
 
-702 passing, smoke 10/10.
+  Also added a restock-point picker (global and per country) - previously
+  the threshold could only be set from the web form, so from Telegram a
+  country could only ever refill at zero.
+
+New preset "One-shot burst": refills at 200 left, stops after 5 re-adds,
+then clears the country. Per-country settings, the schedule table and both
+UIs carry the new fields.
+
+717 passing, smoke 10/10.

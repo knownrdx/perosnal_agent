@@ -199,6 +199,14 @@ async def handle_message(
         await repo.add_message(session, chat_id=chat_id, role="user", content=text, thread_id=thread_id)
 
     if await otp_bot.is_otp_thread(chat_id):
+        # A custom value the owner was asked for (interval / restock level)
+        # is answered by the next message, so it is consumed before anything
+        # else can reinterpret it.
+        pending = await otp_bot.handle_pending_input(text)
+        if pending is not None:
+            await _record_reply(chat_id, pending, thread_id=thread_id)
+            return Reply(pending, Intent.CONTROL)
+
         if await otp_bot.get_awaiting_tag_entry() is not None:
             answer = await otp_bot.handle_tag_answer(text)
             await _record_reply(chat_id, answer, thread_id=thread_id)
