@@ -604,6 +604,14 @@ class AgentBot:
                 ctx = dict(row.context or {})
                 ctx["pending_upload"] = {"path": rel, "name": safe_name}
                 await repo.update_session(db_session, message.chat.id, context=ctx)
+                # Record it as a visible chat turn too - otherwise it only
+                # lived in invisible session context and the web dashboard's
+                # Chat panel (same shared conversation) never showed it.
+                await repo.add_message(
+                    db_session, chat_id=message.chat.id, role="user",
+                    content=f"\U0001F4CE Uploaded: {safe_name}",
+                    thread_id=row.current_thread_id,
+                )
 
             await message.answer(
                 f"\U0001F4C1 Saved: {rel}\n\n"

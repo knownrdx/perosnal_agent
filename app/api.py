@@ -754,6 +754,14 @@ def create_app() -> FastAPI:
             ctx = dict(row.context or {})
             ctx["pending_upload"] = {"path": rel, "name": safe_name}
             await repo.update_session(session, chat_id, context=ctx)
+            # Record the upload as a visible chat message too - otherwise it
+            # only lived in invisible session context and disappeared the
+            # moment history reloaded, looking like the upload never happened.
+            await repo.add_message(
+                session, chat_id=chat_id, role="user",
+                content=f"\U0001F4CE Uploaded: {safe_name}",
+                thread_id=row.current_thread_id,
+            )
 
         return {"saved": True, "path": rel, "name": safe_name}
 

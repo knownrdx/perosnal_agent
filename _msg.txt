@@ -1,47 +1,16 @@
-Multi-thread conversation history: /new keeps old chats, never deletes
+File uploads now show up as a permanent chat message
 
-The owner asked for a way to start a fresh chat while keeping session/chat
-history browsable - ChatGPT's "New Chat" model, not the old destructive
-/new that wiped the conversation outright.
+An upload only ever wrote to invisible session context
+(pending_upload) - the file itself never appeared in the actual chat
+history, so reloading the Chat panel (or scrolling Telegram) made it look
+like nothing had been uploaded at all, even though it was attached and
+working underneath.
 
-Schema: thread_id on Conversation, current_thread_id on ChatSession
+Fix: both upload paths (app/api.py's POST /api/chat/upload and
+app/telegram/bot.py's F.document handler) now also write a normal "user"
+message ("Uploaded: <name>") into the conversation, on the chat's current
+thread, right alongside setting pending_upload. It is a real, permanently
+stored chat turn - it survives a page reload and shows up in
+GET /api/chat/history exactly like any other message, from either surface.
 
-Every message row now belongs to a thread_id (default "main" for anything
-written before this change). /new (Telegram) and "New chat" (web dashboard)
-no longer delete rows - they generate a fresh thread_id and switch the chat
-session onto it. Nothing is ever deleted; old threads stay fully readable
-and switchable.
-
-Production schema migration without alembic
-
-The live Postgres database already has conversation/chat_sessions tables
-without these columns - Base.metadata.create_all() only creates whole
-missing tables, it never ALTERs an existing one, so this would otherwise
-crash the first query that touches the new column. Added a small,
-idempotent ALTER TABLE step (app/db/base.py: _apply_schema_patches(), run
-right after create_all() on every boot) - each column gets its own
-transaction so a "column already exists" failure on one doesn't poison a
-later genuinely-needed patch in the same batch. This is the project's
-first schema change since the tables were created in production, so this
-mechanism will be needed again - see the comment above _COLUMN_PATCHES for
-how to add the next one.
-
-Telegram: /new rewritten to "start a fresh thread, not delete history";
-new /history command lists past threads (title = first user message,
-message count, relative time) and /history <id-prefix> switches back to one.
-
-Web dashboard: Chat panel gained a threads sidebar (mirrors Telegram's
-/history) with a "+ New chat" button. GET /api/chat/threads,
-POST /api/chat/threads/new, POST /api/chat/threads/{id}/switch. Chat
-history/send now operate on the session's current thread specifically
-(new optional thread_id param throughout conversation.py/repo.py) instead
-of the chat's entire history, so switching threads actually isolates
-context between them.
-
-recent_messages() keeps thread_id=None as an explicit "all threads" mode
-so the task engine's existing cross-referencing context (unrelated to chat
-threads) is unaffected.
-
-565 tests (7 new + 2 updated for the new behaviour), smoke 10/10. Verified
-the migration mechanism directly: created old-shape tables without the new
-columns, ran create_all(), confirmed both columns get added in place.
+565 tests (1 updated to assert the upload appears in history), all green.

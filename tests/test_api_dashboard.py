@@ -238,6 +238,11 @@ def test_chat_upload_sets_pending_and_attaches(client):
     assert pending.status_code == 200
     assert pending.json()["pending_upload"]["name"] == "numbers.txt"
 
+    # The upload must show up as a permanent, reloadable chat message -
+    # not just invisible session state that vanishes on the next page load.
+    history = client.get("/api/chat/history", headers=headers).json()
+    assert any("numbers.txt" in m["content"] for m in history["messages"])
+
     cleared = client.delete("/api/chat/pending_upload", headers=headers)
     assert cleared.status_code == 200
     assert cleared.json() == {"cleared": True}
