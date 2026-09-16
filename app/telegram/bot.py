@@ -14,13 +14,14 @@ from typing import Any
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, Update
+from aiogram.types import CallbackQuery, Message, Update
 
 from app.config import get_settings
 from app.db import repo
 from app.db.base import session_scope
 from app.db.models import ACTIVE_STATUSES, ApprovalStatus, TaskStatus
 from app.logging_conf import get_logger
+from app.telegram import otp_panel
 from app.telegram.notifier import Notifier
 
 log = get_logger(__name__)
@@ -117,6 +118,21 @@ class AgentBot:
         window.append(now)
         self._rate[user_id] = window
         return True
+
+    async def _send_next_prompt(self, query: Any, reply: str) -> None:
+        """Send a post-tagging reply, with buttons when it is another question.
+
+        _continue_after_tagging either asks about the next country or reports
+        that everything started. Only the question needs a keyboard, and it
+        has to carry the id of whichever entry is now pending - re-reading it
+        here keeps the buttons and the prompt describing the same file.
+        """
+        from app.automation import otp_bot
+
+        pending = await otp_bot.get_awaiting_tag_entry()
+        markup = otp_panel.service_keyboard(pending["id"]) if pending else None
+        with contextlib.suppress(Exception):
+            await query.message.answer(reply, reply_markup=markup)
 
     async def _guard(self, message: Message) -> bool:
         if not self._authorized(message):
@@ -575,32 +591,174 @@ class AgentBot:
                 return
 
             cfg = await otp_bot.get_config()
-            last = await otp_bot.get_last_result()
-            queue = await otp_bot.get_queue()
-            active = await otp_bot.get_active_files()
-            lines = [
-                "\U0001F501 OTP-bot automation",
-                "",
-                f"Enabled: {cfg['enabled']}",
-                f"Target: {cfg['target_bot']}",
-                f"Checks every: {cfg['interval_minutes']} min",
-                f"Refill when active \u2264: {cfg['quota_threshold']}",
-                f"Active files: {', '.join(f['name'] for f in active) or '(none)'}",
-                f"Queued (not started yet): {', '.join(f['name'] for f in queue) or '(none)'}",
-            ]
-            if last:
-                lines += ["", f"Last run: {'ok' if last.get('ok') else 'FAILED'} "
-                              f"({last.get('action', '')})"]
-                if last.get("error"):
-                    lines.append(f"Error: {last['error'][:200]}")
-            lines += [
-                "",
-                "Just send a numbers file then say \"start\" or \"done\" - I'll ask "
-                "a tag for each file that needs one and take it from there.",
-                "Say \"stop\" any time to pause the periodic checks.",
-                "/otpbot on | off | run for a quick manual override.",
-            ]
-            await message.answer("\n".join(lines))
+            await message.answer(
+                await otp_panel.status_text(),
+                reply_markup=otp_panel.control_keyboard(bool(cfg["enabled"])),
+            )
+
+        @dp.callback_query(F.data.startswith(f"{otp_panel.PREFIX}:"))
+        async def _otp_callback(query: CallbackQuery) -> None:
+            """Every OTP panel button lands here.
+
+            Buttons are shared state: the owner can tap one on an old message
+            long after things moved on, so each branch re-reads current state
+            rather than trusting what the keyboard was rendered from.
+            """
+            if not self._authorized(query):
+                with contextlib.suppress(Exception):
+                    await query.answer("Not authorized.", show_alert=True)
+                return
+
+            from app.automation import otp_bot
+
+            # "otp:<action>:<rest>" - rest may itself contain ':' (service
+            # names are user-visible text), so split at most twice.
+            try:
+                _, action, rest = query.data.split(":", 2)
+            except ValueError:
+                await query.answer()
+                return
+
+            async def refresh_panel(note: str = "") -> None:
+                cfg = await otp_bot.get_config()
+                text = await otp_panel.status_text()
+                if note:
+                    text = f"{note}\n\n{text}"
+                with contextlib.suppress(Exception):
+                    # Telegram rejects an edit that changes nothing; that is
+                    # a no-op for us, not an error worth surfacing.
+                    await query.message.edit_text(
+                        text,
+                        reply_markup=otp_panel.control_keyboard(bool(cfg["enabled"])),
+                    )
+
+            if action == "svc":
+                entry_id, service = rest.split(":", 1)
+                entry = await otp_bot.set_queue_tag(entry_id, service)
+                if entry is None:
+                    await query.answer("That file is gone already.", show_alert=True)
+                    return
+                await query.answer(f"{service} set")
+                await otp_bot.set_awaiting_tag_entry(None)
+                reply = await otp_bot._continue_after_tagging(
+                    f"\u2705 {entry.get('country') or entry['name']} -> {service}"
+                )
+                await self._send_next_prompt(query, reply)
+                return
+
+            if action == "skip":
+                entry = await otp_bot.get_awaiting_tag_entry()
+                await otp_bot.remove_from_queue(rest)
+                await query.answer("Removed")
+                label = (entry or {}).get("country") or "File"
+                reply = await otp_bot._continue_after_tagging(f"\U0001F5D1 {label} bad deoa holo.")
+                await self._send_next_prompt(query, reply)
+                return
+
+            if action == "int":
+                minutes = int(rest)
+                await otp_bot.save_config({"interval_minutes": minutes})
+                await query.answer(f"Every {minutes} min")
+                await refresh_panel(f"\u23F1 Checking every {minutes} minutes.")
+                return
+
+            if action == "clean":
+                await otp_bot.set_cleanup_mode(rest)
+                cfg = await otp_bot.get_config()
+                if rest == "force" and not cfg.get("force_delete_uid"):
+                    await query.answer()
+                    with contextlib.suppress(Exception):
+                        await query.message.answer(
+                            "\u26A0\uFE0F Wipe mode needs your bot user id for /frcd.\n"
+                            "Set it in the web UI (OTP Bot -> Your user id), "
+                            "otherwise I'll fall back to /useddelete."
+                        )
+                    return
+                await query.answer("Saved")
+                await refresh_panel()
+                return
+
+            if action == "ask_int":
+                cfg = await otp_bot.get_config()
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        "\u23F1 Koto min por por check korbo?",
+                        reply_markup=otp_panel.interval_keyboard(cfg["interval_minutes"]),
+                    )
+                return
+
+            if action == "ask_clean":
+                cfg = await otp_bot.get_config()
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        "\U0001F9F9 Add korar age ki korbo?",
+                        reply_markup=otp_panel.cleanup_keyboard(
+                            bool(cfg.get("force_delete_before_add"))
+                        ),
+                    )
+                return
+
+            if action == "start":
+                await query.answer("Starting...")
+                result = await otp_bot.start_automation()
+                if result["ok"]:
+                    await refresh_panel(otp_bot._format_start_success(result))
+                elif result.get("missing_tags"):
+                    entry = result["missing_tags"][0]
+                    await otp_bot.set_awaiting_tag_entry(entry["id"])
+                    with contextlib.suppress(Exception):
+                        await query.message.answer(
+                            otp_bot._tag_question(entry),
+                            reply_markup=otp_panel.service_keyboard(entry["id"]),
+                        )
+                else:
+                    await refresh_panel(f"\u274C {result['error']}")
+                return
+
+            if action == "stop":
+                await otp_bot.stop_automation()
+                await query.answer("Stopped")
+                await refresh_panel("\u23F8 Bondho kora holo.")
+                return
+
+            if action == "run":
+                await query.answer("Checking...")
+                result = await otp_bot.run_cycle()
+                note = (
+                    f"\u2705 {result.action} (quota {result.active_quota})"
+                    if result.ok
+                    else f"\u274C {result.error}"
+                )
+                await refresh_panel(note)
+                return
+
+            if action == "clearq":
+                count = await otp_bot.clear_queue()
+                await query.answer(f"{count} removed" if count else "Already empty")
+                await refresh_panel()
+                return
+
+            if action == "rmc":
+                queue = await otp_bot.get_queue()
+                active = await otp_bot.get_active_files()
+                entry = next((e for e in queue + active if e["id"] == rest), None)
+                if entry is None:
+                    await query.answer("Already gone.", show_alert=True)
+                    await refresh_panel()
+                    return
+                removed = await otp_bot.remove_by_country(entry.get("country") or "")
+                await query.answer(f"{len(removed)} removed")
+                await refresh_panel(f"\U0001F5D1 {entry.get('country')} bad deoa holo.")
+                return
+
+            if action == "status":
+                await query.answer()
+                await refresh_panel()
+                return
+
+            await query.answer()
 
         @dp.message(Command("mode"))
         async def _mode(message: Message, command: CommandObject) -> None:
@@ -715,11 +873,13 @@ class AgentBot:
                 lines += [
                     "",
                     f"Queued ({len(queue)} entr{'y' if len(queue) == 1 else 'ies'} total). "
-                    "Send more files, then say \"start\" when you're finished - "
-                    "I'll ask which service each country goes to if I don't "
-                    "already know.",
+                    "Send more files, then tap Start when you're finished.",
                 ]
-                await message.answer("\n".join(lines))
+                cfg = await otp_bot.get_config()
+                await message.answer(
+                    "\n".join(lines),
+                    reply_markup=otp_panel.control_keyboard(bool(cfg["enabled"])),
+                )
             else:
                 await message.answer(
                     f"\U0001F4C1 Saved: {rel}\n\n"

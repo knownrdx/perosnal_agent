@@ -321,6 +321,111 @@ async def test_force_delete_runs_per_country_before_the_add(environment):
 
 
 # --------------------------------------------------------------------------- #
+# Removing things the owner decided against
+# --------------------------------------------------------------------------- #
+async def test_skip_during_the_tag_question_drops_that_country(environment):
+    """"skip"/"bad dao" at the tag prompt is how a wrong country gets out."""
+    rel = await _write_mixed_country_file("export.txt")
+    await otp_bot.enqueue_file(rel, "export.txt")
+
+    first = await otp_bot.handle_start_trigger()
+    assert "Bangladesh" in first or "Dominican Republic" in first
+    skipped_country = (await otp_bot.get_awaiting_tag_entry())["country"]
+
+    reply = await otp_bot.handle_tag_answer("bad dao")
+
+    assert "bad deoa holo" in reply
+    remaining = {e["country"] for e in await otp_bot.get_queue()}
+    assert skipped_country not in remaining
+    # And it moved straight on to asking about the other country.
+    assert await otp_bot.get_awaiting_tag_entry() is not None
+
+
+async def test_remove_by_country_takes_it_out_of_queue_and_active(environment):
+    rel_bd = await _write_numbers_file("bd.txt", prefix="+880")
+    entry_bd = await _enqueue_single(rel_bd, "bd.txt")
+    await otp_bot.set_queue_tag(entry_bd["id"], "WhatsApp")
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    await otp_bot.start_automation()
+    assert len(await otp_bot.get_active_files()) == 1
+
+    # A second country arrives and is still only queued.
+    rel_ng = await _write_numbers_file("ng.txt", prefix="+234")
+    await _enqueue_single(rel_ng, "ng.txt")
+
+    removed = await otp_bot.remove_by_country("bangladesh")  # case-insensitive
+    assert len(removed) == 1
+    assert await otp_bot.get_active_files() == []
+    # Removing the last active file also stops the monitor.
+    assert (await otp_bot.get_config())["enabled"] is False
+    # The unrelated queued country is untouched.
+    assert [e["country"] for e in await otp_bot.get_queue()] == ["Nigeria"]
+
+
+async def test_remove_active_file_leaves_the_others_running(environment):
+    rel = await _write_mixed_country_file("export.txt")
+    await otp_bot.enqueue_file(rel, "export.txt")
+    for entry in await otp_bot.get_queue():
+        await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    await otp_bot.start_automation()
+
+    active = await otp_bot.get_active_files()
+    assert len(active) == 2
+
+    removed = await otp_bot.remove_active_file(active[0]["id"])
+    assert removed is not None
+    assert len(await otp_bot.get_active_files()) == 1
+    # Still work left to do, so the monitor stays on.
+    assert (await otp_bot.get_config())["enabled"] is True
+
+
+async def test_clear_queue_does_not_touch_active_files(environment):
+    rel_bd = await _write_numbers_file("bd.txt", prefix="+880")
+    entry_bd = await _enqueue_single(rel_bd, "bd.txt")
+    await otp_bot.set_queue_tag(entry_bd["id"], "WhatsApp")
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    await otp_bot.start_automation()
+
+    rel_ng = await _write_numbers_file("ng.txt", prefix="+234")
+    await _enqueue_single(rel_ng, "ng.txt")
+
+    cleared = await otp_bot.clear_queue()
+    assert cleared == 1
+    assert await otp_bot.get_queue() == []
+    # Running work is deliberately left alone.
+    assert len(await otp_bot.get_active_files()) == 1
+    assert (await otp_bot.get_config())["enabled"] is True
+
+
+async def test_removing_the_entry_being_asked_about_clears_the_prompt(environment):
+    """A dangling prompt would wedge the conversation: every later message
+    gets read as a tag answer for an entry that no longer exists.
+    """
+    rel = await _write_mixed_country_file("export.txt")
+    await otp_bot.enqueue_file(rel, "export.txt")
+    await otp_bot.handle_start_trigger()
+
+    pending = await otp_bot.get_awaiting_tag_entry()
+    assert pending is not None
+
+    await otp_bot.remove_from_queue(pending["id"])
+    config = await otp_bot.get_config()
+    assert config["awaiting_tag_entry_id"] is None
+
+
+async def test_removal_phrases_are_recognised():
+    assert otp_bot.is_skip_trigger("skip")
+    assert otp_bot.is_skip_trigger("bad dao")
+    assert otp_bot.is_clear_trigger("sob bad dao")
+    assert otp_bot.country_to_remove("Bangladesh bad dao") == "bangladesh"
+    assert otp_bot.country_to_remove("remove Nigeria") == "nigeria"
+    # An ordinary sentence must never be read as a removal.
+    assert otp_bot.country_to_remove("Bangladesh e koyta number ache") is None
+    assert otp_bot.country_to_remove("start") is None
+
+
+# --------------------------------------------------------------------------- #
 # Dedicated chat thread - answers "where do I send the files?" structurally
 # --------------------------------------------------------------------------- #
 async def test_ensure_thread_creates_and_binds_once(environment):

@@ -1,43 +1,52 @@
-Split uploads by country; per-country service memory; /frcd support
+Telegram buttons for the OTP panel; removals; web UI auto-refresh
 
-A single uploaded file routinely holds several countries - one of the
-owner's own exports mixes Dominican Republic area codes (1809/1829/1849)
-with Bangladesh numbers - and the target bot keeps stock per country. Adding
-such a file whole filed every number under one country's tag, and asking
-"what tag for this file?" was the wrong question: the answer differs per
-country inside it.
+Three gaps the owner hit in a row, all the same shape: the automation knew
+things the owner had no way to change without typing exact phrases.
 
-Uploads are now parsed before anything is queued. app/automation/
-phone_countries.py resolves each number's country by longest-matching E.164
-dialing prefix (longest-first specifically so +1809 stays Dominican Republic
-instead of collapsing into +1 United States, and the NANP carve-outs for
-Canada/Jamaica/Bahamas survive). Each country becomes its own queue entry
-with its own split-out file containing only that country's numbers, so the
-file the bot receives always matches the command that describes it. An
-unrecognised prefix is reported as "+998"-style rather than guessed, so a
-missing table entry is visible instead of silently mis-filed.
+Removing work that should not run
+  Files could only be dropped from the web queue list. There was no way to
+  drop one from Telegram at all, and no way to drop an ALREADY-STARTED file
+  from anywhere - the only lever was "stop", which halts everything.
 
-Service/tag is now remembered PER COUNTRY, and deliberately does not fall
-back to the global last-used tag when the country is known - inheriting
-Nigeria's answer for a Bangladesh file would quietly sell the numbers as the
-wrong service, which is worse than one short question. The question itself
-now names the country and how many numbers it found, so the owner can see
-what they are answering about.
+  - remove_active_file() takes one file out of future refill cycles. It does
+    not un-add numbers the target bot already holds; emptying the active set
+    also flips enabled off, since nothing remains to monitor.
+  - remove_by_country() drops queued and active entries together. Country is
+    the unit the owner thinks in ("Bangladesh bad dao"), and after splitting
+    one country can span several entries from different uploads, so matching
+    by country avoids leaving stragglers.
+  - clear_queue() empties what has not started, deliberately leaving running
+    work alone.
+  - Chat triggers: "<country> bad dao" / "remove <country>", "skip" at the
+    tag prompt, "sob bad dao". country_to_remove() returns None for ordinary
+    sentences, so mentioning a country never deletes it.
+  - DELETE /api/otpbot/queue, /active/{id}, /country/{name}.
 
-Adds /frcd (Owner: force-delete user numbers by country) as an optional
-pre-add step. /useddelete only clears used/expired numbers, so re-adding a
-country whose stock is still live just piles up duplicates - the bot reports
-them as "dup". Off by default and inert without a configured uid; the web UI
-exposes the toggle, the command template and the uid, and explains the
-distinction.
+  Removing an entry now also clears a tag prompt pointing at it. A dangling
+  prompt wedges the conversation: every later message is read as a tag answer
+  for an entry that no longer resolves.
 
-Found while writing the tests: the per-country lookup fell through to the
-global tag when a country had no entry yet, which reintroduced the exact
-leak the split was meant to prevent. The test named it, so it is fixed and
-pinned rather than shipped.
+Buttons instead of remembered phrases
+  New app/telegram/otp_panel.py: service picker (6 common services + "bad
+  dao"), interval picker, cleanup-mode picker, and a control panel with
+  start/stop, check-now, clear-queue and status. Callback data is
+  "otp:<action>:<arg>"; a test asserts every payload fits Telegram's 64-byte
+  limit, which is enforced at send time and otherwise only shows up as a
+  button that silently does nothing.
 
-611 tests (was 603): country resolution incl. the NANP traps, mixed-file
-splitting, split-file contents, single-country files left uncopied,
-per-country tag memory, the country-aware question, {country} in the add
-template, and /frcd firing per country before the add (and staying silent
-when unconfigured).
+  Handlers re-read state instead of trusting the keyboard they came from -
+  the owner can tap a button on an hour-old message.
+
+  set_cleanup_mode() exposes "tidy up" vs "wipe country first" as one choice
+  because the flags underneath must move together; letting them drift gives
+  you force-delete "enabled" but inert. Choosing wipe without a configured
+  uid now says so rather than silently falling back.
+
+Web UI auto-refresh
+  The OTP panel changes on its own - the scheduler refills on a timer, and
+  Telegram buttons write the same state - so an open tab went stale and
+  misled. Polls every 10s while that panel is visible, pausing when the tab
+  is hidden. Quiet mode skips the "Loading..." flash and holds off entirely
+  while an input in the panel has focus, so a refresh never eats typing.
+
+626 passing.

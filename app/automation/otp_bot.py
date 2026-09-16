@@ -409,7 +409,75 @@ async def remove_from_queue(entry_id: str) -> bool:
     if len(remaining) == len(queue):
         return False
     await _save_files(QUEUE_KEY, remaining)
+    # A prompt pointing at a now-deleted entry would hang the conversation:
+    # get_awaiting_tag_entry() returns None (the id no longer resolves) while
+    # the config still claims one is pending, so clear it explicitly.
+    config = await get_config()
+    if config.get("awaiting_tag_entry_id") == entry_id:
+        await set_awaiting_tag_entry(None)
     return True
+
+
+async def remove_active_file(entry_id: str) -> dict[str, Any] | None:
+    """Stop monitoring one already-started file.
+
+    Removing it here does not un-add the numbers the bot already has - it
+    only means future refill cycles stop re-adding this file. Emptying the
+    active set also turns the monitor off, since there is then nothing left
+    for it to do.
+    """
+    active = await get_active_files()
+    removed = next((e for e in active if e["id"] == entry_id), None)
+    if removed is None:
+        return None
+    remaining = [e for e in active if e["id"] != entry_id]
+    await _save_files(ACTIVE_KEY, remaining)
+    if not remaining:
+        await save_config({"enabled": False})
+    return removed
+
+
+async def remove_by_country(country: str) -> list[dict[str, Any]]:
+    """Drop every queued AND active entry for one country.
+
+    Country is how the owner actually thinks about this ("bad the Bangladesh
+    one"), and after splitting, one country can span several entries from
+    different uploads - so matching by country removes all of them rather
+    than leaving stragglers behind.
+    """
+    wanted = country.strip().casefold()
+    removed: list[dict[str, Any]] = []
+
+    queue = await get_queue()
+    keep_queue = [e for e in queue if (e.get("country") or "").casefold() != wanted]
+    removed += [e for e in queue if (e.get("country") or "").casefold() == wanted]
+    if len(keep_queue) != len(queue):
+        await _save_files(QUEUE_KEY, keep_queue)
+
+    active = await get_active_files()
+    keep_active = [e for e in active if (e.get("country") or "").casefold() != wanted]
+    removed += [e for e in active if (e.get("country") or "").casefold() == wanted]
+    if len(keep_active) != len(active):
+        await _save_files(ACTIVE_KEY, keep_active)
+        if not keep_active:
+            await save_config({"enabled": False})
+
+    if removed:
+        config = await get_config()
+        if config.get("awaiting_tag_entry_id") in {e["id"] for e in removed}:
+            await set_awaiting_tag_entry(None)
+    return removed
+
+
+async def clear_queue() -> int:
+    """Throw away everything waiting to be started. Active files are left
+    alone - "clear the queue" should not silently stop running work.
+    """
+    queue = await get_queue()
+    if queue:
+        await _save_files(QUEUE_KEY, [])
+        await set_awaiting_tag_entry(None)
+    return len(queue)
 
 
 async def next_untagged_entry() -> dict[str, Any] | None:
@@ -649,6 +717,19 @@ async def start_automation() -> dict[str, Any]:
     return result
 
 
+async def set_cleanup_mode(mode: str) -> dict[str, Any]:
+    """Pick between "tidy up" and "wipe and replace" as one decision.
+
+    Exposed as a single choice because that is how the owner thinks about it;
+    the two config flags underneath (which command, and whether /frcd runs at
+    all) always have to move together, and letting them drift apart is how
+    you end up with force-delete "enabled" but silently inert.
+    """
+    if mode == "force":
+        return await save_config({"force_delete_before_add": True})
+    return await save_config({"force_delete_before_add": False})
+
+
 async def stop_automation() -> dict[str, Any]:
     """Turn the periodic monitor off. Queue and active_files are untouched -
     starting again later is always a fresh, explicit decision (the owner
@@ -676,9 +757,65 @@ _STOP_WORDS = {
 }
 _RESUME_PHRASES = ("age-r file", "agerfile", "purono file", "same file", "old file", "agerta")
 
+# Removing things. "skip"/"bad dao" while a tag question is open means "not
+# this one", which is the moment the owner most often realises a file should
+# not go in at all.
+_SKIP_WORDS = {
+    "skip", "bad", "bad dao", "baddao", "bad de", "baddo", "cancel", "no",
+    "na", "eta na", "eta bad", "remove", "delete", "bad koro", "skip koro",
+}
+
+# Offered as buttons so the common answers are one tap instead of typing.
+# The owner can still type anything else - these are shortcuts, not a
+# closed list.
+SERVICE_CHOICES = ("WhatsApp", "Telegram", "Facebook", "Google", "Instagram", "Signal")
+INTERVAL_CHOICES = (5, 10, 15, 30, 60)
+# Cleanup style, phrased as the decision rather than the command: "just tidy
+# up" vs "wipe and replace". The second needs /frcd, which needs the uid.
+CLEANUP_CHOICES = (
+    ("used", "\U0001F9F9 Used/expired only (/useddelete)"),
+    ("force", "\U0001F5D1 Wipe country first (/frcd)"),
+)
+_CLEAR_PHRASES = ("sob bad", "sob remove", "clear queue", "queue clear",
+                  "sob cancel", "clear all", "sob delete")
+# "<country> bad dao" / "remove <country>" - the country is whatever is left
+# once the removal word is taken out.
+_REMOVE_PREFIXES = ("remove ", "delete ", "bad dao ", "bad koro ", "bad ")
+_REMOVE_SUFFIXES = (" bad dao", " bad koro", " bad", " remove koro", " remove",
+                    " delete koro", " delete", " cancel")
+
 
 def _normalize(text: str) -> str:
     return " ".join(text.strip().lower().split())
+
+
+def is_skip_trigger(text: str) -> bool:
+    return _normalize(text) in _SKIP_WORDS
+
+
+def is_clear_trigger(text: str) -> bool:
+    return any(phrase in _normalize(text) for phrase in _CLEAR_PHRASES)
+
+
+def country_to_remove(text: str) -> str | None:
+    """Extract the country from "<country> bad dao" / "remove <country>".
+
+    Returns None when the message is not a removal request, so an ordinary
+    sentence mentioning a country never deletes anything.
+    """
+    norm = _normalize(text)
+    if is_clear_trigger(norm) or is_skip_trigger(norm):
+        return None
+
+    for prefix in _REMOVE_PREFIXES:
+        if norm.startswith(prefix):
+            rest = norm[len(prefix):].strip()
+            return rest or None
+    for suffix in _REMOVE_SUFFIXES:
+        if norm.endswith(suffix):
+            rest = norm[: -len(suffix)].strip()
+            return rest or None
+    return None
 
 
 def is_start_trigger(text: str) -> bool:
@@ -772,27 +909,72 @@ async def handle_start_trigger() -> str:
     return f"\u274C Start korte parlam na: {result['error']}"
 
 
+async def _continue_after_tagging(prefix: str) -> str:
+    """Either ask the next question or, if nothing is left to ask, start."""
+    next_entry = await next_untagged_entry()
+    if next_entry is not None:
+        await set_awaiting_tag_entry(next_entry["id"])
+        return f"{prefix}\n\n{_tag_question(next_entry)}"
+
+    if not await get_queue():
+        return f"{prefix}\n\nQueue ekhon khali. Notun file dao, tarpor 'start' bolo."
+
+    result = await start_automation()
+    if result["ok"]:
+        text_out = _format_start_success(result)
+        await _notify_owner(f"\U0001F7E2 OTP-bot automation started.\n\n{text_out}")
+        return f"{prefix}\n\n{text_out}"
+    return f"{prefix}\n\n\u274C Start korte parlam na: {result['error']}"
+
+
 async def handle_tag_answer(text: str) -> str:
     """Owner just answered a "what tag for X" question."""
     entry = await get_awaiting_tag_entry()
     if entry is None:
         return "Kono file tag-er jonno wait kortese na. 'start' bolle shuru hobe."
 
+    label = entry.get("country") or entry["name"]
+
+    # "skip" / "bad dao" here means "not this one" - the tag question is
+    # exactly when the owner notices a country they did not mean to send.
+    if is_skip_trigger(text):
+        await remove_from_queue(entry["id"])
+        return await _continue_after_tagging(f"\U0001F5D1 {label} bad deoa holo.")
+
     await set_queue_tag(entry["id"], text)
     await set_awaiting_tag_entry(None)
+    return await _continue_after_tagging(f"\u2705 {label} -> {text.strip()[:60]}")
 
-    next_entry = await next_untagged_entry()
-    if next_entry is not None:
-        await set_awaiting_tag_entry(next_entry["id"])
-        confirmed = f"{entry.get('country') or entry['name']} -> {text.strip()[:60]}"
-        return f"\u2705 {confirmed}\n\n{_tag_question(next_entry)}"
 
-    result = await start_automation()
-    if result["ok"]:
-        text_out = _format_start_success(result)
-        await _notify_owner(f"\U0001F7E2 OTP-bot automation started.\n\n{text_out}")
-        return text_out
-    return f"\u274C Start korte parlam na: {result['error']}"
+async def handle_remove_country(country: str) -> str:
+    """Owner said "<country> bad dao" - drop it from queue and active alike."""
+    removed = await remove_by_country(country)
+    if not removed:
+        queue = await get_queue()
+        active = await get_active_files()
+        known = sorted({e.get("country") or "?" for e in queue + active})
+        available = ", ".join(known) if known else "(kichu nai)"
+        return f"'{country}' khuje pelam na.\nEkhon ache: {available}"
+
+    total = sum(e.get("count") or 0 for e in removed)
+    label = removed[0].get("country") or country
+    text = f"\U0001F5D1 {label} bad deoa holo ({len(removed)} entry, {total} number)."
+
+    # If that removal answered the open question, keep the flow moving.
+    if await get_awaiting_tag_entry() is None and await next_untagged_entry() is not None:
+        return await _continue_after_tagging(text)
+    return text
+
+
+async def handle_clear_queue() -> str:
+    """Owner said "sob bad dao" - empty the not-yet-started queue."""
+    count = await clear_queue()
+    if not count:
+        return "Queue emnitei khali."
+    return (
+        f"\U0001F5D1 Queue clear kora holo ({count} entry bad).\n"
+        "Cholte thaka file gulo (active) thik-i ache - oigula bondho korte 'stop' bolo."
+    )
 
 
 async def handle_stop_trigger() -> str:

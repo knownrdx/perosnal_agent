@@ -860,6 +860,7 @@
               <div id="otpbot-queue-list">Loading...</div>
               <div class="row mt12">
                 <button type="button" class="primary" id="otpbot-start-btn">Start</button>
+                <button type="button" id="otpbot-clear-queue-btn">Clear queue</button>
               </div>
             </div>
 
@@ -1017,7 +1018,9 @@
      STATE & CONSTANTS
      ============================================================ */
   var TASKS_POLL_MS = 5000;
+  var OTPBOT_POLL_MS = 10000;
   var tasksPollTimer = null;
+  var otpBotPollTimer = null;
   var currentPanel = "chat";
   var currentTaskDetailId = null;
   var chatHistoryLoaded = false;
@@ -1267,7 +1270,12 @@
     if (name === "skills") loadSkills();
     if (name === "memory") loadMemory();
     if (name === "jobs") loadJobs();
-    if (name === "otpbot") loadOtpBot();
+    if (name === "otpbot") {
+      loadOtpBot();
+      startOtpBotPolling();
+    } else {
+      stopOtpBotPolling();
+    }
     if (name === "llm") loadLlm();
     if (name === "bridges") loadBridges();
     if (name === "settings") loadAutonomy();
@@ -1647,12 +1655,36 @@
     }
   }
 
+  /* The OTP panel changes on its own - the scheduler refills on a timer and
+     Telegram buttons write the same state - so a stale open tab is
+     misleading. Polls only while that panel is actually visible. */
+  function startOtpBotPolling() {
+    stopOtpBotPolling();
+    if (document.hidden) return;
+    otpBotPollTimer = setInterval(function () {
+      if (!document.hidden && currentPanel === "otpbot") {
+        loadOtpBot({ quiet: true });
+      }
+    }, OTPBOT_POLL_MS);
+  }
+
+  function stopOtpBotPolling() {
+    if (otpBotPollTimer) {
+      clearInterval(otpBotPollTimer);
+      otpBotPollTimer = null;
+    }
+  }
+
   function handleVisibilityChange() {
     if (document.hidden) {
       stopTasksPolling();
+      stopOtpBotPolling();
     } else if (currentPanel === "tasks") {
       loadTasks();
       startTasksPolling();
+    } else if (currentPanel === "otpbot") {
+      loadOtpBot();
+      startOtpBotPolling();
     }
   }
 
@@ -2114,13 +2146,23 @@
      OTP BOT PANEL (deterministic automation, no LLM involved)
      ============================================================ */
 
-  function loadOtpBot() {
-    qs("#otpbot-last-result").textContent = "Loading...";
-    qs("#otpbot-queue-list").textContent = "Loading...";
-    qs("#otpbot-active-list").textContent = "Loading...";
+  function loadOtpBot(options) {
+    // A background refresh must not stomp on fields the owner is editing or
+    // flash "Loading..." over a panel they are reading, so quiet mode skips
+    // the placeholders and leaves focused inputs alone.
+    var quiet = options && options.quiet;
+    if (!quiet) {
+      qs("#otpbot-last-result").textContent = "Loading...";
+      qs("#otpbot-queue-list").textContent = "Loading...";
+      qs("#otpbot-active-list").textContent = "Loading...";
+    }
     apiFetchJson("/api/otpbot/status")
       .then(function (data) {
         var cfg = data.config || {};
+        var editing = document.activeElement;
+        var isEditing = editing && editing.tagName === "INPUT" &&
+          editing.closest && editing.closest("#panel-otpbot");
+        if (quiet && isEditing) return;
         qs("#otpbot-enabled").checked = !!cfg.enabled;
         qs("#otpbot-target").value = cfg.target_bot || "";
         qs("#otpbot-interval").value = cfg.interval_minutes != null ? cfg.interval_minutes : 10;
@@ -2236,12 +2278,30 @@
       return;
     }
     activeFiles.forEach(function (entry) {
-      var p = document.createElement("div");
+      var row = document.createElement("div");
+      row.className = "row";
+      row.style.alignItems = "center";
+      row.style.marginBottom = "6px";
+
+      var label = document.createElement("span");
+      label.style.flex = "1";
       var where = entry.country ? entry.country + " (" + (entry.count || 0) + ")" : entry.name;
-      p.textContent = where + " - " + (entry.tag || "General");
-      p.title = entry.source_name || entry.name;
-      p.style.marginBottom = "4px";
-      el.appendChild(p);
+      label.textContent = where + " - " + (entry.tag || "General");
+      label.title = entry.source_name || entry.name;
+      row.appendChild(label);
+
+      var removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.textContent = "Remove";
+      removeBtn.title = "Stop re-adding this file. Numbers already added stay with the bot.";
+      removeBtn.addEventListener("click", function () {
+        apiFetchJson("/api/otpbot/active/" + encodeURIComponent(entry.id), { method: "DELETE" })
+          .then(function () { showConfirm("Removed - it will not be re-added."); loadOtpBot(); })
+          .catch(function () { showConfirm("Failed to remove."); });
+      });
+      row.appendChild(removeBtn);
+
+      el.appendChild(row);
     });
   }
 
@@ -2318,6 +2378,15 @@
         btn.disabled = false;
         btn.textContent = "Start";
       });
+  }
+
+  function handleOtpBotClearQueue() {
+    apiFetchJson("/api/otpbot/queue", { method: "DELETE" })
+      .then(function (data) {
+        showConfirm(data.removed ? "Queue cleared (" + data.removed + " removed)." : "Queue was already empty.");
+        loadOtpBot();
+      })
+      .catch(function () { showConfirm("Failed to clear the queue."); });
   }
 
   function handleOtpBotStop() {
@@ -2450,6 +2519,7 @@
     qs("#otpbot-start-btn").addEventListener("click", handleOtpBotStart);
     qs("#otpbot-stop-btn").addEventListener("click", handleOtpBotStop);
     qs("#otpbot-open-thread-btn").addEventListener("click", handleOtpBotOpenThread);
+    qs("#otpbot-clear-queue-btn").addEventListener("click", handleOtpBotClearQueue);
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
   }

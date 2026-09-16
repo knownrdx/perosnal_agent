@@ -204,6 +204,17 @@ async def handle_message(
             await _record_reply(chat_id, answer, thread_id=thread_id)
             return Reply(answer, Intent.CONTROL)
 
+        if otp_bot.is_clear_trigger(text):
+            answer = await otp_bot.handle_clear_queue()
+            await _record_reply(chat_id, answer, thread_id=thread_id)
+            return Reply(answer, Intent.CONTROL)
+
+        removal_target = otp_bot.country_to_remove(text)
+        if removal_target:
+            answer = await otp_bot.handle_remove_country(removal_target)
+            await _record_reply(chat_id, answer, thread_id=thread_id)
+            return Reply(answer, Intent.CONTROL)
+
         if otp_bot.is_stop_trigger(text):
             answer = await otp_bot.handle_stop_trigger()
             await _record_reply(chat_id, answer, thread_id=thread_id)

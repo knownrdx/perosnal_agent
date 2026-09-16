@@ -888,6 +888,37 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="queue entry not found")
         return {"removed": True, "entry_id": entry_id}
 
+    @app.delete("/api/otpbot/queue", dependencies=[Depends(require_api_access)])
+    async def otpbot_clear_queue() -> dict[str, Any]:
+        """Empty the not-yet-started queue. Active files keep running."""
+        from app.automation import otp_bot
+
+        return {"removed": await otp_bot.clear_queue()}
+
+    @app.delete("/api/otpbot/active/{entry_id}", dependencies=[Depends(require_api_access)])
+    async def otpbot_remove_active(entry_id: str) -> dict[str, Any]:
+        """Stop re-adding one already-started file.
+
+        Does not remove numbers the target bot already holds - it only takes
+        the file out of future refill cycles.
+        """
+        from app.automation import otp_bot
+
+        removed = await otp_bot.remove_active_file(entry_id)
+        if removed is None:
+            raise HTTPException(status_code=404, detail="active file not found")
+        return {"removed": True, "entry": removed}
+
+    @app.delete("/api/otpbot/country/{country}", dependencies=[Depends(require_api_access)])
+    async def otpbot_remove_country(country: str) -> dict[str, Any]:
+        """Drop every queued AND active entry for one country."""
+        from app.automation import otp_bot
+
+        removed = await otp_bot.remove_by_country(country)
+        if not removed:
+            raise HTTPException(status_code=404, detail="no entries for that country")
+        return {"removed": len(removed), "entries": removed}
+
     @app.post("/api/otpbot/thread", dependencies=[Depends(require_api_access)])
     async def otpbot_open_thread() -> dict[str, Any]:
         """Open (creating it once) the dedicated OTP-bot chat thread and make
