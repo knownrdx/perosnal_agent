@@ -50,6 +50,7 @@ Commands:
 /jobs    - scheduled jobs
 /memory <query> - search long-term memory
 /otpchat - open the dedicated OTP-bot thread (send number files there)
+/otpset  - view/change OTP-bot settings (global or per country)
 /otpbot  - status of the OTP-number automation (just say "start"/"stop" to run it)
 
 AI model:
@@ -580,7 +581,7 @@ class AgentBot:
                 return
             if arg in {"run", "now"}:
                 await message.answer("\U0001F504 Running one cycle now...")
-                result = await otp_bot.run_cycle()
+                result = await otp_bot.run_cycle(force=True)
                 if result.ok:
                     await message.answer(
                         f"\u2705 {result.action} (active quota was {result.active_quota})"
@@ -698,6 +699,12 @@ class AgentBot:
                             bool(cfg.get("force_delete_before_add"))
                         ),
                     )
+                return
+
+            if action == "settings":
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(await otp_bot.describe_settings())
                 return
 
             if action == "refreshc":
@@ -846,7 +853,7 @@ class AgentBot:
 
             if action == "run":
                 await query.answer("Checking...")
-                result = await otp_bot.run_cycle()
+                result = await otp_bot.run_cycle(force=True)
                 note = (
                     f"\u2705 {result.action} (quota {result.active_quota})"
                     if result.ok
@@ -880,6 +887,173 @@ class AgentBot:
                 return
 
             await query.answer()
+
+        @dp.message(Command("otpset"))
+        async def _otpset(message: Message, command: CommandObject) -> None:
+            """Change any OTP-bot setting from Telegram.
+
+            /otpset                         -> show everything
+            /otpset <key> <value>           -> global
+            /otpset <country> <key> <value> -> that country only
+            """
+            if not await self._guard(message):
+                return
+            from app.automation import otp_bot
+
+            args = (command.args or "").strip()
+            if not args:
+                await message.answer(await otp_bot.describe_settings())
+                return
+
+            parts = args.split()
+            try:
+                # A known key in first position means global; anything else is
+                # read as a country name, which can be several words
+                # ("Central African Republic interval_minutes 5").
+                if parts[0] in otp_bot.SETTABLE_FIELDS:
+                    if len(parts) < 2:
+                        spec = otp_bot.SETTABLE_FIELDS[parts[0]]
+                        await message.answer(
+                            f"{parts[0]}: {spec['label']}\n"
+                            f"Jemon: /otpset {parts[0]} {spec['example']}"
+                        )
+                        return
+                    reply = await otp_bot.set_setting_from_chat(parts[0], " ".join(parts[1:]))
+                else:
+                    key_index = next(
+                        (i for i, part in enumerate(parts) if part in otp_bot.SETTABLE_FIELDS),
+                        None,
+                    )
+                    if key_index is None or key_index == 0 or key_index == len(parts) - 1:
+                        await message.answer(
+                            "Bujhte parlam na. Likho: /otpset <key> <value>\n"
+                            "othoba /otpset <country> <key> <value>\n\n"
+                            "Sob key dekhte: /otpset"
+                        )
+                        return
+                    country = " ".join(parts[:key_index])
+                    reply = await otp_bot.set_country_setting_from_chat(
+                        country, parts[key_index], " ".join(parts[key_index + 1:])
+                    )
+            except ValueError as exc:
+                await message.answer(f"\u274C {exc}")
+                return
+
+            await message.answer(reply)
+
+        @dp.message(Command("otppreset"))
+        async def _otppreset(message: Message, command: CommandObject) -> None:
+            """Create/apply/delete presets from Telegram.
+
+            /otppreset                              -> list
+            /otppreset save <name> k=v k=v          -> create or overwrite
+            /otppreset use <name> for <country>     -> apply
+            /otppreset delete <name>                -> remove (own presets)
+            """
+            if not await self._guard(message):
+                return
+            from app.automation import otp_bot, otp_schedule
+
+            args = (command.args or "").strip()
+            if not args:
+                presets = await otp_schedule.get_presets()
+                lines = ["\U0001F4D0 Presets", ""]
+                for name in sorted(presets):
+                    preset = presets[name]
+                    bits = []
+                    if preset.get("interval_minutes") is not None:
+                        bits.append(f"every {preset['interval_minutes']}m")
+                    if preset.get("quota_threshold") is not None:
+                        bits.append(
+                            f"refill at {preset['quota_threshold']}"
+                            if preset["quota_threshold"] else "refill at empty"
+                        )
+                    if preset.get("limit") is not None:
+                        bits.append(f"limit {preset['limit']}")
+                    if preset.get("force_delete_before_add"):
+                        bits.append("/frcd")
+                    lines.append(f"\u2022 {name} - {', '.join(bits)}")
+                    if preset.get("_note"):
+                        lines.append(f"    {preset['_note']}")
+                lines += [
+                    "",
+                    "Notun banate: /otppreset save <name> quota_threshold=200 interval_minutes=10",
+                    "Apply korte:  /otppreset use <name> for <country>",
+                    "Muchte:       /otppreset delete <name>",
+                ]
+                await message.answer("\n".join(lines))
+                return
+
+            parts = args.split()
+            verb = parts[0].lower()
+
+            if verb == "use":
+                # "use <name...> for <country...>" - both sides can be several
+                # words, so split on the "for" keyword rather than on spaces.
+                if "for" not in [p.lower() for p in parts]:
+                    await message.answer("Likho: /otppreset use <name> for <country>")
+                    return
+                idx = [p.lower() for p in parts].index("for")
+                name = " ".join(parts[1:idx])
+                country = " ".join(parts[idx + 1:])
+                if not name or not country:
+                    await message.answer("Likho: /otppreset use <name> for <country>")
+                    return
+                canonical = await otp_bot.canonical_country(country)
+                applied = await otp_schedule.apply_preset(name, canonical)
+                if applied is None:
+                    await message.answer(f"\u274C '{name}' preset nai. /otppreset e list ache.")
+                    return
+                await message.answer(f"\u2705 {canonical} -> '{name}' preset apply kora holo.")
+                return
+
+            if verb == "delete":
+                name = " ".join(parts[1:])
+                if not name:
+                    await message.answer("Kon preset muchbo? /otppreset delete <name>")
+                    return
+                if await otp_schedule.delete_preset(name):
+                    await message.answer(f"\U0001F5D1 '{name}' mucha holo.")
+                else:
+                    await message.answer(
+                        f"\u274C '{name}' tomar banano preset na. "
+                        "Built-in preset overwrite kora jay (save diye), mucha jay na."
+                    )
+                return
+
+            if verb == "save":
+                # "save <name...> key=value key=value" - the name is everything
+                # before the first key=value pair.
+                rest = parts[1:]
+                first_pair = next((i for i, p in enumerate(rest) if "=" in p), None)
+                if first_pair is None or first_pair == 0:
+                    await message.answer(
+                        "Likho: /otppreset save <name> quota_threshold=200 interval_minutes=10\n"
+                        f"Je field gula dewa jay: {', '.join(otp_schedule.OVERRIDABLE)}"
+                    )
+                    return
+                name = " ".join(rest[:first_pair])
+                values: dict[str, Any] = {}
+                try:
+                    for pair in rest[first_pair:]:
+                        key, _, raw = pair.partition("=")
+                        if key not in otp_schedule.OVERRIDABLE:
+                            raise ValueError(
+                                f"'{key}' preset e deya jay na. "
+                                f"Jegula jay: {', '.join(otp_schedule.OVERRIDABLE)}"
+                            )
+                        values[key] = otp_bot.coerce_setting(key, raw)
+                    saved = await otp_schedule.save_preset(name, values)
+                except ValueError as exc:
+                    await message.answer(f"\u274C {exc}")
+                    return
+                shown = ", ".join(f"{k}={v}" for k, v in saved.items() if k != "_note")
+                await message.answer(f"\u2705 Preset '{name}' save kora holo: {shown}")
+                return
+
+            await message.answer(
+                "Bujhte parlam na. /otppreset likhe option gula dekho."
+            )
 
         @dp.message(Command("mode"))
         async def _mode(message: Message, command: CommandObject) -> None:

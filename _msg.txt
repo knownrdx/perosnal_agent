@@ -1,21 +1,47 @@
-Deliver button presses: callback_query was missing from allowed_updates
+Settings from Telegram; low-stock presets; fix "Check now" doing nothing
 
-Every inline button in the OTP panel did nothing. There was no error and no
-log line, which is what made it confusing: start_polling was called with
-allowed_updates=["message"], so Telegram dropped callback_query updates
-server-side and the handler was never reached at all. The handler, the
-keyboards and the callback payloads were all correct - the updates simply
-never arrived.
+"Check now" answered "not due yet"
+  Per-country timers were applied to manual checks too, so pressing the
+  button (or /otpbot run) usually did nothing at all and left a stale error
+  on screen. A human asking for a check is asking for it NOW: run_cycle
+  gained force=True, used by the button, the API and the Telegram command,
+  while the scheduler still respects each country's own pace. A forced check
+  re-arms the timers, so it does not leave every country due and cause the
+  next scheduler tick to repeat the work.
 
-Added a test that drives the real handler for each button (interval,
-cleanup, service, skip, per-country interval, preset, clear queue, refresh
-countries) plus the delivery config itself, and verified it by
-reintroducing the bug: the allowed_updates assertion fails with
-["message"] and passes with callback_query included.
+  The stale error that prompted this - "no reply from the bot to the quota
+  command" - was from before the /st switch. The message now names the
+  command and the bot it actually sent to, since both are configurable and
+  the old wording said neither.
 
-Also covered the cases that only show up in a live chat: an unauthorised
-user tapping a button, a button tapped long after its country was removed
-(buttons live forever in chat history), and malformed payloads - none of
-which may raise inside the handler.
+Settings from Telegram
+  Everything was web-only. /otpset lists every setting with its current
+  value; /otpset <key> <value> changes one globally; /otpset <country> <key>
+  <value> overrides it for one country. Country names can be several words
+  ("/otpset Central African Republic interval_minutes 5"), so the key is
+  located in the argument list rather than assumed to be the second word,
+  and the name is resolved to the bot's own spelling.
 
-682 passing.
+  The settable fields live in one table (SETTABLE_FIELDS) that Telegram, the
+  help text and validation all read, so they cannot drift apart. Values are
+  validated before they are stored - a bad value stored silently is worse
+  than a rejected one. Templates must keep the placeholders that are
+  actually substituted: an add_command_template without {tag} still "works",
+  it just sends the wrong command forever.
+
+Presets with a custom refill threshold
+  Added "Low-stock refill": tops up at 200 remaining instead of waiting for
+  zero, so a country never actually runs dry, wiping with /frcd first.
+
+  The threshold was not settable when creating a preset - the web form had
+  no field for it. Added there and to the per-country row, plus /otppreset
+  save/use/delete for Telegram. Both UIs use an explicit NaN check rather
+  than `|| default`, because 0 is a legitimate threshold ("wait until
+  empty") that truthiness would silently rewrite.
+
+  With a non-zero threshold a new case appears: the file is spent while the
+  bot still holds stock. The alert now distinguishes "stock shesh" from
+  "file shesh" and reports how many are left, rather than claiming a country
+  is empty when 150 remain.
+
+702 passing, smoke 10/10.

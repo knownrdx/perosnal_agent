@@ -1111,7 +1111,9 @@ def create_app() -> FastAPI:
         from app.automation import otp_bot
 
         config = await otp_bot.get_config()
-        result = await otp_bot.run_cycle(config)
+        # Manual check: bypass the per-country timers, or the button
+        # answers "not due yet" and looks broken.
+        result = await otp_bot.run_cycle(config, force=True)
         return asdict(result)
 
     # --- static web dashboard ------------------------------------------- #

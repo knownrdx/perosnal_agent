@@ -156,6 +156,21 @@ async def test_forgetting_a_country_clears_its_timer_and_settings(environment):
 # Presets
 # --------------------------------------------------------------------------- #
 @asyncio_test
+async def test_low_stock_preset_refills_before_reaching_zero(environment):
+    """Waiting for zero means the country is briefly dead; this preset tops
+    up while numbers are still left.
+    """
+    presets = await otp_schedule.get_presets()
+    assert "Low-stock refill" in presets
+    assert presets["Low-stock refill"]["quota_threshold"] == 200
+
+    await otp_schedule.apply_preset("Low-stock refill", "Bangladesh")
+    cfg = await otp_schedule.effective_config("Bangladesh", BASE)
+    assert cfg["quota_threshold"] == 200
+    assert cfg["force_delete_before_add"] is True
+
+
+@asyncio_test
 async def test_builtin_presets_are_available_out_of_the_box(environment):
     presets = await otp_schedule.get_presets()
     assert "Fast burn" in presets

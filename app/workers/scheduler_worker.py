@@ -222,14 +222,23 @@ class SchedulerRunner:
         # routine refill and says exactly what is needed.
         if result.exhausted:
             names = ", ".join(e["country"] for e in result.exhausted)
-            lines = [
-                f"\U0001F6A8 Number stock shesh: {names}",
-                "",
-            ]
+            # "Stock gone" and "file spent but stock still left" are different
+            # situations - with a low-stock threshold the second is the normal
+            # one, and calling it "shesh" while the bot still holds numbers
+            # would be false and teach the owner to distrust the alert.
+            dry = [e for e in result.exhausted if not e.get("had_stock")]
+            headline = (
+                f"\U0001F6A8 Number stock shesh: {names}"
+                if dry
+                else f"\u26A0\uFE0F Number file shesh: {names}"
+            )
+            lines = [headline, ""]
             for item in result.exhausted:
+                left = item.get("had_stock") or 0
+                tail = f" Bot e ekhono {left} ache." if left else " Bot e ekhon 0 ache."
                 lines.append(
                     f"\u2022 {item['country']} - file '{item['name']}' e notun kichu nai "
-                    "(sob duplicate)."
+                    f"(sob duplicate).{tail}"
                 )
             lines += [
                 "",
@@ -237,7 +246,7 @@ class SchedulerRunner:
                 f"File ta ei chat-e pathao - ami nije queue kore {config['target_bot']}-e "
                 "add kore dibo.",
                 "",
-                "Na dile oi country bondho thakbe. Bad dite chaile: "
+                "Bad dite chaile: "
                 f"\"{result.exhausted[0]['country']} bad dao\".",
             ]
             await self.notifier.send(

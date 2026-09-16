@@ -87,6 +87,7 @@ def control_keyboard(enabled: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 text="\U0001F30E Refresh countries", callback_data=f"{PREFIX}:refreshc:"
             ),
+            InlineKeyboardButton(text="\u2699\uFE0F Settings", callback_data=f"{PREFIX}:settings:"),
         ],
         [
             InlineKeyboardButton(text="\U0001F4CB Status", callback_data=f"{PREFIX}:status:"),

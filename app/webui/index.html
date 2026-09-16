@@ -900,6 +900,11 @@
                   <input type="number" id="otpbot-preset-interval" min="1" value="10">
                 </div>
                 <div>
+                  <label for="otpbot-preset-threshold">Refill at (stock left)</label>
+                  <input type="number" id="otpbot-preset-threshold" min="0" value="200"
+                         title="Refill once the bot's stock for a country falls to this. 0 = wait until it is empty.">
+                </div>
+                <div>
                   <label for="otpbot-preset-limit">Limit</label>
                   <input type="number" id="otpbot-preset-limit" min="1" value="4">
                 </div>
@@ -2475,6 +2480,14 @@
       every.style.width = "70px";
       box.appendChild(every);
 
+      var thresh = document.createElement("input");
+      thresh.type = "number";
+      thresh.min = "0";
+      thresh.value = row.quota_threshold;
+      thresh.title = "Refill once stock falls to this (0 = wait until empty)";
+      thresh.style.width = "70px";
+      box.appendChild(thresh);
+
       var limit = document.createElement("input");
       limit.type = "number";
       limit.min = "1";
@@ -2487,10 +2500,13 @@
       saveBtn.type = "button";
       saveBtn.textContent = "Save";
       saveBtn.addEventListener("click", function () {
+        var t = parseInt(thresh.value, 10);
         apiFetchJson("/api/otpbot/country/" + encodeURIComponent(row.country) + "/settings", {
           method: "POST",
           body: {
             interval_minutes: parseInt(every.value, 10) || row.interval_minutes,
+            // 0 is meaningful ("wait until empty"), so NaN is the only fallback.
+            quota_threshold: isNaN(t) ? row.quota_threshold : t,
             limit: parseInt(limit.value, 10) || row.limit
           }
         }).then(function () { showConfirm(row.country + " updated."); loadOtpBot(); })
@@ -2543,6 +2559,11 @@
       label.style.flex = "1";
       var bits = [];
       if (preset.interval_minutes != null) bits.push("every " + preset.interval_minutes + "m");
+      if (preset.quota_threshold != null) {
+        bits.push(preset.quota_threshold > 0
+          ? "refill at " + preset.quota_threshold
+          : "refill at empty");
+      }
       if (preset.limit != null) bits.push("limit " + preset.limit);
       if (preset.force_delete_before_add) bits.push("/frcd");
       label.textContent = name + (bits.length ? " - " + bits.join(", ") : "");
@@ -2574,6 +2595,10 @@
       method: "POST",
       body: {
         interval_minutes: parseInt(qs("#otpbot-preset-interval").value, 10) || 10,
+        // parseInt, then an explicit NaN check: 0 is a legitimate value here
+        // ("wait until empty") and `|| 200` would silently rewrite it.
+        quota_threshold: isNaN(parseInt(qs("#otpbot-preset-threshold").value, 10))
+          ? 0 : parseInt(qs("#otpbot-preset-threshold").value, 10),
         limit: parseInt(qs("#otpbot-preset-limit").value, 10) || 4,
         count: parseInt(qs("#otpbot-preset-count").value, 10) || 4,
         force_delete_before_add: qs("#otpbot-preset-force").checked

@@ -269,3 +269,126 @@ async def test_an_unknown_action_is_acknowledged(runner):
     query = _Query("otp:no_such_action:x", await _owner_id(runner))
     await _handler(runner)(query)
     assert query.acks
+
+
+class _Command:
+    """Stands in for aiogram's CommandObject."""
+
+    def __init__(self, args: str = "") -> None:
+        self.args = args
+
+
+class _PlainMessage(_Message):
+    def __init__(self, user_id: int) -> None:
+        super().__init__()
+        self.from_user = _User(user_id)
+        self.chat = type("_Chat", (), {"id": user_id})()
+
+
+def _command_handler(runner: Any, name: str):
+    for observer in runner.dp.observers.values():
+        for handler in getattr(observer, "handlers", []):
+            if handler.callback.__name__ == name:
+                return handler.callback
+    raise AssertionError(f"{name} is not registered")
+
+
+# --------------------------------------------------------------------------- #
+# /otpset and /otppreset - settings from Telegram
+# --------------------------------------------------------------------------- #
+async def test_otpset_with_no_args_lists_everything(runner):
+    message = _PlainMessage(await _owner_id(runner))
+    await _command_handler(runner, "_otpset")(message, _Command(""))
+
+    text = message.answers[-1]["text"]
+    assert "interval_minutes" in text
+    assert "/otpset" in text
+
+
+async def test_otpset_changes_a_global_setting(runner):
+    message = _PlainMessage(await _owner_id(runner))
+    await _command_handler(runner, "_otpset")(message, _Command("interval_minutes 20"))
+
+    assert (await otp_bot.get_config())["interval_minutes"] == 20
+
+
+async def test_otpset_handles_a_multi_word_country(runner):
+    """"Central African Republic interval_minutes 5" - the country name has
+    spaces, so the key has to be located rather than assumed to be word two.
+    """
+    await otp_bot.learn_countries({"Central African Republic": 1})
+    message = _PlainMessage(await _owner_id(runner))
+    await _command_handler(runner, "_otpset")(
+        message, _Command("Central African Republic interval_minutes 5")
+    )
+
+    settings = await otp_schedule.get_country_settings("Central African Republic")
+    assert settings["interval_minutes"] == 5
+
+
+async def test_otpset_reports_a_bad_value_instead_of_storing_it(runner):
+    before = (await otp_bot.get_config())["interval_minutes"]
+    message = _PlainMessage(await _owner_id(runner))
+    await _command_handler(runner, "_otpset")(message, _Command("interval_minutes banana"))
+
+    assert "\u274c" in message.answers[-1]["text"].lower() or "number" in message.answers[-1]["text"]
+    assert (await otp_bot.get_config())["interval_minutes"] == before
+
+
+async def test_otppreset_saves_a_custom_threshold(runner):
+    """The thing actually asked for: a preset that refills at a chosen
+    stock level rather than waiting for zero.
+    """
+    message = _PlainMessage(await _owner_id(runner))
+    await _command_handler(runner, "_otppreset")(
+        message, _Command("save My limit quota_threshold=500 interval_minutes=20 limit=6")
+    )
+
+    presets = await otp_schedule.get_presets()
+    assert presets["My limit"]["quota_threshold"] == 500
+    assert presets["My limit"]["interval_minutes"] == 20
+    assert presets["My limit"]["limit"] == 6
+
+
+async def test_a_preset_threshold_of_zero_survives(runner):
+    """0 means "wait until empty" - a truthiness filter would drop it and
+    silently fall back to the global value.
+    """
+    message = _PlainMessage(await _owner_id(runner))
+    await _command_handler(runner, "_otppreset")(
+        message, _Command("save Drain quota_threshold=0")
+    )
+
+    presets = await otp_schedule.get_presets()
+    assert presets["Drain"]["quota_threshold"] == 0
+
+
+async def test_otppreset_applies_to_a_multi_word_country(runner):
+    await otp_bot.learn_countries({"Central African Republic": 1})
+    message = _PlainMessage(await _owner_id(runner))
+    await _command_handler(runner, "_otppreset")(
+        message, _Command("use Fast burn for Central African Republic")
+    )
+
+    settings = await otp_schedule.get_country_settings("Central African Republic")
+    assert settings["interval_minutes"] == 5
+
+
+async def test_otppreset_rejects_a_field_that_is_not_per_country(runner):
+    message = _PlainMessage(await _owner_id(runner))
+    await _command_handler(runner, "_otppreset")(
+        message, _Command("save Bad target_bot=@nope")
+    )
+
+    assert "\u274c" in message.answers[-1]["text"]
+    assert "Bad" not in await otp_schedule.get_presets()
+
+
+async def test_otppreset_lists_presets_with_their_thresholds(runner):
+    message = _PlainMessage(await _owner_id(runner))
+    await _command_handler(runner, "_otppreset")(message, _Command(""))
+
+    text = message.answers[-1]["text"]
+    assert "Low-stock refill" in text
+    assert "refill at 200" in text
+

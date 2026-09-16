@@ -681,6 +681,139 @@ async def test_refresh_fails_cleanly_when_the_bot_says_nothing_useful(environmen
     assert outcome["countries"] == {}
 
 
+async def test_check_now_ignores_the_per_country_timers(environment):
+    """A human pressing "Check now" is asking for a check NOW. Answering
+    "not due yet" is what made the button look broken.
+    """
+    rel = await _write_numbers_file("bd.txt", prefix="+880")
+    entry = (await otp_bot.enqueue_file(rel, "bd.txt"))["entries"][0]
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    await otp_bot.start_automation()
+    # start_automation just armed the timer, so an unforced cycle must wait.
+
+    set_userbot(FakeUserbot([{"text": REAL_ST_REPLY, "out": False}]))
+    lazy = await otp_bot.run_cycle(await otp_bot.get_config())
+    assert lazy.action == "not due yet"
+
+    set_userbot(FakeUserbot([{"text": REAL_ST_REPLY, "out": False}]))
+    forced = await otp_bot.run_cycle(await otp_bot.get_config(), force=True)
+    assert forced.action != "not due yet"
+    assert forced.country_stock, "a forced check must actually read the stock"
+
+
+async def test_a_forced_check_rearms_the_timer(environment):
+    """Otherwise a manual check leaves the country due, and the next
+    scheduler tick immediately repeats the work.
+    """
+    from app.automation import otp_schedule
+
+    await _start_with_one_active_file()
+    set_userbot(FakeUserbot([{"text": REAL_ST_REPLY, "out": False}]))
+    await otp_bot.run_cycle(await otp_bot.get_config(), force=True)
+
+    set_userbot(FakeUserbot([{"text": REAL_ST_REPLY, "out": False}]))
+    following = await otp_bot.run_cycle(await otp_bot.get_config())
+    assert following.action == "not due yet"
+    assert await otp_schedule.get_due_at("Bangladesh") is not None
+
+
+async def test_no_reply_error_names_the_command_it_sent(environment):
+    """"no reply to the quota command" was unhelpful once the command became
+    configurable - it never said which command or which bot.
+    """
+    await _start_with_one_active_file()
+    set_userbot(FakeUserbot([{"text": "some chatter with no stock", "out": False}]))
+
+    result = await otp_bot.run_cycle(await otp_bot.get_config(), force=True)
+
+    assert result.ok is False
+    assert "/st" in result.error
+    assert "@PBDxbot" in result.error
+
+
+# --------------------------------------------------------------------------- #
+# Editing settings from chat
+# --------------------------------------------------------------------------- #
+def test_setting_values_are_validated_before_they_are_stored():
+    """A bad value stored silently is worse than a rejected one: the
+    automation would keep running with settings the owner never intended.
+    """
+    assert otp_bot.coerce_setting("interval_minutes", "15") == 15
+    assert otp_bot.coerce_setting("force_delete_before_add", "on") is True
+    assert otp_bot.coerce_setting("force_delete_before_add", "bondho") is False
+
+    with pytest.raises(ValueError):
+        otp_bot.coerce_setting("interval_minutes", "abc")
+    with pytest.raises(ValueError):
+        otp_bot.coerce_setting("interval_minutes", "0")       # below the minimum
+    with pytest.raises(ValueError):
+        otp_bot.coerce_setting("no_such_key", "1")
+    with pytest.raises(ValueError):
+        otp_bot.coerce_setting("target_bot", "PBDxbot")       # missing the @
+
+
+def test_command_templates_must_keep_their_placeholders():
+    """A template that loses {tag} still "works" - it just sends the wrong
+    command forever, which is the hardest kind of bug to notice.
+    """
+    with pytest.raises(ValueError):
+        otp_bot.coerce_setting("add_command_template", "/fan -l 4")
+    with pytest.raises(ValueError):
+        otp_bot.coerce_setting("force_delete_command", "/frcd {uid}")
+
+    assert otp_bot.coerce_setting("add_command_template", "/fan -t {tag}") == "/fan -t {tag}"
+
+
+async def test_setting_a_value_from_chat_persists_it(environment):
+    reply = await otp_bot.set_setting_from_chat("interval_minutes", "25")
+    assert "25" in reply
+    assert (await otp_bot.get_config())["interval_minutes"] == 25
+
+
+async def test_per_country_setting_from_chat_only_touches_that_country(environment):
+    from app.automation import otp_schedule
+
+    await otp_bot.set_country_setting_from_chat("Bangladesh", "quota_threshold", "200")
+
+    cfg = await otp_bot.get_config()
+    assert (await otp_schedule.effective_config("Bangladesh", cfg))["quota_threshold"] == 200
+    assert (await otp_schedule.effective_config("Nigeria", cfg))["quota_threshold"] == cfg[
+        "quota_threshold"
+    ]
+
+
+async def test_per_country_setting_uses_the_bots_spelling(environment):
+    from app.automation import otp_schedule
+
+    await otp_bot.learn_countries({"Central African Republic": 5})
+    reply = await otp_bot.set_country_setting_from_chat(
+        "central african republic", "interval_minutes", "5"
+    )
+
+    assert "Central African Republic" in reply
+    settings = await otp_schedule.get_country_settings("Central African Republic")
+    assert settings["interval_minutes"] == 5
+
+
+async def test_a_global_only_field_is_rejected_per_country(environment):
+    """target_bot is a property of the bot being driven, not of one country -
+    accepting it per country would store a setting that never applies.
+    """
+    with pytest.raises(ValueError):
+        await otp_bot.set_country_setting_from_chat("Bangladesh", "target_bot", "@other")
+
+
+async def test_settings_listing_shows_current_values(environment):
+    await otp_bot.save_config({"interval_minutes": 42})
+    text = await otp_bot.describe_settings()
+
+    assert "interval_minutes = 42" in text
+    assert "/otpset" in text
+    for key in otp_bot.SETTABLE_FIELDS:
+        assert key in text
+
+
 # --------------------------------------------------------------------------- #
 # Removing things the owner decided against
 # --------------------------------------------------------------------------- #

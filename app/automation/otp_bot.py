@@ -211,6 +211,179 @@ def _parse_added_count(text: str) -> int | None:
 KNOWN_COUNTRIES_KEY = "otp_bot_known_countries"
 
 
+# Everything the owner can change from a chat, with the validation each
+# needs. Kept as data rather than a wall of if/elif so Telegram, the web UI
+# and the help text cannot drift apart - they all read this one table.
+SETTABLE_FIELDS: dict[str, dict[str, Any]] = {
+    "target_bot": {
+        "type": "str",
+        "label": "Which bot to drive",
+        "example": "@PBDxbot",
+    },
+    "quota_command": {
+        "type": "str",
+        "label": "Stock-check command",
+        "example": "/st",
+    },
+    "cleanup_command": {
+        "type": "str",
+        "label": "Cleanup command",
+        "example": "/useddelete",
+    },
+    "add_command_template": {
+        "type": "str",
+        "label": "Add command ({tag}, {limit}, {count}, {country})",
+        "example": "/fan -t {tag} -l {limit} -c {count}",
+    },
+    "force_delete_command": {
+        "type": "str",
+        "label": "Force-delete command ({country}, {uid})",
+        "example": "/frcd {country} {uid}",
+    },
+    "force_delete_uid": {
+        "type": "str",
+        "label": "Your user id for /frcd",
+        "example": "123456789",
+    },
+    "force_delete_before_add": {
+        "type": "bool",
+        "label": "Wipe the country before adding",
+        "example": "on / off",
+    },
+    "interval_minutes": {
+        "type": "int",
+        "label": "Default check interval (minutes)",
+        "min": 1,
+        "max": 1440,
+        "example": "10",
+    },
+    "quota_threshold": {
+        "type": "int",
+        "label": "Refill when stock <= this",
+        "min": 0,
+        "max": 10_000_000,
+        "example": "0",
+    },
+    "limit": {
+        "type": "int",
+        "label": "Per-add limit",
+        "min": 1,
+        "max": 10000,
+        "example": "4",
+    },
+    "count": {
+        "type": "int",
+        "label": "Cooldown seconds",
+        "min": 1,
+        "max": 10000,
+        "example": "4",
+    },
+    "default_tag": {
+        "type": "str",
+        "label": "Default service (blank = ask/auto)",
+        "example": "WhatsApp",
+    },
+    "enabled": {
+        "type": "bool",
+        "label": "Automation running",
+        "example": "on / off",
+    },
+}
+
+_TRUE_WORDS = {"on", "true", "yes", "1", "haa", "ha", "chalu"}
+_FALSE_WORDS = {"off", "false", "no", "0", "na", "bondho"}
+
+
+def coerce_setting(key: str, raw: str) -> Any:
+    """Parse and validate one setting. Raises ValueError with a message meant
+    to be shown straight to the owner.
+    """
+    spec = SETTABLE_FIELDS.get(key)
+    if spec is None:
+        raise ValueError(f"'{key}' ta kono setting na. /otpset likhe list dekho.")
+
+    value = raw.strip()
+    if spec["type"] == "bool":
+        lowered = value.casefold()
+        if lowered in _TRUE_WORDS:
+            return True
+        if lowered in _FALSE_WORDS:
+            return False
+        raise ValueError(f"{key}: 'on' othoba 'off' likho.")
+
+    if spec["type"] == "int":
+        try:
+            number = int(value.replace(",", ""))
+        except ValueError:
+            raise ValueError(f"{key}: ekta number lagbe (jemon {spec['example']}).") from None
+        low, high = spec.get("min", 0), spec.get("max", 10**9)
+        if not low <= number <= high:
+            raise ValueError(f"{key}: {low} theke {high} er moddhe hote hobe.")
+        return number
+
+    # Strings: a template that loses its placeholders silently stops working,
+    # so check the ones the sender actually substitutes.
+    if key == "add_command_template" and "{tag}" not in value:
+        raise ValueError("add_command_template e {tag} thakte hobe.")
+    if key == "force_delete_command" and "{country}" not in value:
+        raise ValueError("force_delete_command e {country} thakte hobe.")
+    if key == "target_bot" and not value.startswith("@"):
+        raise ValueError("target_bot '@' diye shuru hobe (jemon @PBDxbot).")
+    return value[:200]
+
+
+async def set_setting_from_chat(key: str, raw: str) -> str:
+    """Apply one setting and describe the result in one line."""
+    value = coerce_setting(key, raw)
+    await save_config({key: value})
+    shown = "on" if value is True else "off" if value is False else (value or "(blank)")
+    return f"\u2705 {key} = {shown}"
+
+
+async def describe_settings() -> str:
+    """Current values for everything settable, with how to change them."""
+    cfg = await get_config()
+    lines = ["\u2699\uFE0F OTP-bot settings", ""]
+    for key, spec in SETTABLE_FIELDS.items():
+        current = cfg.get(key, "")
+        if current is True:
+            shown = "on"
+        elif current is False:
+            shown = "off"
+        else:
+            shown = str(current) if current != "" else "(blank)"
+        lines.append(f"\u2022 {key} = {shown}")
+        lines.append(f"    {spec['label']}")
+    lines += [
+        "",
+        "Bodlate: /otpset <key> <value>",
+        "Jemon: /otpset interval_minutes 15",
+        "       /otpset target_bot @PBDxbot",
+        "       /otpset force_delete_before_add on",
+        "",
+        "Ek country-r jonno alada: /otpset <country> <key> <value>",
+        "Jemon: /otpset Bangladesh interval_minutes 5",
+    ]
+    return "\n".join(lines)
+
+
+async def set_country_setting_from_chat(country: str, key: str, raw: str) -> str:
+    """Per-country override of the same fields."""
+    from app.automation import otp_schedule
+
+    if key not in otp_schedule.OVERRIDABLE:
+        allowed = ", ".join(otp_schedule.OVERRIDABLE)
+        raise ValueError(f"'{key}' country-r jonno set kora jay na. Jegula jay: {allowed}")
+
+    value = coerce_setting(key, raw)
+    canonical = await canonical_country(country)
+    await otp_schedule.set_country_settings(canonical, {key: value})
+    if key == "interval_minutes":
+        await otp_schedule.arm_country(canonical, int(value))
+    shown = "on" if value is True else "off" if value is False else value
+    return f"\u2705 {canonical}: {key} = {shown}"
+
+
 async def get_known_countries() -> dict[str, Any]:
     """Countries the TARGET BOT itself reports, learned from /st replies.
 
@@ -1234,13 +1407,18 @@ async def handle_resume_trigger() -> str:
 # The periodic cycle (called by the scheduler on its own timer, and by the
 # dashboard's manual "Run now" button)
 # --------------------------------------------------------------------------- #
-async def run_cycle(config: dict[str, Any] | None = None) -> CycleResult:
-    """One quota-check-and-refill pass over the ACTIVE files. Never raises -
+async def run_cycle(config: dict[str, Any] | None = None, *, force: bool = False) -> CycleResult:
+    """One stock-check-and-refill pass over the ACTIVE files. Never raises -
     always returns a result, even on failure.
 
-    Countries share the target bot's single quota, so the quota is read once
-    per pass; what differs per country is the settings used to re-add it
-    (limit, count, tag, cleanup mode), which come from otp_schedule.
+    Countries share the target bot's single chat, so stock is read once per
+    pass; what differs per country is the settings used to re-add it (limit,
+    count, tag, cleanup mode), which come from otp_schedule.
+
+    force=True ignores the per-country timers. The scheduler leaves it False
+    so each country keeps its own pace, but a human pressing "Check now" is
+    asking for a check right now - answering "not due yet" would make the
+    button look broken.
     """
     cfg = config or await get_config()
     target = cfg["target_bot"]
@@ -1256,7 +1434,17 @@ async def run_cycle(config: dict[str, Any] | None = None) -> CycleResult:
     # shared interval a slow country was being re-added on the fast one's
     # clock, which is pure noise for the target bot.
     countries = [e.get("country") or e["name"] for e in active_files]
-    ready = await otp_schedule.due_countries(countries, cfg)
+    if force:
+        # A manual check looks at everything, and still re-arms the timers so
+        # the next automatic pass is measured from now.
+        ready = countries
+        for country in countries:
+            entry_cfg = await otp_schedule.effective_config(country, cfg)
+            await otp_schedule.arm_country(
+                country, int(entry_cfg.get("interval_minutes", 10))
+            )
+    else:
+        ready = await otp_schedule.due_countries(countries, cfg)
     if not ready:
         result.ok = True
         result.action = "not due yet"
@@ -1284,7 +1472,10 @@ async def run_cycle(config: dict[str, Any] | None = None) -> CycleResult:
             matches=lambda text: bool(_parse_country_stock(text)) or _parse_quota(text) is not None,
         )
         if stock_msg is None:
-            result.error = "no reply from the bot to the stock command"
+            result.error = (
+                f"no reply from {target} to {cfg['quota_command']} "
+                "(check the userbot is linked and the command still works)"
+            )
             await _save_last_result(result)
             return result
 

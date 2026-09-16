@@ -75,6 +75,17 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         "force_delete_before_add": False,
         "_note": "Big batch that lasts - checking every few minutes is wasted work.",
     },
+    "Low-stock refill": {
+        "interval_minutes": 10,
+        "quota_threshold": 200,
+        "limit": 4,
+        "count": 4,
+        "force_delete_before_add": True,
+        "_note": (
+            "Refills at 200 left instead of waiting for zero, so the country "
+            "never actually runs dry. Wipes with /frcd first - needs your uid."
+        ),
+    },
     "Replace stock": {
         "interval_minutes": 30,
         "quota_threshold": 0,
@@ -301,6 +312,9 @@ async def save_preset(name: str, values: dict[str, Any]) -> dict[str, Any]:
 
     async with session_scope() as session:
         stored = dict(await repo.get_setting(session, PRESET_KEY) or {})
+        # Membership, not truthiness: quota_threshold=0 ("wait until empty")
+        # and force_delete_before_add=False are both meaningful values that a
+        # truthiness filter would silently drop from the preset.
         entry = {f: values[f] for f in OVERRIDABLE if values.get(f) is not None}
         if values.get("_note"):
             entry["_note"] = str(values["_note"])[:200]
