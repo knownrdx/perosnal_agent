@@ -122,7 +122,7 @@ class CredentialVault:
             try:
                 cache[row.name] = decrypt(row.value)
             except VaultError:
-                log.warning("vault_decrypt_failed", extra={"name": row.name})
+                log.warning("vault_decrypt_failed", extra={"cred_name": row.name})
         self._cache = cache
         self._loaded = True
         if cache:
@@ -142,8 +142,10 @@ class CredentialVault:
         async with session_scope() as session:
             await repo.set_credential(session, name=name, value=encrypted)
         self._cache[name] = value
-        # NOTE: the value itself is deliberately never logged.
-        log.info("credential_set", extra={"name": name})
+        # NOTE: the value itself is deliberately never logged. "name" is a
+        # reserved LogRecord attribute - stdlib logging refuses `extra={"name": ...}`
+        # with KeyError, so this is namespaced to avoid the collision.
+        log.info("credential_set", extra={"cred_name": name})
 
     async def delete(self, name: str) -> bool:
         from app.db import repo
@@ -154,7 +156,7 @@ class CredentialVault:
             removed = await repo.delete_credential(session, name)
         self._cache.pop(name, None)
         if removed:
-            log.info("credential_deleted", extra={"name": name})
+            log.info("credential_deleted", extra={"cred_name": name})
         return removed
 
     def get(self, name: str, fallback: str = "") -> str:

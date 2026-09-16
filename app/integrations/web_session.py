@@ -138,15 +138,14 @@ async def _resolve(value: Any) -> Any:
 
 
 def _is_logrecord_clash(exc: BaseException) -> bool:
-    """True for the vault's ``extra={"name": ...}`` logging bug.
+    """True for the vault's old ``extra={"name": ...}`` logging bug.
 
-    ``app.security.vault`` logs ``credential_set`` / ``credential_deleted`` with
-    ``extra={"name": ...}``, but ``name`` is a reserved ``LogRecord`` attribute, so
-    ``logging`` raises ``KeyError`` once the level is INFO or lower - which is what
-    ``setup_logging("INFO")`` uses in production.  The raise happens *after* the row is
-    committed and the cache updated, so the write itself did land.  Rather than losing
-    every site profile to a log line, tolerate exactly this failure and verify the
-    result instead.  Fixing vault.py is the real remedy.
+    ``app.security.vault`` used to log ``credential_set`` / ``credential_deleted``
+    with ``extra={"name": ...}``, but ``name`` is a reserved ``LogRecord`` attribute,
+    so ``logging`` raised ``KeyError`` once the level was INFO or lower - which is
+    what ``setup_logging("INFO")`` uses in production. vault.py now uses
+    ``extra={"cred_name": ...}`` instead, so this no longer fires; kept as a
+    defense-in-depth guard rather than removed outright.
     """
     return isinstance(exc, KeyError) and "LogRecord" in str(exc)
 

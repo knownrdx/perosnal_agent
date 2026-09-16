@@ -515,7 +515,7 @@ class AgentBot:
             doc = message.document
             if doc is None:
                 return
-            if doc.file_size and doc.file_size > self.settings.max_upload_bytes:
+            if doc.file_size and doc.file_size > self.settings.max_file_bytes:
                 await message.answer(
                     f"\u26A0\uFE0F That file is over the {self.settings.max_file_mb} MB limit."
                 )

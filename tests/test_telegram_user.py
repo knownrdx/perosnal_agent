@@ -158,6 +158,42 @@ async def test_two_factor_flow(vault, monkeypatch):
     assert vault.get(SESSION_KEY) == "SESSION-STRING-ABC"
 
 
+async def test_login_works_under_production_logging_level(vault, monkeypatch, caplog):
+    """Regression guard: /tglogin -> /tgcode -> /tg2fa must complete a real login.
+
+    app/security/vault.py used to log credential_set/credential_deleted with
+    extra={"name": ...}, and "name" is a reserved LogRecord attribute -
+    stdlib logging raises KeyError for that at INFO level, which is what
+    setup_logging("INFO") uses in production. That crash landed inside
+    _finish_login() AFTER the DB write but before the in-memory client/backend
+    were set, so the owner saw success messages in the bot but /tgstatus kept
+    saying "not linked". Reproduce at the real production log level so this
+    exact class of bug (a reserved LogRecord key in ANY vault.set/delete call)
+    cannot silently regress.
+    """
+    import logging
+
+    caplog.set_level(logging.INFO)
+
+    fake = FakeTelethonClient(needs_2fa=True)
+    monkeypatch.setattr(
+        "app.integrations.telegram_user.TelegramClient", lambda *a, **k: fake
+    )
+
+    userbot = TelegramUserbot()
+    await userbot.start_login(1234567, "hash", "+880****5678")
+    with pytest.raises(TwoFactorRequired):
+        await userbot.submit_code("12345")
+    result = await userbot.submit_password("my-2fa-password")
+
+    assert result["linked"] is True
+    # The real regression: login "succeeded" but the vault write silently
+    # never landed / status still reported unlinked.
+    assert vault.get(SESSION_KEY) == "SESSION-STRING-ABC"
+    status = await userbot.status()
+    assert status["linked"] is True
+
+
 async def test_code_without_login_is_rejected(vault):
     with pytest.raises(UserbotError, match="no login in progress"):
         await TelegramUserbot().submit_code("12345")
