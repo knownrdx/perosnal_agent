@@ -65,10 +65,21 @@ Messaging:
 /teams connect <tenant> <client> <secret> | status | send <chat> <text>
 /inbox   - recent WhatsApp/Teams messages
 
+Your Telegram account (acts as YOU, not the bot - message any chat, run other bots):
+/tglogin <api_id> <api_hash> <phone> - link by phone code (from my.telegram.org)
+/tgstring <session string>          - link by pasting an existing Telethon or
+                                       Pyrogram session string instead (skips
+                                       the code - use if /tglogin can't deliver one)
+/tgstatus - is it linked   /tglogout - unlink
+
+Files: just send me a document (e.g. a .txt of numbers) and tell me what to do
+with it, e.g. "add these numbers to @SomeBot" - I will send it through your
+own Telegram account and can repeat that on a schedule (/jobs).
+
 Contacts & skills:
 /members [query] - people seen on Telegram/WhatsApp
 /syncmembers - pull in contacts now
-/skills  - what the agent has taught itself
+/skills  - what the agent has taught itself (grows on its own as I learn)
 """
 
 
@@ -495,6 +506,46 @@ class AgentBot:
                 lines += ["", "Not tied to any job right now."]
             lines += ["", "/new to start fresh   /mode to change behaviour"]
             await message.answer("\n".join(lines))
+
+        @dp.message(F.document)
+        async def _document(message: Message) -> None:
+            """Save an uploaded file into the workspace so a task can use it."""
+            if not await self._guard(message):
+                return
+            doc = message.document
+            if doc is None:
+                return
+            if doc.file_size and doc.file_size > self.settings.max_upload_bytes:
+                await message.answer(
+                    f"\u26A0\uFE0F That file is over the {self.settings.max_file_mb} MB limit."
+                )
+                return
+
+            from app.security import safe_path
+
+            name = doc.file_name or f"upload_{doc.file_unique_id}"
+            # Keep the name but never let it escape uploads/ or collide silently.
+            safe_name = "".join(c for c in name if c not in '\\/:*?"<>|').strip() or "file"
+            target = safe_path(f"uploads/{safe_name}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                stem, _, ext = safe_name.rpartition(".")
+                stem = stem or safe_name
+                target = safe_path(f"uploads/{stem}_{doc.file_unique_id}{'.' + ext if ext else ''}")
+
+            try:
+                file = await message.bot.get_file(doc.file_id)
+                await message.bot.download_file(file.file_path, destination=str(target))
+            except Exception as exc:  # noqa: BLE001
+                await message.answer(f"\u274C Could not download that file: {str(exc)[:200]}")
+                return
+
+            from app.security import rel_path
+
+            await message.answer(
+                f"\U0001F4C1 Saved: {rel_path(target)}\n\n"
+                "Tell me what to do with it, e.g. \"add these numbers to @PBDxbot\"."
+            )
 
         @dp.message(F.text & ~F.text.startswith("/"))
         async def _natural(message: Message) -> None:
