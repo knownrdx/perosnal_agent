@@ -81,7 +81,13 @@ _KNOWN_TAG_TOKENS = {
     "BD", "IN", "PK", "NG", "KE", "ID", "US", "UK", "GENERAL", "GEN",
 }
 
-_QUOTA_RE = re.compile(r"active\s*[:\-]?\s*(\d+)", re.IGNORECASE)
+# The live /myquota reply looks like:
+#     📊 Your quota
+#     Active : 0
+#     Limit  : unlimited (disabled)
+# Comma-grouped counts ("1,234") appear once the number gets large, so they
+# have to be accepted here or a healthy quota reads as an unparseable one.
+_QUOTA_RE = re.compile(r"active\s*[:\-]?\s*([\d,]+)", re.IGNORECASE)
 _FAILURE_PHRASES = ("no valid", "error", "failed", "invalid", "not found", "denied")
 
 
@@ -374,7 +380,9 @@ _QUOTA_RE_MATCH = _QUOTA_RE
 
 def _parse_quota(text: str) -> int | None:
     match = _QUOTA_RE_MATCH.search(text)
-    return int(match.group(1)) if match else None
+    if not match:
+        return None
+    return int(match.group(1).replace(",", ""))
 
 
 async def _last_bot_message(target: str, *, limit: int = 5) -> dict[str, Any] | None:
@@ -386,26 +394,44 @@ async def _last_bot_message(target: str, *, limit: int = 5) -> dict[str, Any] | 
 
 
 async def _wait_for_new_bot_reply(
-    target: str, *, after_id: int | None, timeout_s: float = 90.0, poll_s: float = 3.0
+    target: str,
+    *,
+    after_id: int | None,
+    timeout_s: float = 90.0,
+    poll_s: float = 3.0,
+    matches: Any | None = None,
 ) -> dict[str, Any] | None:
-    """Wait for a bot message NEWER than ``after_id``.
+    """Wait for a bot message NEWER than ``after_id`` (optionally one whose
+    text satisfies ``matches``).
 
     A fixed sleep-then-read is not enough: a large file can take the target
     bot well over a minute to ingest, and reading too early returns its
     PREVIOUS message - which is how an add once got reported with the
-    /useddelete reply ("Deleted 4,796 used numbers") as its result. Anchoring
-    on the last-seen message id makes "has it actually answered yet?"
-    decidable instead of guessed.
+    /useddelete reply ("Deleted 4,796 used numbers") as its result.
+
+    Recency alone is not enough either: the bot emits progress/completion
+    messages of its own, so a quota check can land on the tail end of an
+    earlier add ("Fast Add Complete!") and fail to parse. ``matches`` lets
+    the caller say what the answer should look like, and unmatched messages
+    are skipped rather than mistaken for the reply.
     """
     waited = 0.0
+    newest_seen = after_id
     while waited < timeout_s:
         await _sleep(poll_s)
         waited += poll_s
         message = await _last_bot_message(target)
         if message is None:
             continue
-        if after_id is None or int(message.get("id", 0)) > after_id:
-            return message
+        message_id = int(message.get("id", 0))
+        if newest_seen is not None and message_id <= newest_seen:
+            continue
+        if matches is not None and not matches(message.get("text") or ""):
+            # Something new, but not the answer we asked for - remember it so
+            # we keep moving forward instead of re-examining it every poll.
+            newest_seen = message_id
+            continue
+        return message
     return None
 
 
@@ -683,8 +709,15 @@ async def run_cycle(config: dict[str, Any] | None = None) -> CycleResult:
         before_quota_id = int(before_quota.get("id", 0)) if before_quota else None
 
         await get_userbot().send_message(target, cfg["quota_command"])
+        # Only a message that actually parses as a quota counts as the
+        # answer: the bot also posts its own add/progress notices, and one of
+        # those arriving first previously produced "could not parse an
+        # 'Active' count" even though the quota reply was on its way.
         quota_msg = await _wait_for_new_bot_reply(
-            target, after_id=before_quota_id, timeout_s=45.0
+            target,
+            after_id=before_quota_id,
+            timeout_s=45.0,
+            matches=lambda text: _parse_quota(text) is not None,
         )
         if quota_msg is None:
             result.error = "no reply from the bot to the quota command"

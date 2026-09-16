@@ -1,24 +1,24 @@
-Wait for the bot's actual reply instead of sleeping a fixed 3 seconds
+Quota check: accept only a reply that is actually a quota
 
-A live run added 53,412 numbers successfully but reported the wrong result:
-the first file's outcome was shown as the /useddelete reply ("Deleted 4,796
-used/expired numbers") rather than its own confirmation. Cause: the code
-slept 3s and then read the latest bot message. A large file takes the target
-bot far longer than that to ingest, so the read returned the PREVIOUS
-message - the automation had no way to tell "it answered" from "it has not
-answered yet".
+Live "check quota now" failed with "could not parse an 'Active' count",
+quoting the bot's own "Fast Add Complete!" notice. Waiting for a NEWER
+message was not enough - the target bot posts its own progress and
+completion notices, so a stray one arrives first and gets mistaken for the
+answer while the real /myquota reply is still in flight.
 
-Both the add and the quota check now anchor on the id of the last bot
-message before sending, then poll until something newer appears (90s for an
-add, 45s for a quota check). No reply within the window is now an explicit
-failure that says the add may or may not have gone through, instead of
-silently attributing someone else's message to this file.
+_wait_for_new_bot_reply now takes an optional predicate, and the quota
+check only accepts a message that actually parses as a quota; anything else
+newer is skipped and the wait continues. Unparseable chatter is therefore
+"not the answer yet" rather than a hard failure, which is what it always
+meant.
 
-Test doubles updated to issue increasing message ids, since "newer than what
-I last saw" is now the thing under test; FailingUserbot gained the methods
-the real path touches first. Two regressions added: one drives a bot that
-only answers after several polls and asserts the stale /useddelete text is
-never reported as the add's result, another asserts a silent bot fails
-loudly and leaves nothing marked active.
+The parser also now accepts comma-grouped counts ("Active : 4,796"), which
+appear once the number grows and would otherwise have read as unparseable.
 
-600 tests (was 598), smoke 10/10.
+Tests: the real reply formats are pinned (including the grouped-thousands
+case and a "Fast Add Complete!" line that must NOT parse), plus a bot that
+posts an add notice before its quota reply and must still be read
+correctly. The old unparseable-quota test asserted the now-obsolete
+behaviour and was rewritten to match what the code should do.
+
+602 tests (was 600).

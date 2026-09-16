@@ -391,6 +391,53 @@ async def test_add_fails_when_the_bot_never_answers(environment, monkeypatch):
     assert await otp_bot.get_active_files() == []
 
 
+async def test_quota_parser_handles_the_real_reply_formats():
+    """Exact shapes seen from the live bot, including grouped thousands."""
+    assert otp_bot._parse_quota("\U0001F4CA Your quota\n\nActive : 0\nLimit  : unlimited") == 0
+    assert otp_bot._parse_quota("Active : 4,796") == 4796
+    assert otp_bot._parse_quota("active-12") == 12
+    assert otp_bot._parse_quota("\u26A1 Fast Add Complete! 53412 added") is None
+
+
+async def test_cycle_skips_the_bots_own_add_notice_when_reading_quota(environment):
+    """Regression: a stray "Fast Add Complete!" was taken as the quota reply.
+
+    It is newer than the anchor but is not an answer to /myquota, so the
+    cycle reported "could not parse an 'Active' count" while the real reply
+    was still on its way.
+    """
+    await _start_with_one_active_file()
+
+    class ChattyBot:
+        """Posts an unrelated notice first, then the actual quota."""
+
+        def __init__(self) -> None:
+            self.reads = 0
+            self.messages = [
+                {"text": "\u26A1 Fast Add Complete! 53412 added", "id": 20, "out": False},
+                {"text": "\u26A1 Fast Add Complete! 53412 added", "id": 20, "out": False},
+                {"text": "\U0001F4CA Your quota\n\nActive : 7", "id": 21, "out": False},
+            ]
+
+        async def send_message(self, target, text, reply_to=None):
+            return {"sent": True, "message_id": 900}
+
+        async def send_file(self, target, path, caption="", reply_to=None):
+            return {"sent": True, "message_id": 901}
+
+        async def read_messages(self, target, limit=20):
+            index = min(self.reads, len(self.messages) - 1)
+            self.reads += 1
+            return [self.messages[index]]
+
+    set_userbot(ChattyBot())
+    result = await otp_bot.run_cycle(await otp_bot.get_config())
+
+    assert result.ok is True
+    assert result.active_quota == 7
+    assert result.action == "skipped"
+
+
 # --------------------------------------------------------------------------- #
 # Deterministic chat triggers (start/stop/tag-answer/resume) - no LLM
 # --------------------------------------------------------------------------- #
@@ -508,13 +555,18 @@ async def test_cycle_fails_cleanly_when_not_linked(environment):
     assert "not linked" in result.error
 
 
-async def test_cycle_reports_unparseable_quota(environment):
+async def test_cycle_reports_no_quota_reply_when_the_bot_only_talks_nonsense(environment):
+    """Unparseable chatter is treated as "not the answer yet", not as the
+    answer - so the cycle waits out its window and reports no reply rather
+    than acting on a number it never actually read.
+    """
     await _start_with_one_active_file()
     fake = FakeUserbot([{"text": "some unexpected reply with no numbers", "out": False}])
     set_userbot(fake)
     result = await otp_bot.run_cycle(await otp_bot.get_config())
     assert result.ok is False
-    assert "could not parse" in result.error
+    assert "no reply" in result.error
+    assert result.active_quota is None
 
 
 async def test_last_result_persists(environment):
