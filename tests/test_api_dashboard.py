@@ -155,3 +155,61 @@ def test_jobs_create_and_delete(client):
     assert deleted.json() == {"removed": True, "job_id": job_id}
 
     assert client.delete("/api/jobs/doesnotexist", headers=headers).status_code == 404
+
+
+def test_chat_send_and_history(client, monkeypatch):
+    """Web chat uses the same handle_message brain as Telegram, same chat_id."""
+    headers = {"X-API-Token": "test-api-token"}
+
+    from app.agent.router import Decision, Intent
+
+    async def fake_classify(*args, **kwargs):
+        return Decision(Intent.CHAT, "test")
+
+    async def fake_chat_reply(chat_id, text, llm=None):
+        return f"echo: {text}"
+
+    monkeypatch.setattr("app.agent.conversation.classify", fake_classify)
+    monkeypatch.setattr("app.agent.conversation.chat_reply", fake_chat_reply)
+
+    resp = client.post("/api/chat", json={"message": "hello there"}, headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["reply"] == "echo: hello there"
+    assert body["intent"] == "CHAT"
+
+    history = client.get("/api/chat/history", headers=headers)
+    assert history.status_code == 200
+    roles = [m["role"] for m in history.json()["messages"]]
+    assert roles[-2:] == ["user", "assistant"]
+    assert history.json()["messages"][-1]["content"] == "echo: hello there"
+
+
+def test_chat_requires_auth(client):
+    assert client.post("/api/chat", json={"message": "hi"}).status_code == 401
+    assert client.get("/api/chat/history").status_code == 401
+
+
+def test_chat_works_with_cookie_only(client, monkeypatch):
+    monkeypatch.setenv("WEB_UI_PASSWORD", "hunter2")
+    from app.config import reload_settings
+
+    reload_settings()
+
+    from app.agent.router import Decision, Intent
+
+    async def fake_classify(*args, **kwargs):
+        return Decision(Intent.CHAT, "test")
+
+    async def fake_chat_reply(chat_id, text, llm=None):
+        return "hi from the cookie session"
+
+    monkeypatch.setattr("app.agent.conversation.classify", fake_classify)
+    monkeypatch.setattr("app.agent.conversation.chat_reply", fake_chat_reply)
+
+    login = client.post("/api/auth/login", json={"password": "hunter2"})
+    assert login.status_code == 200
+
+    resp = client.post("/api/chat", json={"message": "yo"})
+    assert resp.status_code == 200
+    assert resp.json()["reply"] == "hi from the cookie session"

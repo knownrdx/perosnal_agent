@@ -179,6 +179,10 @@ class SchedulerCreateRequest(BaseModel):
     max_runs: int | None = None
 
 
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=8000)
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="Personal AI Agent", version="1.0.0", docs_url=None, redoc_url=None)
 
@@ -594,6 +598,52 @@ def create_app() -> FastAPI:
         from app.integrations.telegram_user import get_userbot
 
         return await get_userbot().status()
+
+    # --- chat (ChatGPT-style web conversation) --------------------------- #
+    # Shares the exact same brain as the Telegram "just talk to me" flow
+    # (app.agent.conversation.handle_message) and the same chat_id (the
+    # owner's), so a message sent from the web dashboard and one sent from
+    # Telegram land in one continuous conversation either surface can see.
+    @app.get("/api/chat/history", dependencies=[Depends(require_api_access)])
+    async def chat_history(limit: int = 50) -> dict[str, Any]:
+        settings = get_settings()
+        chat_id = settings.owner_chat_id
+        if chat_id is None:
+            return {"chat_id": None, "messages": []}
+        async with session_scope() as session:
+            turns = await repo.recent_messages(session, chat_id, limit=min(limit, 200))
+            return {
+                "chat_id": chat_id,
+                "messages": [
+                    {
+                        "role": t.role,
+                        "content": t.content,
+                        "task_id": t.task_id,
+                        "created_at": t.created_at.isoformat() if t.created_at else None,
+                    }
+                    for t in turns
+                ],
+            }
+
+    @app.post("/api/chat", dependencies=[Depends(require_api_access)])
+    async def chat_send(payload: ChatRequest) -> dict[str, Any]:
+        settings = get_settings()
+        chat_id = settings.owner_chat_id
+        if chat_id is None:
+            raise HTTPException(
+                status_code=503,
+                detail="no owner chat configured (set TELEGRAM_ALLOWED_USER_IDS)",
+            )
+
+        from app.agent.conversation import handle_message
+
+        reply = await handle_message(chat_id, chat_id, payload.message)
+        return {
+            "reply": reply.text,
+            "intent": reply.intent.value,
+            "task_id": reply.task_id,
+            "created_task": reply.created_task,
+        }
 
     # --- static web dashboard ------------------------------------------- #
     # Mounted last so it never shadows an /api/* or /health route above.

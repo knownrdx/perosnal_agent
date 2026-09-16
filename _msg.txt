@@ -1,54 +1,28 @@
-Web dashboard: cookie-authed control surface at /ui behind agent.dubaivpn.xyz
+Add a ChatGPT-style Chat panel to the web dashboard
 
-The Telegram interface works well for conversational control, but the owner
-wants a real dashboard - click a button instead of remembering slash-command
-syntax, see everything at once instead of scrolling chat history.
+Every other panel is a control surface - tasks, jobs, contacts - but there
+was no way to just talk to the agent from the browser the way Telegram
+already lets you. Fixed.
 
-Cookie auth alongside the existing token
+Backend: two new endpoints reusing the existing brain
 
-The existing X-API-Token header is fine for scripts but wrong for a browser:
-shipping a long-lived secret into client-side JS defeats the point of having
-one. Added a parallel auth path - POST /api/auth/login with a password sets
-an HttpOnly signed session cookie (stdlib hmac+base64+json, no new
-dependency, no JWT library); require_api_access accepts either the header or
-the cookie, so nothing that already used the token breaks. WEB_UI_PASSWORD
-unset means no valid cookie can ever exist, so a token-only deployment is
-unaffected by any of this. The session-signing secret persists to a file
-under the workspace the same way vault.py's Fernet key does, so a redeploy
-does not invalidate every open session.
+POST /api/chat and GET /api/chat/history both call the exact same
+app.agent.conversation.handle_message()/recent_messages() that Telegram's
+"just talk to me" flow already uses, against the owner's chat_id
+(settings.owner_chat_id). No new conversation engine, no new memory store -
+a message sent from the web dashboard and one sent from Telegram are one
+continuous conversation either surface can see, same task-creation routing,
+same self-learning, same follow-up detection.
 
-New read/control endpoints backing the dashboard
+Frontend: a real chat UI, not a form
 
-Contacts, skills, memory search, scheduled jobs (list/create/delete),
-autonomy level, WhatsApp/Teams/Telegram-account connection status - all of
-it already existed as Telegram commands or internal repo functions; these
-endpoints expose the same operations over HTTP so the dashboard has
-something to call.
+New "Chat" panel (now the default landing panel) - message bubbles,
+right-aligned for the owner, left for the agent, auto-scrolling, a
+"Thinking..." indicator while waiting, Enter to send / Shift+Enter for a
+newline, an auto-growing textarea. History loads once per session on first
+visit to the panel. Every request goes through the same credentials-include
++ 401-redirects-to-login fetch wrapper the rest of the dashboard already
+uses - no separate auth path to get wrong.
 
-One HTML file, no build step
-
-app/webui/index.html - inline CSS and JS, zero external requests, dark
-theme, nine panels (tasks, approvals, contacts, skills, memory, jobs, LLM,
-bridges, settings). Mounted at /ui via StaticFiles; the login gate is
-client-side (checks /api/auth/me on load), every actual API call is still
-independently authenticated server-side.
-
-Reverse proxy + domain
-
-The agent's port was loopback-only, correct for a bare VPS but useless
-behind a domain. Added an nginx container (both 80 and 443 - Cloudflare's
-"Full" SSL mode connects to the origin over HTTPS, and a self-signed cert is
-sufficient since Cloudflare doesn't validate the origin chain in that mode)
-proxying agent.dubaivpn.xyz to the agent container. nginx defaulted to
-spawning one worker per host CPU (auto), which on an 8-core box under a
-0.3-CPU container limit caused severe CFS throttling - requests hung rather
-than erroring. Pinned worker_processes to 1.
-
-Also fixed: the LLM health probe inside /health had no timeout, so a
-gateway that hangs instead of failing fast made every health check -
-including nginx's own and the domain's first byte - wait on it. Wrapped in
-asyncio.wait_for(5s); a slow/dead LLM now reports unhealthy quickly instead
-of making the whole health endpoint slow.
-
-558 tests (12 new), smoke 10/10. Live-verified: https://agent.dubaivpn.xyz/health
-resolves through Cloudflare to the VPS.
+561 tests (3 new, covering send+history round-trip, auth-required, and
+cookie-only access), full suite green.
