@@ -134,6 +134,29 @@ async def test_thread_is_titled_so_it_is_findable(environment):
     assert match[0]["title"] != "New chat"
 
 
+async def test_ensure_thread_backfills_a_missing_title(environment):
+    """A thread bound before titling existed must not stay a nameless entry."""
+    from app.db import repo
+    from app.db.base import session_scope
+
+    # Simulate the pre-fix state: a bound thread with no user message in it.
+    async with session_scope() as session:
+        await repo.ensure_session(session, OTP_CHAT_ID)
+        untitled = await repo.reset_session(session, OTP_CHAT_ID)
+    await otp_bot.save_config({"thread_id": untitled})
+
+    async with session_scope() as session:
+        before = await repo.list_threads(session, OTP_CHAT_ID, limit=10)
+    assert [t for t in before if t["thread_id"] == untitled][0]["title"] == "New chat"
+
+    reused = await otp_bot.ensure_thread(OTP_CHAT_ID)
+    assert reused == untitled, "must reuse, not replace, the bound thread"
+
+    async with session_scope() as session:
+        after = await repo.list_threads(session, OTP_CHAT_ID, limit=10)
+    assert [t for t in after if t["thread_id"] == untitled][0]["title"] != "New chat"
+
+
 # --------------------------------------------------------------------------- #
 # Autonomous tag decisions - the agent should decide on its own whenever it
 # reasonably can, and only ever ask when it genuinely has nothing to go on.

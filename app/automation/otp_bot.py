@@ -226,9 +226,21 @@ async def ensure_thread(chat_id: int) -> str:
         await repo.ensure_session(session, chat_id)
 
         if bound:
-            known = {t["thread_id"] for t in await repo.list_threads(session, chat_id, limit=200)}
-            if bound in known:
+            existing = {
+                t["thread_id"]: t
+                for t in await repo.list_threads(session, chat_id, limit=200)
+            }
+            if bound in existing:
                 await repo.switch_thread(session, chat_id, bound)
+                # Backfill the title for a thread that predates the titling
+                # fix (or lost its seed some other way) - otherwise it stays
+                # a nameless "New chat" forever, which is the one thing this
+                # thread is supposed to prevent.
+                if existing[bound]["title"] in ("New chat", ""):
+                    await repo.add_message(
+                        session, chat_id=chat_id, role="user",
+                        content=THREAD_TITLE, thread_id=bound,
+                    )
                 return bound
 
         new_thread = await repo.reset_session(session, chat_id)
