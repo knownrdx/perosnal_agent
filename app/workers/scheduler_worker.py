@@ -166,8 +166,14 @@ class SchedulerRunner:
         in production. Configured entirely from the web dashboard's
         Automation panel / /otpbot Telegram command; no code change needed to
         turn it on, change the interval, or point it at a different bot.
+
+        The per-country due times live in otp_schedule, so this only paces
+        how often we LOOK. It has to run at least as often as the shortest
+        country interval or a 5-minute country would be capped by a
+        30-minute global one; run_cycle() itself is a cheap no-op ("not due
+        yet") when nothing has come up.
         """
-        from app.automation import otp_bot
+        from app.automation import otp_bot, otp_schedule
 
         config = await otp_bot.get_config()
         if not config.get("enabled"):
@@ -175,7 +181,8 @@ class SchedulerRunner:
             return False
 
         now = utcnow()
-        interval = timedelta(minutes=max(1, int(config.get("interval_minutes", 10))))
+        shortest = await otp_schedule.shortest_interval_minutes(config)
+        interval = timedelta(minutes=max(1, shortest))
         if self._next_otp_check is None:
             # First tick after boot/enable only arms the timer - it must not
             # fire immediately on every restart.
@@ -189,6 +196,9 @@ class SchedulerRunner:
         if result.error == "no active files - run start() first":
             # Enabled but nothing was ever started successfully - nothing to
             # check yet, not a failure worth notifying about.
+            return True
+        if result.action == "not due yet":
+            # Normal idle state when countries run on staggered timers.
             return True
         log.info(
             "otp_automation_cycle",
@@ -204,10 +214,44 @@ class SchedulerRunner:
                 f"\u26A0\uFE0F OTP-bot automation failed: {result.error[:300]}",
                 dedupe_key=f"otp_automation_error:{result.ran_at}",
             )
-        elif result.action == "added":
+            return result.ok
+
+        # A country whose file is spent needs the owner to act - nothing the
+        # automation can do will produce more numbers. This is the one case
+        # worth interrupting them for, so it is reported separately from a
+        # routine refill and says exactly what is needed.
+        if result.exhausted:
+            names = ", ".join(e["country"] for e in result.exhausted)
+            lines = [
+                f"\U0001F6A8 Number stock shesh: {names}",
+                "",
+            ]
+            for item in result.exhausted:
+                lines.append(
+                    f"\u2022 {item['country']} - file '{item['name']}' e notun kichu nai "
+                    "(sob duplicate)."
+                )
+            lines += [
+                "",
+                "Ei country-r jonno notun number file lagbe.",
+                f"File ta ei chat-e pathao - ami nije queue kore {config['target_bot']}-e "
+                "add kore dibo.",
+                "",
+                "Na dile oi country bondho thakbe. Bad dite chaile: "
+                f"\"{result.exhausted[0]['country']} bad dao\".",
+            ]
             await self.notifier.send(
                 self.settings.owner_chat_id,
-                f"\U0001F504 Quota was exhausted - cleaned up and re-added numbers to "
+                "\n".join(lines),
+                # Keyed on the countries, not the timestamp: re-alerting every
+                # cycle for the same dead file would train the owner to ignore
+                # it, but a different country running dry is genuinely new.
+                dedupe_key=f"otp_stock_empty:{names}",
+            )
+        elif result.action.startswith("added"):
+            await self.notifier.send(
+                self.settings.owner_chat_id,
+                f"\U0001F504 Stock was empty - cleaned up and re-added numbers to "
                 f"{config['target_bot']}.\n\n{result.add_reply[:500]}",
                 dedupe_key=f"otp_automation_added:{result.ran_at}",
             )

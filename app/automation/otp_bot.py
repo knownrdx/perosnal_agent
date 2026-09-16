@@ -39,6 +39,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from app.automation import otp_schedule
 from app.db import repo
 from app.db.base import session_scope
 from app.integrations.telegram_user import UserbotError, get_userbot
@@ -60,7 +61,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "add_command_template": "/fan -t {tag} -l {limit} -c {count}",
     "limit": 4,
     "count": 4,
-    "quota_command": "/myquota",
+    # /st ("/stats") over /myquota: it reports live stock PER COUNTRY in one
+    # reply, so a single round-trip answers for every country being run
+    # instead of needing one check each.
+    "quota_command": "/st",
     "quota_threshold": 0,        # refill when active quota <= this
     "cleanup_command": "/useddelete",
     # Force-delete (Owner-level "/frcd <country> <uid>"). /useddelete only
@@ -94,7 +98,177 @@ _KNOWN_TAG_TOKENS = {
 # Comma-grouped counts ("1,234") appear once the number gets large, so they
 # have to be accepted here or a healthy quota reads as an unparseable one.
 _QUOTA_RE = re.compile(r"active\s*[:\-]?\s*([\d,]+)", re.IGNORECASE)
+
+# /st ("/stats") reports live stock PER COUNTRY under its own header, which
+# is what makes one command enough for any number of countries:
+#
+#   \U0001F30D Country Stock (yours):
+#     \U0001F1E8\U0001F1EB Central African Republic: 90712 (+416 taken)
+#
+# Only lines below that header count. The section above it has a global
+# "\u2022 Available: 416036" line that would otherwise be read as a country.
+_STOCK_HEADER_RE = re.compile(r"country\s+stock", re.IGNORECASE)
+_STOCK_LINE_RE = re.compile(
+    r"^[\s\u2022\-]*"            # bullet / indent
+    r"[^\w(]*"                    # flag emoji and other leading symbols
+    r"(?P<country>[A-Za-z][A-Za-z .'\-]*[A-Za-z])"
+    r"\s*[:\-]\s*"
+    r"(?P<count>[\d,]+)"
+)
+
+
+def _parse_country_stock(text: str) -> dict[str, int]:
+    """Live per-country stock from a /st reply.
+
+    Returns {} when the reply has no stock section, which the caller treats
+    as "not the answer I asked for" rather than "every country is empty" -
+    misreading a progress notice as zero stock would trigger a pointless
+    refill of everything.
+    """
+    if not text:
+        return {}
+
+    lines = text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if _STOCK_HEADER_RE.search(line):
+            start = index + 1
+            break
+    if start is None:
+        return {}
+
+    stock: dict[str, int] = {}
+    for line in lines[start:]:
+        if not line.strip():
+            # A blank line ends the section; anything after it belongs to
+            # some other part of the message.
+            if stock:
+                break
+            continue
+        match = _STOCK_LINE_RE.match(line)
+        if not match:
+            continue
+        country = match.group("country").strip()
+        try:
+            stock[country] = int(match.group("count").replace(",", ""))
+        except ValueError:
+            continue
+    return stock
+
+def _stock_for(stock: dict[str, int], country: str) -> int | None:
+    """Look up one country in a /st reply.
+
+    Matched case-insensitively, and by prefix as a fallback, because the
+    name we stored came from the phone-prefix table while the one in the
+    reply came from the bot - they agree today but need not agree exactly
+    ("Congo (DRC)" vs "Congo"), and a missed match reads as zero stock and
+    triggers a pointless re-add.
+    """
+    wanted = " ".join(country.strip().casefold().split())
+    lowered = {" ".join(k.strip().casefold().split()): v for k, v in stock.items()}
+    if wanted in lowered:
+        return lowered[wanted]
+
+    def letters(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+    target = letters(wanted)
+    if not target:
+        return None
+    for name, value in lowered.items():
+        stored = letters(name)
+        if stored and (stored.startswith(target) or target.startswith(stored)):
+            return value
+    return None
+
+
 _FAILURE_PHRASES = ("no valid", "error", "failed", "invalid", "not found", "denied")
+
+# "✅ 53412 added, 46588 duplicates skipped" / "Central African Republic: 0 added (20000 dup)"
+_ADDED_RE = re.compile(r"([\d,]+)\s+added", re.IGNORECASE)
+
+
+def _parse_added_count(text: str) -> int | None:
+    """How many NEW numbers an add actually contributed.
+
+    This is the difference between "the command worked" and "the file still
+    has something to give": a spent file reports "0 added (20000 dup)" -
+    a perfectly successful command that changed nothing. Without this the
+    automation would keep re-uploading a dead file every cycle forever and
+    the owner would never learn the stock is gone.
+    """
+    if not text:
+        return None
+    match = _ADDED_RE.search(text)
+    if not match:
+        return None
+    try:
+        return int(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+KNOWN_COUNTRIES_KEY = "otp_bot_known_countries"
+
+
+async def get_known_countries() -> dict[str, Any]:
+    """Countries the TARGET BOT itself reports, learned from /st replies.
+
+    The phone-prefix table is only a guess used to split a file; the bot's
+    own spelling is the authority, because that is what /frcd, /setlimit and
+    the stock report all key on. A name we invented that the bot does not
+    use would silently never match its stock line.
+    """
+    async with session_scope() as session:
+        stored = await repo.get_setting(session, KNOWN_COUNTRIES_KEY)
+    return dict(stored or {})
+
+
+async def learn_countries(stock: dict[str, int]) -> list[str]:
+    """Record the countries seen in a /st reply. Returns newly-seen names."""
+    if not stock:
+        return []
+
+    known = await get_known_countries()
+    names = dict(known.get("names", {}))
+    new: list[str] = []
+    for name, count in stock.items():
+        key = " ".join(name.strip().casefold().split())
+        if key not in names:
+            new.append(name)
+        names[key] = {"name": name, "last_stock": count, "seen_at": _now_iso()}
+
+    known["names"] = names
+    known["updated_at"] = _now_iso()
+    async with session_scope() as session:
+        await repo.set_setting(session, KNOWN_COUNTRIES_KEY, known)
+    return new
+
+
+async def canonical_country(name: str) -> str:
+    """Map a guessed country name onto the bot's own spelling when we have
+    seen it. Falls back to the guess, so a brand-new country still works -
+    it just gets corrected the first time the bot reports it.
+    """
+    known = (await get_known_countries()).get("names", {})
+    key = " ".join(name.strip().casefold().split())
+    if key in known:
+        return known[key]["name"]
+
+    # Prefix match on letters only, so punctuation and abbreviation styles
+    # do not block a match ("Central African Rep." vs "...Republic",
+    # "Congo (DRC)" vs "Congo").
+    def letters(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+    target = letters(key)
+    if not target:
+        return name.strip()
+    for stored_key, entry in known.items():
+        stored = letters(stored_key)
+        if stored and (stored.startswith(target) or target.startswith(stored)):
+            return entry["name"]
+    return name.strip()
 
 
 def _looks_like_failure(reply_text: str) -> bool:
@@ -126,6 +300,14 @@ class CycleResult:
     quota_reply: str = ""
     active_quota: int | None = None
     add_reply: str = ""
+    # Live per-country stock from /st, so one command answers for every
+    # country at once instead of one round-trip each.
+    country_stock: dict[str, int] = field(default_factory=dict)
+    # Countries whose file has nothing left to give (0 added, all duplicates)
+    # - the owner has to send a fresh file for these.
+    exhausted: list[dict[str, Any]] = field(default_factory=list)
+    # Countries the bot reported that we had not seen before.
+    new_countries: list[str] = field(default_factory=list)
     files_processed: list[str] = field(default_factory=list)
     error: str = ""
     ran_at: str = field(default_factory=_now_iso)
@@ -357,6 +539,10 @@ async def enqueue_file(path: str, name: str) -> dict[str, Any]:
     batch_id = secrets.token_hex(4)
 
     for country, numbers in grouped.items():
+        # Prefer the spelling the target bot itself uses, when we have seen
+        # it: every per-country command (/frcd, /setlimit) and the stock
+        # report key on the bot's name, not on our prefix table's guess.
+        country = await canonical_country(country)
         split_path = path
         if len(grouped) > 1:
             # Write the country's own file so the bot only ever receives
@@ -648,6 +834,37 @@ async def _add_one_file(target: str, entry: dict[str, Any], cfg: dict[str, Any])
 # --------------------------------------------------------------------------- #
 # start() / stop(): owner-triggered, not on the scheduler's timer
 # --------------------------------------------------------------------------- #
+async def refresh_countries_from_bot() -> dict[str, Any]:
+    """Ask the bot for its stock and learn the country list from the reply.
+
+    Lets the owner populate the country list without waiting for a refill
+    cycle - and confirms the bot is reachable at the same time.
+    """
+    cfg = await get_config()
+    target = cfg["target_bot"]
+    try:
+        before = await _last_bot_message(target)
+        before_id = int(before.get("id", 0)) if before else None
+        await get_userbot().send_message(target, cfg["quota_command"])
+        reply = await _wait_for_new_bot_reply(
+            target,
+            after_id=before_id,
+            timeout_s=45.0,
+            matches=lambda text: bool(_parse_country_stock(text)),
+        )
+        if reply is None:
+            return {"ok": False, "error": "no stock reply from the bot", "countries": {}}
+
+        stock = _parse_country_stock(reply["text"])
+        new = await learn_countries(stock)
+        return {"ok": True, "countries": stock, "new": new, "error": ""}
+    except UserbotError as exc:
+        return {"ok": False, "error": f"telegram account not linked: {exc}", "countries": {}}
+    except Exception as exc:  # noqa: BLE001 - never crash a UI call
+        log.exception("otp_bot_refresh_countries_error")
+        return {"ok": False, "error": f"unexpected error ({type(exc).__name__}): {exc}", "countries": {}}
+
+
 async def start_automation() -> dict[str, Any]:
     """Consume every queued (and tagged) file: cleanup once, then add each
     file as its own reply-based command. On success the queue becomes the
@@ -684,12 +901,20 @@ async def start_automation() -> dict[str, Any]:
         await _sleep(2)
 
         for entry in queue:
-            reply = await _add_one_file(target, entry, cfg)
+            country = entry.get("country") or entry["name"]
+            # Each country runs on its own settings from the very first add,
+            # not just from the second cycle onwards.
+            entry_cfg = await otp_schedule.effective_config(country, cfg)
+            reply = await _add_one_file(target, entry, entry_cfg)
+            await otp_schedule.arm_country(
+                country, int(entry_cfg.get("interval_minutes", 10))
+            )
             result["files"].append({
                 "name": entry["name"],
                 "country": entry.get("country"),
                 "count": entry.get("count"),
                 "tag": entry["tag"],
+                "interval_minutes": entry_cfg.get("interval_minutes"),
                 "reply": reply,
             })
 
@@ -1012,6 +1237,10 @@ async def handle_resume_trigger() -> str:
 async def run_cycle(config: dict[str, Any] | None = None) -> CycleResult:
     """One quota-check-and-refill pass over the ACTIVE files. Never raises -
     always returns a result, even on failure.
+
+    Countries share the target bot's single quota, so the quota is read once
+    per pass; what differs per country is the settings used to re-add it
+    (limit, count, tag, cleanup mode), which come from otp_schedule.
     """
     cfg = config or await get_config()
     target = cfg["target_bot"]
@@ -1023,6 +1252,21 @@ async def run_cycle(config: dict[str, Any] | None = None) -> CycleResult:
         await _save_last_result(result)
         return result
 
+    # Only refill the countries whose own timer has come up. With a single
+    # shared interval a slow country was being re-added on the fast one's
+    # clock, which is pure noise for the target bot.
+    countries = [e.get("country") or e["name"] for e in active_files]
+    ready = await otp_schedule.due_countries(countries, cfg)
+    if not ready:
+        result.ok = True
+        result.action = "not due yet"
+        await _save_last_result(result)
+        return result
+
+    due_files = [
+        e for e in active_files if (e.get("country") or e["name"]) in set(ready)
+    ]
+
     try:
         # Anchor on the last bot message before asking, so a slow answer is
         # waited for rather than the previous one being mistaken for it.
@@ -1030,49 +1274,94 @@ async def run_cycle(config: dict[str, Any] | None = None) -> CycleResult:
         before_quota_id = int(before_quota.get("id", 0)) if before_quota else None
 
         await get_userbot().send_message(target, cfg["quota_command"])
-        # Only a message that actually parses as a quota counts as the
-        # answer: the bot also posts its own add/progress notices, and one of
-        # those arriving first previously produced "could not parse an
-        # 'Active' count" even though the quota reply was on its way.
-        quota_msg = await _wait_for_new_bot_reply(
+        # Only a message that actually carries per-country stock counts as
+        # the answer: the bot also posts its own add/progress notices, and
+        # one of those arriving first previously produced a misread.
+        stock_msg = await _wait_for_new_bot_reply(
             target,
             after_id=before_quota_id,
             timeout_s=45.0,
-            matches=lambda text: _parse_quota(text) is not None,
+            matches=lambda text: bool(_parse_country_stock(text)) or _parse_quota(text) is not None,
         )
-        if quota_msg is None:
-            result.error = "no reply from the bot to the quota command"
-            await _save_last_result(result)
-            return result
-        result.quota_reply = quota_msg["text"]
-        active = _parse_quota(quota_msg["text"])
-        result.active_quota = active
-
-        if active is None:
-            result.error = "could not parse an 'Active' count from the quota reply"
+        if stock_msg is None:
+            result.error = "no reply from the bot to the stock command"
             await _save_last_result(result)
             return result
 
-        if active > cfg["quota_threshold"]:
-            result.ok = True
-            result.action = "skipped"
-            await _save_last_result(result)
-            return result
+        result.quota_reply = stock_msg["text"]
+        stock = _parse_country_stock(stock_msg["text"])
+        result.country_stock = stock
+        # The bot's own list is the authority on what countries exist and how
+        # they are spelled - learn it rather than trusting our prefix guess.
+        result.new_countries = await learn_countries(stock)
+        # Kept for the existing UI/notification surface, which still shows a
+        # single headline number.
+        result.active_quota = _parse_quota(stock_msg["text"])
+        if result.active_quota is None and stock:
+            result.active_quota = sum(stock.values())
 
-        # Quota exhausted: clean up once, then re-add every active file.
+        if not stock:
+            # A plain /myquota reply has no per-country breakdown. Fall back
+            # to the old all-or-nothing behaviour rather than refusing to
+            # work, so an owner who kept /myquota configured is not stranded.
+            if result.active_quota is None:
+                result.error = "could not read stock from the reply"
+                await _save_last_result(result)
+                return result
+            if result.active_quota > cfg["quota_threshold"]:
+                result.ok = True
+                result.action = "skipped"
+                await _save_last_result(result)
+                return result
+            refill = due_files
+        else:
+            # Per-country decision: only refill the countries that are
+            # actually empty. A country with stock left does not need
+            # touching just because a sibling ran out.
+            refill = []
+            for entry in due_files:
+                country = entry.get("country") or entry["name"]
+                entry_cfg = await otp_schedule.effective_config(country, cfg)
+                have = _stock_for(stock, country)
+                if have is None:
+                    # Not listed at all means the bot is holding none of it.
+                    have = 0
+                if have <= int(entry_cfg.get("quota_threshold", 0)):
+                    refill.append(entry)
+
+            if not refill:
+                result.ok = True
+                result.action = "skipped - every due country still has stock"
+                await _save_last_result(result)
+                return result
+
+        # Clean up once, then re-add the countries that ran out - each with
+        # its OWN limit/count/tag/cleanup mode.
         await get_userbot().send_message(target, cfg["cleanup_command"])
         await _sleep(2)
 
         replies: list[str] = []
-        for entry in active_files:
-            reply = await _add_one_file(target, entry, cfg)
+        for entry in refill:
+            country = entry.get("country") or entry["name"]
+            entry_cfg = await otp_schedule.effective_config(country, cfg)
+            reply = await _add_one_file(target, entry, entry_cfg)
             result.files_processed.append(entry["name"])
             if reply:
-                replies.append(f"{entry['name']}: {reply}")
+                replies.append(f"{country}: {reply}")
+
+            # The file is spent when the bot had no stock AND the re-add
+            # contributed nothing new - every number in it is already known.
+            added = _parse_added_count(reply)
+            if added == 0:
+                result.exhausted.append({
+                    "country": country,
+                    "name": entry["name"],
+                    "had_stock": _stock_for(stock, country) or 0,
+                })
 
         result.add_reply = "\n".join(replies)
         result.ok = True
-        result.action = "added"
+        result.action = f"added ({len(refill)} countr{'y' if len(refill) == 1 else 'ies'})"
         await _save_last_result(result)
         return result
 

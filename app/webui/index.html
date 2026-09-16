@@ -874,6 +874,50 @@
             </div>
 
             <div class="panel-section">
+              <h3>Per country</h3>
+              <p class="small">
+                Each country runs on its own clock, because they drain at
+                different rates - one stock check (<code>/st</code>) reports
+                every country at once, and only the empty ones get refilled.
+                Blank fields fall back to the global settings below.
+              </p>
+              <div id="otpbot-schedule-list">Loading...</div>
+            </div>
+
+            <div class="panel-section">
+              <h3>Presets</h3>
+              <p class="small">
+                Save a set of settings once and apply it to any country.
+              </p>
+              <div id="otpbot-preset-list">Loading...</div>
+              <div class="row mt8">
+                <div>
+                  <label for="otpbot-preset-name">New preset name</label>
+                  <input type="text" id="otpbot-preset-name" placeholder="e.g. Night shift">
+                </div>
+                <div>
+                  <label for="otpbot-preset-interval">Every (min)</label>
+                  <input type="number" id="otpbot-preset-interval" min="1" value="10">
+                </div>
+                <div>
+                  <label for="otpbot-preset-limit">Limit</label>
+                  <input type="number" id="otpbot-preset-limit" min="1" value="4">
+                </div>
+                <div>
+                  <label for="otpbot-preset-count">Cooldown</label>
+                  <input type="number" id="otpbot-preset-count" min="1" value="4">
+                </div>
+              </div>
+              <div class="row mt8">
+                <label class="small" style="margin:0; display:flex; align-items:center; gap:6px;">
+                  <input type="checkbox" id="otpbot-preset-force">
+                  Wipe country first (/frcd)
+                </label>
+                <button type="button" id="otpbot-preset-save-btn">Save preset</button>
+              </div>
+            </div>
+
+            <div class="panel-section">
               <h3>Settings</h3>
               <div class="row" style="align-items:center;">
                 <label class="small" style="margin:0; display:flex; align-items:center; gap:6px;">
@@ -2180,6 +2224,18 @@
         renderOtpBotActive(data.active_files || []);
         renderOtpBotLastResult(data.last_result);
         renderOtpBotThreadState(data);
+        // Per-country schedule and presets come from their own endpoint so
+        // the main status call stays cheap.
+        apiFetchJson("/api/otpbot/schedule")
+          .then(function (sched) {
+            var presetNames = Object.keys(sched.presets || {}).sort();
+            renderOtpBotSchedule(sched.countries, presetNames);
+            renderOtpBotPresets(sched.presets);
+          })
+          .catch(function () {
+            qs("#otpbot-schedule-list").textContent = "Could not load the schedule.";
+            qs("#otpbot-preset-list").textContent = "Could not load presets.";
+          });
       })
       .catch(function () {
         qs("#otpbot-last-result").textContent = "Failed to load.";
@@ -2389,6 +2445,146 @@
       .catch(function () { showConfirm("Failed to clear the queue."); });
   }
 
+  function renderOtpBotSchedule(rows, presetNames) {
+    var el = qs("#otpbot-schedule-list");
+    el.textContent = "";
+    if (!rows || !rows.length) {
+      el.textContent = "No countries yet - send a numbers file to the OTP chat.";
+      return;
+    }
+    rows.forEach(function (row) {
+      var box = document.createElement("div");
+      box.className = "row";
+      box.style.alignItems = "center";
+      box.style.marginBottom = "6px";
+
+      var label = document.createElement("span");
+      label.style.flex = "1";
+      var when = row.due_in_seconds == null
+        ? "not scheduled"
+        : (row.due_in_seconds <= 0 ? "due now" : "in " + Math.max(1, Math.floor(row.due_in_seconds / 60)) + "m");
+      label.textContent = row.country + " - every " + row.interval_minutes + "m, next " + when
+        + (row.customised && row.customised.length ? " *" : "");
+      box.appendChild(label);
+
+      var every = document.createElement("input");
+      every.type = "number";
+      every.min = "1";
+      every.value = row.interval_minutes;
+      every.title = "Check this country every N minutes";
+      every.style.width = "70px";
+      box.appendChild(every);
+
+      var limit = document.createElement("input");
+      limit.type = "number";
+      limit.min = "1";
+      limit.value = row.limit;
+      limit.title = "Per-add limit for this country";
+      limit.style.width = "60px";
+      box.appendChild(limit);
+
+      var saveBtn = document.createElement("button");
+      saveBtn.type = "button";
+      saveBtn.textContent = "Save";
+      saveBtn.addEventListener("click", function () {
+        apiFetchJson("/api/otpbot/country/" + encodeURIComponent(row.country) + "/settings", {
+          method: "POST",
+          body: {
+            interval_minutes: parseInt(every.value, 10) || row.interval_minutes,
+            limit: parseInt(limit.value, 10) || row.limit
+          }
+        }).then(function () { showConfirm(row.country + " updated."); loadOtpBot(); })
+          .catch(function () { showConfirm("Failed to save " + row.country + "."); });
+      });
+      box.appendChild(saveBtn);
+
+      if (presetNames && presetNames.length) {
+        var sel = document.createElement("select");
+        var blank = document.createElement("option");
+        blank.value = "";
+        blank.textContent = "preset...";
+        sel.appendChild(blank);
+        presetNames.forEach(function (name) {
+          var opt = document.createElement("option");
+          opt.value = name;
+          opt.textContent = name;
+          sel.appendChild(opt);
+        });
+        sel.addEventListener("change", function () {
+          if (!sel.value) return;
+          apiFetchJson("/api/otpbot/country/" + encodeURIComponent(row.country) + "/preset", {
+            method: "POST", body: { name: sel.value }
+          }).then(function () { showConfirm(sel.value + " applied to " + row.country + "."); loadOtpBot(); })
+            .catch(function () { showConfirm("Failed to apply preset."); });
+        });
+        box.appendChild(sel);
+      }
+
+      el.appendChild(box);
+    });
+  }
+
+  function renderOtpBotPresets(presets) {
+    var el = qs("#otpbot-preset-list");
+    el.textContent = "";
+    var names = Object.keys(presets || {}).sort();
+    if (!names.length) {
+      el.textContent = "No presets.";
+      return;
+    }
+    names.forEach(function (name) {
+      var preset = presets[name];
+      var row = document.createElement("div");
+      row.className = "row";
+      row.style.alignItems = "center";
+      row.style.marginBottom = "4px";
+
+      var label = document.createElement("span");
+      label.style.flex = "1";
+      var bits = [];
+      if (preset.interval_minutes != null) bits.push("every " + preset.interval_minutes + "m");
+      if (preset.limit != null) bits.push("limit " + preset.limit);
+      if (preset.force_delete_before_add) bits.push("/frcd");
+      label.textContent = name + (bits.length ? " - " + bits.join(", ") : "");
+      if (preset._note) label.title = preset._note;
+      row.appendChild(label);
+
+      var del = document.createElement("button");
+      del.type = "button";
+      del.textContent = "Delete";
+      del.addEventListener("click", function () {
+        apiFetchJson("/api/otpbot/presets/" + encodeURIComponent(name), { method: "DELETE" })
+          .then(function () { showConfirm("Deleted " + name + "."); loadOtpBot(); })
+          .catch(function () {
+            // Built-ins are shadowed rather than stored, so they cannot be
+            // removed - only overwritten.
+            showConfirm("Built-in presets can be overwritten, not deleted.");
+          });
+      });
+      row.appendChild(del);
+
+      el.appendChild(row);
+    });
+  }
+
+  function handleOtpBotSavePreset() {
+    var name = qs("#otpbot-preset-name").value.trim();
+    if (!name) { showConfirm("Give the preset a name first."); return; }
+    apiFetchJson("/api/otpbot/presets/" + encodeURIComponent(name), {
+      method: "POST",
+      body: {
+        interval_minutes: parseInt(qs("#otpbot-preset-interval").value, 10) || 10,
+        limit: parseInt(qs("#otpbot-preset-limit").value, 10) || 4,
+        count: parseInt(qs("#otpbot-preset-count").value, 10) || 4,
+        force_delete_before_add: qs("#otpbot-preset-force").checked
+      }
+    }).then(function () {
+      showConfirm("Preset '" + name + "' saved.");
+      qs("#otpbot-preset-name").value = "";
+      loadOtpBot();
+    }).catch(function () { showConfirm("Failed to save the preset."); });
+  }
+
   function handleOtpBotStop() {
     var btn = qs("#otpbot-stop-btn");
     btn.disabled = true;
@@ -2520,6 +2716,7 @@
     qs("#otpbot-stop-btn").addEventListener("click", handleOtpBotStop);
     qs("#otpbot-open-thread-btn").addEventListener("click", handleOtpBotOpenThread);
     qs("#otpbot-clear-queue-btn").addEventListener("click", handleOtpBotClearQueue);
+    qs("#otpbot-preset-save-btn").addEventListener("click", handleOtpBotSavePreset);
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
   }

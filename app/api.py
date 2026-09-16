@@ -183,6 +183,26 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
 
 
+class OtpCountryRequest(BaseModel):
+    """Per-country overrides. Every field is optional: omit to leave alone,
+    send null to clear the override and fall back to the global config.
+    """
+
+    interval_minutes: int | None = Field(default=None, ge=1, le=1440)
+    quota_threshold: int | None = Field(default=None, ge=0)
+    limit: int | None = Field(default=None, ge=1, le=10000)
+    count: int | None = Field(default=None, ge=1, le=10000)
+    tag: str | None = Field(default=None, max_length=60)
+    force_delete_before_add: bool | None = None
+    note: str | None = Field(default=None, max_length=200, alias="_note")
+
+    model_config = {"populate_by_name": True}
+
+
+class OtpPresetApplyRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+
+
 class OtpBotConfigRequest(BaseModel):
     enabled: bool | None = None
     target_bot: str | None = None
@@ -908,6 +928,107 @@ def create_app() -> FastAPI:
         if removed is None:
             raise HTTPException(status_code=404, detail="active file not found")
         return {"removed": True, "entry": removed}
+
+    @app.get("/api/otpbot/countries", dependencies=[Depends(require_api_access)])
+    async def otpbot_countries() -> dict[str, Any]:
+        """The country list as reported by the target bot itself."""
+        from app.automation import otp_bot
+
+        known = await otp_bot.get_known_countries()
+        names = known.get("names", {})
+        return {
+            "countries": sorted(
+                (
+                    {"name": v["name"], "last_stock": v.get("last_stock"), "seen_at": v.get("seen_at")}
+                    for v in names.values()
+                ),
+                key=lambda row: row["name"],
+            ),
+            "updated_at": known.get("updated_at"),
+        }
+
+    @app.post("/api/otpbot/countries/refresh", dependencies=[Depends(require_api_access)])
+    async def otpbot_refresh_countries() -> dict[str, Any]:
+        """Ask the bot for its live stock and relearn the country list."""
+        from app.automation import otp_bot
+
+        return await otp_bot.refresh_countries_from_bot()
+
+    @app.get("/api/otpbot/schedule", dependencies=[Depends(require_api_access)])
+    async def otpbot_schedule() -> dict[str, Any]:
+        """Per-country settings and next-run times for everything in play."""
+        from app.automation import otp_bot, otp_schedule
+
+        cfg = await otp_bot.get_config()
+        queue = await otp_bot.get_queue()
+        active = await otp_bot.get_active_files()
+        countries = [e.get("country") or e["name"] for e in queue + active]
+        return {
+            "countries": await otp_schedule.schedule_overview(countries, cfg),
+            "presets": await otp_schedule.get_presets(),
+            "overridable": list(otp_schedule.OVERRIDABLE),
+        }
+
+    @app.post("/api/otpbot/country/{country}/settings", dependencies=[Depends(require_api_access)])
+    async def otpbot_set_country(country: str, payload: OtpCountryRequest) -> dict[str, Any]:
+        """Override any subset of settings for one country.
+
+        Fields left out are untouched; fields sent as null fall back to the
+        global config, so a country can be reset without deleting it.
+        """
+        from app.automation import otp_bot, otp_schedule
+
+        values = payload.model_dump(exclude_unset=True)
+        applied = await otp_schedule.set_country_settings(country, values)
+        if "interval_minutes" in values and values["interval_minutes"]:
+            await otp_schedule.arm_country(country, int(values["interval_minutes"]))
+        cfg = await otp_bot.get_config()
+        return {
+            "country": country,
+            "settings": applied,
+            "effective": await otp_schedule.effective_config(country, cfg),
+        }
+
+    @app.post("/api/otpbot/country/{country}/preset", dependencies=[Depends(require_api_access)])
+    async def otpbot_apply_preset(country: str, payload: OtpPresetApplyRequest) -> dict[str, Any]:
+        from app.automation import otp_bot, otp_schedule
+
+        applied = await otp_schedule.apply_preset(payload.name, country)
+        if applied is None:
+            raise HTTPException(status_code=404, detail="preset not found")
+        cfg = await otp_bot.get_config()
+        return {
+            "country": country,
+            "preset": payload.name,
+            "effective": await otp_schedule.effective_config(country, cfg),
+        }
+
+    @app.get("/api/otpbot/presets", dependencies=[Depends(require_api_access)])
+    async def otpbot_presets() -> dict[str, Any]:
+        from app.automation import otp_schedule
+
+        return {"presets": await otp_schedule.get_presets()}
+
+    @app.post("/api/otpbot/presets/{name}", dependencies=[Depends(require_api_access)])
+    async def otpbot_save_preset(name: str, payload: OtpCountryRequest) -> dict[str, Any]:
+        from app.automation import otp_schedule
+
+        try:
+            saved = await otp_schedule.save_preset(name, payload.model_dump(exclude_unset=True))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"name": name, "preset": saved}
+
+    @app.delete("/api/otpbot/presets/{name}", dependencies=[Depends(require_api_access)])
+    async def otpbot_delete_preset(name: str) -> dict[str, Any]:
+        from app.automation import otp_schedule
+
+        if not await otp_schedule.delete_preset(name):
+            raise HTTPException(
+                status_code=404,
+                detail="preset not found (built-in presets can be overwritten, not deleted)",
+            )
+        return {"deleted": True, "name": name}
 
     @app.delete("/api/otpbot/country/{country}", dependencies=[Depends(require_api_access)])
     async def otpbot_remove_country(country: str) -> dict[str, Any]:

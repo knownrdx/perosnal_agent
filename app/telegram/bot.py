@@ -609,7 +609,7 @@ class AgentBot:
                     await query.answer("Not authorized.", show_alert=True)
                 return
 
-            from app.automation import otp_bot
+            from app.automation import otp_bot, otp_schedule
 
             # "otp:<action>:<rest>" - rest may itself contain ':' (service
             # names are user-visible text), so split at most twice.
@@ -698,6 +698,127 @@ class AgentBot:
                             bool(cfg.get("force_delete_before_add"))
                         ),
                     )
+                return
+
+            if action == "refreshc":
+                await query.answer("Asking the bot...")
+                outcome = await otp_bot.refresh_countries_from_bot()
+                if not outcome["ok"]:
+                    await refresh_panel(f"\u274C {outcome['error']}")
+                    return
+                names = ", ".join(outcome["countries"]) or "(kichu nai)"
+                note = f"\U0001F30D Bot theke country list update kora holo: {names}"
+                if outcome.get("new"):
+                    note += f"\nNotun: {', '.join(outcome['new'])}"
+                await refresh_panel(note)
+                return
+
+            if action == "ask_country":
+                # Per-country settings: pick the country, then the interval.
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                markup = otp_panel.country_keyboard(entries, "pickc")
+                await query.answer()
+                if markup is None:
+                    with contextlib.suppress(Exception):
+                        await query.message.answer("Kono country nai - age file dao.")
+                    return
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        "\U0001F30D Kon country-r setting bodlabo?", reply_markup=markup
+                    )
+                return
+
+            if action == "pickc":
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                index = int(rest)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                country = names[index]
+                cfg = await otp_bot.get_config()
+                current = await otp_schedule.effective_config(country, cfg)
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        f"\u23F1 {country}: koto min por por check korbo?",
+                        reply_markup=otp_panel.country_interval_keyboard(
+                            index, current.get("interval_minutes")
+                        ),
+                    )
+                return
+
+            if action == "cint":
+                index_raw, minutes_raw = rest.split(":", 1)
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                index = int(index_raw)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                country = names[index]
+                minutes = int(minutes_raw)
+                await otp_schedule.set_country_settings(
+                    country, {"interval_minutes": minutes}
+                )
+                await otp_schedule.arm_country(country, minutes)
+                await query.answer(f"{country}: every {minutes} min")
+                await refresh_panel(f"\u23F1 {country} ekhon {minutes} min por por check hobe.")
+                return
+
+            if action == "ask_preset":
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                markup = otp_panel.country_keyboard(entries, "prec")
+                await query.answer()
+                if markup is None:
+                    with contextlib.suppress(Exception):
+                        await query.message.answer("Kono country nai - age file dao.")
+                    return
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        "\U0001F4D0 Kon country-te preset apply korbo?", reply_markup=markup
+                    )
+                return
+
+            if action == "prec":
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                index = int(rest)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                presets = await otp_schedule.get_presets()
+                preset_names = sorted(presets)
+                await query.answer()
+                lines = [f"\U0001F4D0 {names[index]} - kon preset?", ""]
+                for name in preset_names:
+                    note = presets[name].get("_note", "")
+                    every = presets[name].get("interval_minutes")
+                    lines.append(f"\u2022 {name} ({every}m) - {note}" if note else f"\u2022 {name} ({every}m)")
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        "\n".join(lines),
+                        reply_markup=otp_panel.preset_keyboard(preset_names, index),
+                    )
+                return
+
+            if action == "usepre":
+                index_raw, preset_raw = rest.split(":", 1)
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                index = int(index_raw)
+                preset_names = sorted(await otp_schedule.get_presets())
+                preset_index = int(preset_raw)
+                if index >= len(names) or preset_index >= len(preset_names):
+                    await query.answer("Gone already.", show_alert=True)
+                    return
+                country, preset = names[index], preset_names[preset_index]
+                applied = await otp_schedule.apply_preset(preset, country)
+                if applied is None:
+                    await query.answer("Preset not found.", show_alert=True)
+                    return
+                await query.answer(f"{preset} applied")
+                await refresh_panel(f"\U0001F4D0 {country} -> '{preset}' preset apply kora holo.")
                 return
 
             if action == "start":

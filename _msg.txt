@@ -1,52 +1,64 @@
-Telegram buttons for the OTP panel; removals; web UI auto-refresh
+Per-country scheduling, /st stock reads, presets, stock-empty alerts
 
-Three gaps the owner hit in a row, all the same shape: the automation knew
-things the owner had no way to change without typing exact phrases.
+Running several countries at once exposed that the automation treated the
+active set as one batch on one clock. Bangladesh can drain in minutes while
+a Central African Republic batch lasts hours; one shared interval either
+hammers the bot for nothing or starves the fast country.
 
-Removing work that should not run
-  Files could only be dropped from the web queue list. There was no way to
-  drop one from Telegram at all, and no way to drop an ALREADY-STARTED file
-  from anywhere - the only lever was "stop", which halts everything.
+Read stock with /st instead of /myquota
+  /myquota returns a single "Active : 96336" total, which cannot tell you
+  WHICH country ran out. /st (alias of /stats) reports every country in one
+  reply:
 
-  - remove_active_file() takes one file out of future refill cycles. It does
-    not un-add numbers the target bot already holds; emptying the active set
-    also flips enabled off, since nothing remains to monitor.
-  - remove_by_country() drops queued and active entries together. Country is
-    the unit the owner thinks in ("Bangladesh bad dao"), and after splitting
-    one country can span several entries from different uploads, so matching
-    by country avoids leaving stragglers.
-  - clear_queue() empties what has not started, deliberately leaving running
-    work alone.
-  - Chat triggers: "<country> bad dao" / "remove <country>", "skip" at the
-    tag prompt, "sob bad dao". country_to_remove() returns None for ordinary
-    sentences, so mentioning a country never deletes it.
-  - DELETE /api/otpbot/queue, /active/{id}, /country/{name}.
+      Country Stock (yours):
+        Central African Republic: 90712 (+416 taken)
+        Bangladesh: 0
 
-  Removing an entry now also clears a tag prompt pointing at it. A dangling
-  prompt wedges the conversation: every later message is read as a tag answer
-  for an entry that no longer resolves.
+  So one round-trip now answers for any number of countries, and only the
+  empty ones get refilled - previously an empty total re-added everything.
 
-Buttons instead of remembered phrases
-  New app/telegram/otp_panel.py: service picker (6 common services + "bad
-  dao"), interval picker, cleanup-mode picker, and a control panel with
-  start/stop, check-now, clear-queue and status. Callback data is
-  "otp:<action>:<arg>"; a test asserts every payload fits Telegram's 64-byte
-  limit, which is enforced at send time and otherwise only shows up as a
-  button that silently does nothing.
+  The parser only reads lines under the country header: the block above it
+  has a global "Available: 416036" that would otherwise be mistaken for a
+  country and mask an empty one behind a healthy-looking total. Add-notices
+  ("Bangladesh: 0 added") contain the same shape and are rejected too.
+  A /myquota-style reply still works, so an owner who kept it configured is
+  not stranded.
 
-  Handlers re-read state instead of trusting the keyboard they came from -
-  the owner can tap a button on an hour-old message.
+Per-country timers and settings (app/automation/otp_schedule.py)
+  Each country gets its own interval, threshold, limit, count, service and
+  cleanup mode - all optional, falling back to the global config, so a
+  country nobody touched behaves exactly as before. Due times are persisted,
+  so a redeploy does not reset every country to "due now" and stampede the
+  bot. The scheduler now polls at the SHORTEST country interval; polling on
+  the global one would silently cap a 5-minute country at 30 minutes, which
+  is the bug this exists to fix.
 
-  set_cleanup_mode() exposes "tidy up" vs "wipe country first" as one choice
-  because the flags underneath must move together; letting them drift gives
-  you force-delete "enabled" but inert. Choosing wipe without a configured
-  uid now says so rather than silently falling back.
+The country list comes from the bot, not from our prefix table
+  The phone-prefix table is only a guess used to split an upload. Every
+  per-country command (/frcd, /setlimit) and the stock report key on the
+  bot's own spelling, so a name we invented would never match. Countries are
+  now learned from each /st reply and uploads adopt that spelling; matching
+  ignores punctuation so "Central African Rep." and "...Republic" are one
+  country, not two. A "Refresh countries" button populates the list on
+  demand. Unknown countries still work - they just get corrected the first
+  time the bot reports them.
 
-Web UI auto-refresh
-  The OTP panel changes on its own - the scheduler refills on a timer, and
-  Telegram buttons write the same state - so an open tab went stale and
-  misled. Polls every 10s while that panel is visible, pausing when the tab
-  is hidden. Quiet mode skips the "Loading..." flash and holds off entirely
-  while an input in the panel has focus, so a refresh never eats typing.
+Stock-empty alerts
+  A file is spent when the bot holds no stock AND the re-add contributes
+  nothing ("0 added (20000 dup)") - a successful command that changed
+  nothing. Without reading that count, a dead file would cycle forever and
+  the owner would never learn. They now get told which country ran dry and
+  that a new file is needed, deduped per country so a dead file does not
+  re-alert every cycle (which just trains people to ignore alerts) while a
+  different country running dry still gets through.
 
-626 passing.
+Presets
+  Four built-ins (fast burn / steady / slow / replace stock) plus the
+  owner's own, appliable per country from either UI. Built-ins can be
+  overwritten but not deleted, so a wrong default is correctable.
+
+Both UIs: Telegram gets per-country, preset and refresh buttons; the web
+panel gets a per-country schedule table with inline interval/limit editing
+and a preset manager.
+
+668 passing, smoke 10/10.

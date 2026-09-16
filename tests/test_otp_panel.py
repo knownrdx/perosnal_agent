@@ -108,15 +108,51 @@ def test_removal_keyboard_is_none_when_there_is_nothing_to_remove():
 @asyncio_test
 async def test_status_text_reports_the_settings_the_buttons_change(environment):
     await _queue_one(environment)
-    await otp_bot.save_config({"interval_minutes": 30})
     text = await otp_panel.status_text()
 
-    assert "30 min" in text
+    # Intervals are per-country now and shown against RUNNING countries, so
+    # the global header carries what is still global.
+    assert "/st" in text
     assert "Bangladesh" in text
     assert "used/expired only" in text
 
     await otp_bot.set_cleanup_mode("force")
     assert "/frcd" in await otp_panel.status_text()
+
+
+@asyncio_test
+async def test_status_text_shows_each_running_country_on_its_own_schedule(environment):
+    """The whole point of per-country timers is being able to SEE them."""
+    from app.automation import otp_schedule
+    from app.integrations.telegram_user import set_userbot
+
+    entry = await _queue_one(environment)
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+
+    class _Bot:
+        def __init__(self) -> None:
+            self._id = 100
+
+        async def send_message(self, *a, **k):
+            self._id += 1
+            return {"message_id": self._id}
+
+        async def send_file(self, *a, **k):
+            self._id += 1
+            return {"message_id": self._id}
+
+        async def read_messages(self, *a, **k):
+            self._id += 1
+            return [{"id": self._id, "text": "Added.", "out": False}]
+
+    set_userbot(_Bot())
+    await otp_bot.start_automation()
+    await otp_schedule.set_country_settings("Bangladesh", {"interval_minutes": 5})
+
+    text = await otp_panel.status_text()
+    assert "Bangladesh" in text
+    assert "every 5m" in text
+    assert "*" in text  # marked as customised
 
 
 @asyncio_test

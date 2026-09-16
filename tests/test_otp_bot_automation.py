@@ -6,6 +6,7 @@ test_tools.py does for other userbot-backed tools.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -318,6 +319,366 @@ async def test_force_delete_runs_per_country_before_the_add(environment):
     # It must happen BEFORE the add command for that file.
     add_index = next(i for i, t in enumerate(sent) if t.startswith("/fan"))
     assert sent.index(frcd[0]) < add_index
+
+
+# --------------------------------------------------------------------------- #
+# /st: one command, every country's live stock
+# --------------------------------------------------------------------------- #
+REAL_ST_REPLY = (
+    "\U0001F4CA Bot Statistics\n"
+    "\n"
+    "\u23F1\uFE0F Uptime: 38m 36s\n"
+    "\U0001F465 Users: 43024\n"
+    "\U0001F4F1 Numbers:\n"
+    "  \u2022 Available: 416036\n"
+    "  \u2022 Taken: 1076\n"
+    "  \u2022 Used: 11221\n"
+    "\U0001F4E8 OTPs (24h): 24411\n"
+    "\n"
+    "\U0001F30D Country Stock (yours):\n"
+    "  \U0001F1E8\U0001F1EB Central African Republic: 90712 (+416 taken)\n"
+    "  \U0001F1E7\U0001F1E9 Bangladesh: 0\n"
+)
+
+
+def test_stock_parser_reads_the_real_st_reply():
+    stock = otp_bot._parse_country_stock(REAL_ST_REPLY)
+    assert stock == {"Central African Republic": 90712, "Bangladesh": 0}
+
+
+def test_stock_parser_ignores_the_global_numbers_block():
+    """"Available: 416036" sits above the country header and is a total, not
+    a country - reading it as one would mask an empty country behind a
+    healthy-looking global figure.
+    """
+    stock = otp_bot._parse_country_stock(REAL_ST_REPLY)
+    assert "Available" not in stock
+    assert "Taken" not in stock
+    assert "Users" not in stock
+
+
+def test_stock_parser_rejects_lookalike_messages():
+    """The bot posts add-notices that also contain "Country: number".
+    Accepting one as a stock report would act on a stale number.
+    """
+    assert otp_bot._parse_country_stock(
+        "\u26A1 Fast Add Complete!\n\n\U0001F1E8\U0001F1EB Central African Republic: 100000 added"
+    ) == {}
+    assert otp_bot._parse_country_stock("\U0001F4CA Your quota\n\nActive : 96336") == {}
+    assert otp_bot._parse_country_stock("") == {}
+
+
+def test_stock_lookup_tolerates_name_differences():
+    stock = {"Central African Republic": 5}
+    assert otp_bot._stock_for(stock, "central african republic") == 5
+    assert otp_bot._stock_for(stock, "  Central African Republic ") == 5
+    assert otp_bot._stock_for(stock, "Bangladesh") is None
+
+
+async def test_cycle_refills_only_the_empty_country(environment):
+    """The whole point of /st: one check, and only the country that actually
+    ran out gets re-added. Previously any empty quota re-added everything.
+    """
+    rel_caf = await _write_numbers_file("caf.txt", prefix="+236")
+    rel_bd = await _write_numbers_file("bd.txt", prefix="+880")
+    for rel, name in ((rel_caf, "caf.txt"), (rel_bd, "bd.txt")):
+        entry = (await otp_bot.enqueue_file(rel, name))["entries"][0]
+        await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    await otp_bot.start_automation()
+    await _make_everything_due()
+
+    # CAR still has stock; Bangladesh is at zero.
+    fake = FakeUserbot([
+        {"text": REAL_ST_REPLY, "out": False},
+        {"text": "\u2705 Added 5 numbers.", "out": False},
+    ])
+    set_userbot(fake)
+
+    result = await otp_bot.run_cycle(await otp_bot.get_config())
+
+    assert result.ok is True
+    assert result.country_stock["Central African Republic"] == 90712
+    assert result.country_stock["Bangladesh"] == 0
+    # Only the empty one was touched.
+    assert result.files_processed == ["bd.txt"]
+
+
+async def test_cycle_skips_when_every_country_still_has_stock(environment):
+    rel = await _write_numbers_file("caf.txt", prefix="+236")
+    entry = (await otp_bot.enqueue_file(rel, "caf.txt"))["entries"][0]
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    await otp_bot.start_automation()
+    await _make_everything_due()
+
+    set_userbot(FakeUserbot([{"text": REAL_ST_REPLY, "out": False}]))
+    result = await otp_bot.run_cycle(await otp_bot.get_config())
+
+    assert result.ok is True
+    assert "skipped" in result.action
+    assert result.files_processed == []
+
+
+async def test_a_country_missing_from_the_stock_list_counts_as_empty(environment):
+    """Absence means the bot holds none of it - that is exactly when a
+    refill is needed, so it must not be read as "unknown, leave it alone".
+    """
+    rel = await _write_numbers_file("ng.txt", prefix="+234")
+    entry = (await otp_bot.enqueue_file(rel, "ng.txt"))["entries"][0]
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    await otp_bot.start_automation()
+    await _make_everything_due()
+
+    # Nigeria is not in the reply at all.
+    fake = FakeUserbot([
+        {"text": REAL_ST_REPLY, "out": False},
+        {"text": "\u2705 Added 5 numbers.", "out": False},
+    ])
+    set_userbot(fake)
+    result = await otp_bot.run_cycle(await otp_bot.get_config())
+
+    assert result.ok is True
+    assert result.files_processed == ["ng.txt"]
+
+
+async def test_myquota_style_reply_still_works(environment):
+    """An owner who kept /myquota configured must not be stranded by the
+    switch to /st.
+    """
+    await _start_with_one_active_file()
+    fake = FakeUserbot([
+        {"text": "\U0001F4CA Your quota\n\nActive : 0", "out": False},
+        {"text": "\u2705 Added 2 numbers.", "out": False},
+    ])
+    set_userbot(fake)
+    result = await otp_bot.run_cycle(await otp_bot.save_config({"quota_command": "/myquota"}))
+
+    assert result.ok is True
+    assert result.action.startswith("added")
+    assert result.active_quota == 0
+
+
+def test_added_count_parser_distinguishes_worked_from_contributed():
+    """"0 added (20000 dup)" is a SUCCESSFUL command that changed nothing.
+    Treating it as success without reading the count is what would leave a
+    dead file cycling forever.
+    """
+    assert otp_bot._parse_added_count("\u2705 53412 added, 46588 duplicates skipped") == 53412
+    assert otp_bot._parse_added_count("Central African Republic: 0 added (20000 dup)") == 0
+    assert otp_bot._parse_added_count("\u2705 1,204 added") == 1204
+    assert otp_bot._parse_added_count("Added successfully") is None
+    assert otp_bot._parse_added_count("") is None
+
+
+async def test_cycle_flags_a_country_whose_file_is_spent(environment):
+    """Stock empty AND nothing new added = the owner must send a new file."""
+    rel = await _write_numbers_file("bd.txt", prefix="+880")
+    entry = (await otp_bot.enqueue_file(rel, "bd.txt"))["entries"][0]
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    await otp_bot.start_automation()
+    await _make_everything_due()
+
+    fake = FakeUserbot([
+        {"text": REAL_ST_REPLY, "out": False},           # Bangladesh: 0
+        {"text": "\u26A1 Fast Add Complete!\n\nBangladesh: 0 added (5 dup)", "out": False},
+    ])
+    set_userbot(fake)
+    result = await otp_bot.run_cycle(await otp_bot.get_config())
+
+    assert result.ok is True
+    assert len(result.exhausted) == 1
+    assert result.exhausted[0]["country"] == "Bangladesh"
+    assert result.exhausted[0]["name"] == "bd.txt"
+
+
+async def test_a_file_with_numbers_left_is_not_flagged_as_spent(environment):
+    rel = await _write_numbers_file("bd.txt", prefix="+880")
+    entry = (await otp_bot.enqueue_file(rel, "bd.txt"))["entries"][0]
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    await otp_bot.start_automation()
+    await _make_everything_due()
+
+    fake = FakeUserbot([
+        {"text": REAL_ST_REPLY, "out": False},
+        {"text": "\u2705 4821 added, 12 duplicates skipped", "out": False},
+    ])
+    set_userbot(fake)
+    result = await otp_bot.run_cycle(await otp_bot.get_config())
+
+    assert result.ok is True
+    assert result.exhausted == []
+
+
+# --------------------------------------------------------------------------- #
+# The owner-facing alert: a country whose stock is gone needs a new file, and
+# nothing the automation can do will fix it by itself.
+# --------------------------------------------------------------------------- #
+class _CapturingNotifier:
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    async def send(self, chat_id: int, text: str, *, dedupe_key: str | None = None) -> dict:
+        self.sent.append({"chat_id": chat_id, "text": text, "dedupe_key": dedupe_key})
+        return {"sent": True}
+
+
+async def _run_scheduler_once(notifier: _CapturingNotifier) -> None:
+    """Drive one OTP pass through the real scheduler method."""
+    from datetime import timedelta as _td
+
+    from app.workers.scheduler_worker import SchedulerRunner
+
+    runner = SchedulerRunner(notifier=notifier)
+    # First call only arms the timer by design, so pre-arm it into the past.
+    runner._next_otp_check = datetime.now(timezone.utc) - _td(minutes=1)
+    await runner.maybe_run_otp_automation()
+
+
+async def test_owner_is_told_which_country_ran_out_and_what_to_do(environment):
+    rel = await _write_numbers_file("bd.txt", prefix="+880")
+    entry = (await otp_bot.enqueue_file(rel, "bd.txt"))["entries"][0]
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    await otp_bot.start_automation()
+    await _make_everything_due()
+
+    set_userbot(FakeUserbot([
+        {"text": REAL_ST_REPLY, "out": False},
+        {"text": "\u26A1 Fast Add Complete!\n\nBangladesh: 0 added (5 dup)", "out": False},
+    ]))
+
+    notifier = _CapturingNotifier()
+    await _run_scheduler_once(notifier)
+
+    assert notifier.sent, "the owner must be told - they are the only one who can fix it"
+    message = notifier.sent[-1]["text"]
+    assert "Bangladesh" in message
+    assert "shesh" in message            # says the stock is gone
+    assert "file" in message.lower()     # says a new file is what is needed
+
+
+async def test_the_same_dead_country_does_not_re_alert_every_cycle(environment):
+    """Re-alerting on a timer trains the owner to ignore the alert, which is
+    worse than not sending it. Keyed on the country, so a DIFFERENT country
+    running dry still gets through.
+    """
+    rel = await _write_numbers_file("bd.txt", prefix="+880")
+    entry = (await otp_bot.enqueue_file(rel, "bd.txt"))["entries"][0]
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    await otp_bot.start_automation()
+
+    notifier = _CapturingNotifier()
+    for _ in range(2):
+        await _make_everything_due()
+        set_userbot(FakeUserbot([
+            {"text": REAL_ST_REPLY, "out": False},
+            {"text": "\u26A1 Fast Add Complete!\n\nBangladesh: 0 added (5 dup)", "out": False},
+        ]))
+        await _run_scheduler_once(notifier)
+
+    keys = [n["dedupe_key"] for n in notifier.sent]
+    # Same key both times, so the notifier's own dedupe suppresses the repeat.
+    assert len(set(keys)) == 1
+    assert "Bangladesh" in keys[0]
+
+
+async def test_a_healthy_refill_does_not_raise_the_stock_alarm(environment):
+    rel = await _write_numbers_file("bd.txt", prefix="+880")
+    entry = (await otp_bot.enqueue_file(rel, "bd.txt"))["entries"][0]
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    await otp_bot.start_automation()
+    await _make_everything_due()
+
+    set_userbot(FakeUserbot([
+        {"text": REAL_ST_REPLY, "out": False},
+        {"text": "\u2705 4821 added, 12 duplicates skipped", "out": False},
+    ]))
+
+    notifier = _CapturingNotifier()
+    await _run_scheduler_once(notifier)
+
+    joined = " ".join(n["text"] for n in notifier.sent)
+    assert "stock shesh" not in joined
+
+
+# --------------------------------------------------------------------------- #
+# The country list comes from the BOT, not from our prefix table
+# --------------------------------------------------------------------------- #
+async def test_countries_are_learned_from_the_bots_own_reply(environment):
+    new = await otp_bot.learn_countries({"Central African Republic": 90712, "Bangladesh": 0})
+    assert sorted(new) == ["Bangladesh", "Central African Republic"]
+
+    known = (await otp_bot.get_known_countries())["names"]
+    assert known["bangladesh"]["name"] == "Bangladesh"
+    assert known["bangladesh"]["last_stock"] == 0
+
+
+async def test_only_genuinely_new_countries_are_reported_as_new(environment):
+    await otp_bot.learn_countries({"Bangladesh": 5})
+    new = await otp_bot.learn_countries({"Bangladesh": 3, "Nigeria": 7})
+    assert new == ["Nigeria"]
+
+
+async def test_our_guessed_name_is_replaced_by_the_bots_spelling(environment):
+    """Our prefix table is a guess; /frcd and /setlimit key on the bot's own
+    name, so a mismatch would silently never match its stock line.
+    """
+    await otp_bot.learn_countries({"Congo (DRC)": 12})
+
+    assert await otp_bot.canonical_country("Congo") == "Congo (DRC)"
+    assert await otp_bot.canonical_country("congo (drc)") == "Congo (DRC)"
+
+
+async def test_an_unknown_country_keeps_our_guess(environment):
+    """A brand-new country still has to work - it just gets corrected the
+    first time the bot reports it.
+    """
+    assert await otp_bot.canonical_country("Bangladesh") == "Bangladesh"
+
+
+async def test_uploads_adopt_the_bots_country_name(environment):
+    await otp_bot.learn_countries({"Central African Rep.": 5})
+
+    rel = await _write_numbers_file("caf.txt", prefix="+236")
+    analysis = await otp_bot.enqueue_file(rel, "caf.txt")
+
+    # Our table says "Central African Republic"; the bot says otherwise.
+    assert analysis["entries"][0]["country"] == "Central African Rep."
+
+
+async def test_a_cycle_learns_the_country_list(environment):
+    await _start_with_one_active_file()
+    set_userbot(FakeUserbot([{"text": REAL_ST_REPLY, "out": False}]))
+    result = await otp_bot.run_cycle(await otp_bot.get_config())
+
+    known = (await otp_bot.get_known_countries())["names"]
+    assert "central african republic" in known
+    assert "bangladesh" in known
+    assert sorted(result.new_countries) == ["Bangladesh", "Central African Republic"]
+
+
+async def test_refresh_reports_the_bots_countries(environment):
+    set_userbot(FakeUserbot([{"text": REAL_ST_REPLY, "out": False}]))
+    outcome = await otp_bot.refresh_countries_from_bot()
+
+    assert outcome["ok"] is True
+    assert outcome["countries"]["Central African Republic"] == 90712
+    assert "Bangladesh" in outcome["new"]
+
+
+async def test_refresh_fails_cleanly_when_the_bot_says_nothing_useful(environment):
+    set_userbot(FakeUserbot([{"text": "\u26A1 Fast Add Complete!", "out": False}]))
+    outcome = await otp_bot.refresh_countries_from_bot()
+
+    assert outcome["ok"] is False
+    assert outcome["countries"] == {}
 
 
 # --------------------------------------------------------------------------- #
@@ -801,7 +1162,20 @@ async def _start_with_one_active_file() -> FakeUserbot:
     fake = FakeUserbot([{"text": "Added.", "out": False}])
     set_userbot(fake)
     await otp_bot.start_automation()
+    # start_automation arms each country's own timer, so a cycle run
+    # immediately afterwards would correctly report "not due yet". These
+    # tests are about what a cycle DOES when it fires, so make it due.
+    await _make_everything_due()
     return fake
+
+
+async def _make_everything_due() -> None:
+    """Backdate every country's next-check time so the next cycle fires."""
+    from app.automation import otp_schedule
+
+    due = await otp_schedule._get_due_map()
+    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    await otp_schedule._save_due_map({key: past for key in due})
 
 
 async def test_cycle_skips_when_quota_healthy(environment):
@@ -829,7 +1203,7 @@ async def test_cycle_refills_when_quota_exhausted(environment):
     result = await otp_bot.run_cycle(config)
 
     assert result.ok is True
-    assert result.action == "added"
+    assert result.action.startswith("added")
     assert result.active_quota == 0
     assert "Added 2 numbers" in result.add_reply
     assert result.files_processed == ["numbers_BD.txt"]

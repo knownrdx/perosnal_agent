@@ -80,10 +80,73 @@ def control_keyboard(enabled: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="\U0001F9F9 Cleanup", callback_data=f"{PREFIX}:ask_clean:"),
         ],
         [
+            InlineKeyboardButton(text="\U0001F30D Per country", callback_data=f"{PREFIX}:ask_country:"),
+            InlineKeyboardButton(text="\U0001F4D0 Presets", callback_data=f"{PREFIX}:ask_preset:"),
+        ],
+        [
+            InlineKeyboardButton(
+                text="\U0001F30E Refresh countries", callback_data=f"{PREFIX}:refreshc:"
+            ),
+        ],
+        [
             InlineKeyboardButton(text="\U0001F4CB Status", callback_data=f"{PREFIX}:status:"),
             InlineKeyboardButton(text="\U0001F5D1 Clear queue", callback_data=f"{PREFIX}:clearq:"),
         ],
     ])
+
+
+def country_keyboard(entries: list[dict[str, Any]], action: str) -> InlineKeyboardMarkup | None:
+    """One button per country, carrying a short index rather than the name.
+
+    Country names are unbounded and often non-ASCII, and callback_data is
+    capped at 64 bytes, so the index is resolved back to a name by the
+    handler against the same ordering.
+    """
+    seen: list[str] = []
+    for entry in entries:
+        country = entry.get("country")
+        if country and country not in seen:
+            seen.append(country)
+    if not seen:
+        return None
+    buttons = [
+        InlineKeyboardButton(text=country, callback_data=f"{PREFIX}:{action}:{index}")
+        for index, country in enumerate(seen)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=_rows(buttons, per_row=2))
+
+
+def country_names(entries: list[dict[str, Any]]) -> list[str]:
+    """The ordering country_keyboard indexes into - kept in one place so the
+    buttons and the handler cannot disagree.
+    """
+    seen: list[str] = []
+    for entry in entries:
+        country = entry.get("country")
+        if country and country not in seen:
+            seen.append(country)
+    return seen
+
+
+def preset_keyboard(names: list[str], country_index: int) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(
+            text=name, callback_data=f"{PREFIX}:usepre:{country_index}:{index}"
+        )
+        for index, name in enumerate(names)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=_rows(buttons, per_row=2))
+
+
+def country_interval_keyboard(country_index: int, current: int | None) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(
+            text=(f"\u2705 {m} min" if m == current else f"{m} min"),
+            callback_data=f"{PREFIX}:cint:{country_index}:{m}",
+        )
+        for m in otp_bot.INTERVAL_CHOICES
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=_rows(buttons, per_row=3))
 
 
 def removal_keyboard(entries: list[dict[str, Any]]) -> InlineKeyboardMarkup | None:
@@ -109,6 +172,8 @@ def removal_keyboard(entries: list[dict[str, Any]]) -> InlineKeyboardMarkup | No
 
 async def status_text() -> str:
     """One compact summary of everything the panel can change."""
+    from app.automation import otp_schedule
+
     config = await otp_bot.get_config()
     queue = await otp_bot.get_queue()
     active = await otp_bot.get_active_files()
@@ -119,17 +184,33 @@ async def status_text() -> str:
         "",
         f"Running: {'yes' if config['enabled'] else 'no'}",
         f"Target: {config['target_bot']}",
-        f"Checks every: {config['interval_minutes']} min",
-        f"Refill when active \u2264 {config['quota_threshold']}",
+        f"Stock check: {config['quota_command']}",
         f"Cleanup: {'wipe country first (/frcd)' if config.get('force_delete_before_add') else 'used/expired only'}",
     ]
 
     if active:
+        # Per-country, because that is now the unit of scheduling: each has
+        # its own interval and its own next-run time.
+        overview = {
+            row["country"]: row
+            for row in await otp_schedule.schedule_overview(
+                [e.get("country") or e["name"] for e in active], config
+            )
+        }
         lines += ["", "Running now:"]
-        lines += [
-            f"  {e.get('country') or e['name']} ({e.get('count') or 0}) - {e.get('tag') or 'General'}"
-            for e in active
-        ]
+        for entry in active:
+            country = entry.get("country") or entry["name"]
+            row = overview.get(country, {})
+            due = row.get("due_in_seconds")
+            when = "due now" if due is None or due <= 0 else f"in {max(1, due // 60)}m"
+            mark = " *" if row.get("customised") else ""
+            lines.append(
+                f"  {country} ({entry.get('count') or 0}) - {entry.get('tag') or 'General'}"
+                f" | every {row.get('interval_minutes')}m, next {when}{mark}"
+            )
+        if any(overview.get(c, {}).get("customised") for c in overview):
+            lines.append("  (* = custom settings for that country)")
+
     if queue:
         lines += ["", "Waiting to start:"]
         lines += [
@@ -143,7 +224,11 @@ async def status_text() -> str:
     if last:
         outcome = "ok" if last.get("ok") else "FAILED"
         lines += ["", f"Last check: {outcome} ({last.get('action', '')})"]
-        if last.get("active_quota") is not None:
+        stock = last.get("country_stock") or {}
+        if stock:
+            lines.append("Live stock:")
+            lines += [f"  {name}: {count}" for name, count in stock.items()]
+        elif last.get("active_quota") is not None:
             lines.append(f"Quota then: {last['active_quota']}")
         if last.get("error"):
             lines.append(f"Error: {last['error'][:200]}")
