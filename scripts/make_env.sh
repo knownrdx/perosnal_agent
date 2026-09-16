@@ -114,6 +114,9 @@ SHELL_ALLOWLIST=ls,pwd,cat,head,tail,wc,grep,find,df,du,file,sha256sum,stat,pyth
 ENABLE_BROWSER_TOOLS=false
 ENABLE_PYTHON_TOOL=true
 ENABLE_SHELL_TOOL=true
+
+# --- Web dashboard (https://<domain>/ui) ------------------------------------
+WEB_UI_PASSWORD=$(keep WEB_UI_PASSWORD "$(rand 12)")
 EOF
 
 chmod 600 .env
@@ -123,3 +126,4 @@ echo "wrote .env"
 echo "  telegram user : ${USER_ID}"
 echo "  api token     : ${API_TOKEN}"
 echo "  bridge token  : ${BRIDGE_TOKEN}"
+echo "  web ui pass   : $(keep WEB_UI_PASSWORD "")"

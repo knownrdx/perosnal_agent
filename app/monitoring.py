@@ -35,10 +35,22 @@ async def check_database() -> dict[str, Any]:
 
 
 async def check_llm() -> dict[str, Any]:
+    """Health probe with a hard timeout.
+
+    A gateway that hangs (rather than erroring) instead of the normal fast
+    401/502 would otherwise make every /health call - including the reverse
+    proxy's own healthcheck and the public domain's first byte - wait on it.
+    Timing out and reporting unhealthy is strictly better than a slow health
+    endpoint pretending everything is fine.
+    """
+    import asyncio
+
     from app.llm import get_llm
 
     try:
-        return await get_llm().health()
+        return await asyncio.wait_for(get_llm().health(), timeout=5.0)
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": "health probe timed out after 5s"}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)[:300]}
 

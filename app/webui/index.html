@@ -1,0 +1,1660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-alt: #12181f;
+    --panel: #161b22;
+    --border: #2a313c;
+    --text: #e6edf3;
+    --text-dim: #9aa7b3;
+    --accent: #3fa7b3;
+    --accent-hover: #57c2ce;
+    --danger: #e5534b;
+    --ok: #3fb950;
+    --warn: #d29922;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    height: 100%;
+  }
+
+  button {
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 12px;
+  }
+
+  button:hover { border-color: var(--accent); }
+
+  button.primary {
+    background: var(--accent);
+    color: #04141a;
+    border-color: var(--accent);
+    font-weight: 600;
+  }
+
+  button.primary:hover { background: var(--accent-hover); }
+
+  button.danger {
+    background: transparent;
+    color: var(--danger);
+    border-color: var(--danger);
+  }
+
+  button.danger:hover { background: var(--danger); color: #fff; }
+
+  button:disabled { opacity: 0.5; cursor: default; }
+
+  input, select, textarea {
+    font-family: inherit;
+    font-size: 13px;
+    background: var(--bg-alt);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 8px;
+  }
+
+  input:focus, select:focus, textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 3px;
+    margin-top: 10px;
+  }
+
+  a { color: var(--accent); text-decoration: none; }
+
+  /* ---------- login screen ---------- */
+  #login-screen {
+    display: none;
+    min-height: 100vh;
+    align-items: center;
+    justify-content: center;
+  }
+
+  #login-box {
+    width: 300px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 28px;
+    text-align: center;
+  }
+
+  #login-box h1 {
+    font-size: 18px;
+    margin: 0 0 4px 0;
+  }
+
+  #login-box p.sub {
+    color: var(--text-dim);
+    font-size: 12px;
+    margin: 0 0 18px 0;
+  }
+
+  #login-box input {
+    width: 100%;
+    margin-bottom: 10px;
+  }
+
+  #login-box button {
+    width: 100%;
+  }
+
+  #login-error {
+    color: var(--danger);
+    font-size: 12px;
+    margin-top: 10px;
+    min-height: 14px;
+  }
+
+  #login-disabled-msg {
+    color: var(--text-dim);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  /* ---------- app shell ---------- */
+  #app-shell {
+    display: none;
+    min-height: 100vh;
+  }
+
+  #layout {
+    display: flex;
+    min-height: 100vh;
+  }
+
+  #sidebar {
+    width: 200px;
+    flex-shrink: 0;
+    background: var(--bg-alt);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+  }
+
+  #sidebar .brand {
+    padding: 16px 14px;
+    font-weight: 700;
+    font-size: 15px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  #sidebar nav {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 0;
+  }
+
+  #sidebar nav button.nav-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    border-left: 3px solid transparent;
+    padding: 9px 14px;
+    color: var(--text-dim);
+  }
+
+  #sidebar nav button.nav-item:hover {
+    background: rgba(63, 167, 179, 0.08);
+    color: var(--text);
+  }
+
+  #sidebar nav button.nav-item.active {
+    border-left-color: var(--accent);
+    background: rgba(63, 167, 179, 0.12);
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  #sidebar-footer {
+    padding: 10px 14px;
+    border-top: 1px solid var(--border);
+  }
+
+  #sidebar-footer button { width: 100%; }
+
+  #main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  #topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 18px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-alt);
+  }
+
+  #topbar h2 {
+    font-size: 15px;
+    margin: 0;
+  }
+
+  #content {
+    flex: 1;
+    padding: 18px;
+    overflow-y: auto;
+  }
+
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  .panel-section {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+    margin-bottom: 16px;
+  }
+
+  .panel-section h3 {
+    margin: 0 0 10px 0;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-dim);
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+
+  table th {
+    text-align: left;
+    color: var(--text-dim);
+    font-weight: 600;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+  }
+
+  table td {
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+
+  table tr.clickable { cursor: pointer; }
+  table tr.clickable:hover { background: rgba(63, 167, 179, 0.06); }
+
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .row.spread { justify-content: space-between; }
+
+  .card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+    gap: 10px;
+  }
+
+  .card {
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+  }
+
+  .card .card-title {
+    font-weight: 600;
+    margin-bottom: 4px;
+    word-break: break-word;
+  }
+
+  .card .card-body {
+    color: var(--text-dim);
+    font-size: 12.5px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 140px;
+    overflow-y: auto;
+  }
+
+  .card .card-footer {
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--text-dim);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .badge {
+    display: inline-block;
+    font-size: 10.5px;
+    padding: 2px 7px;
+    border-radius: 10px;
+    background: var(--accent);
+    color: #04141a;
+    font-weight: 600;
+  }
+
+  .status-card {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+  }
+
+  .dot {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--danger);
+  }
+
+  .dot.ok { background: var(--ok); }
+
+  .status-card .status-title { font-weight: 600; }
+  .status-card .status-detail { color: var(--text-dim); font-size: 12px; }
+
+  #global-banner {
+    display: none;
+    background: var(--danger);
+    color: #fff;
+    padding: 8px 16px;
+    font-size: 13px;
+    text-align: center;
+  }
+
+  #confirm-msg {
+    display: none;
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background: var(--accent);
+    color: #04141a;
+    padding: 10px 16px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+    z-index: 999;
+  }
+
+  .muted { color: var(--text-dim); }
+  .small { font-size: 12px; }
+  .mt8 { margin-top: 8px; }
+  .mt12 { margin-top: 12px; }
+  .hidden { display: none !important; }
+
+  .detail-box {
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-top: 8px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 13px;
+  }
+
+  #sidebar-toggle {
+    display: none;
+  }
+
+  /* ---------- responsive ---------- */
+  @media (max-width: 700px) {
+    #layout { flex-direction: column; }
+
+    #sidebar {
+      width: 100%;
+      border-right: none;
+      border-bottom: 1px solid var(--border);
+    }
+
+    #sidebar .brand {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    #sidebar-toggle {
+      display: inline-block;
+    }
+
+    #sidebar nav {
+      display: none;
+      flex-direction: column;
+      max-height: 60vh;
+    }
+
+    #sidebar nav.open { display: flex; }
+
+    #sidebar-footer { display: none; }
+    #sidebar nav.open ~ #sidebar-footer,
+    #sidebar.nav-open #sidebar-footer { display: block; }
+
+    .card-grid { grid-template-columns: 1fr; }
+
+    #content { padding: 12px; }
+
+    #topbar { padding: 10px 12px; }
+
+    table, thead, tbody, th, td, tr { font-size: 12.5px; }
+  }
+</style>
+</head>
+<body>
+
+  <div id="global-banner"></div>
+
+  <!-- ============ LOGIN SCREEN ============ -->
+  <div id="login-screen">
+    <div id="login-box">
+      <h1>Agent Dashboard</h1>
+      <p class="sub">Sign in to continue</p>
+
+      <div id="login-form-wrap">
+        <form id="login-form">
+          <label for="login-password">Password</label>
+          <input type="password" id="login-password" name="password" autocomplete="current-password" required>
+          <button type="submit" class="primary" id="login-submit-btn">Log in</button>
+          <div id="login-error"></div>
+        </form>
+      </div>
+
+      <div id="login-disabled-wrap" class="hidden">
+        <p id="login-disabled-msg">The web UI login is not configured on the server.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ APP SHELL ============ -->
+  <div id="app-shell">
+    <div id="layout">
+      <div id="sidebar">
+        <div class="brand">
+          <span>🤖 Agent</span>
+          <button id="sidebar-toggle" type="button">☰</button>
+        </div>
+        <nav id="sidebar-nav">
+          <button class="nav-item" data-panel="tasks">📋 Tasks</button>
+          <button class="nav-item" data-panel="approvals">✅ Approvals</button>
+          <button class="nav-item" data-panel="contacts">👤 Contacts</button>
+          <button class="nav-item" data-panel="skills">🧠 Skills</button>
+          <button class="nav-item" data-panel="memory">💾 Memory</button>
+          <button class="nav-item" data-panel="jobs">⏰ Jobs</button>
+          <button class="nav-item" data-panel="llm">⚙️ LLM</button>
+          <button class="nav-item" data-panel="bridges">🔗 Bridges</button>
+          <button class="nav-item" data-panel="settings">🛠️ Settings</button>
+        </nav>
+        <div id="sidebar-footer">
+          <button id="logout-btn">Log out</button>
+        </div>
+      </div>
+
+      <div id="main">
+        <div id="topbar">
+          <h2 id="panel-title">Tasks</h2>
+        </div>
+        <div id="content">
+
+          <!-- ===================== TASKS PANEL ===================== -->
+          <div class="panel" id="panel-tasks">
+            <div class="panel-section">
+              <h3>New Task</h3>
+              <form id="new-task-form">
+                <label for="task-instruction">Instruction</label>
+                <textarea id="task-instruction" rows="2" style="width:100%;" required></textarea>
+                <div class="row mt8">
+                  <div>
+                    <label for="task-chat-id">Chat ID (optional)</label>
+                    <input type="text" id="task-chat-id">
+                  </div>
+                  <div>
+                    <label for="task-permission">Permission (optional)</label>
+                    <input type="text" id="task-permission">
+                  </div>
+                </div>
+                <button type="submit" class="primary mt12">Create task</button>
+              </form>
+            </div>
+
+            <div class="panel-section">
+              <div class="row spread">
+                <h3 style="margin:0;">Task List</h3>
+                <label class="small" style="margin:0; display:flex; align-items:center; gap:6px;">
+                  <input type="checkbox" id="tasks-active-only" style="width:auto;"> Active only
+                </label>
+              </div>
+              <div id="tasks-list">Loading...</div>
+            </div>
+
+            <div class="panel-section hidden" id="task-detail-section">
+              <div class="row spread">
+                <h3 style="margin:0;">Task Detail</h3>
+                <button id="task-detail-close">Close</button>
+              </div>
+              <div id="task-detail-body">Loading...</div>
+            </div>
+          </div>
+
+          <!-- ===================== APPROVALS PANEL ===================== -->
+          <div class="panel" id="panel-approvals">
+            <div class="panel-section">
+              <h3>Pending Approvals</h3>
+              <div id="approvals-list">Loading...</div>
+            </div>
+          </div>
+
+          <!-- ===================== CONTACTS PANEL ===================== -->
+          <div class="panel" id="panel-contacts">
+            <div class="panel-section">
+              <h3>Contacts</h3>
+              <div class="row">
+                <div>
+                  <label for="contacts-search">Search</label>
+                  <input type="text" id="contacts-search" placeholder="Name or number...">
+                </div>
+                <div>
+                  <label for="contacts-channel">Channel</label>
+                  <select id="contacts-channel">
+                    <option value="all">All</option>
+                    <option value="telegram">Telegram</option>
+                    <option value="whatsapp">WhatsApp</option>
+                  </select>
+                </div>
+                <div style="align-self:flex-end;">
+                  <button id="contacts-search-btn" class="primary">Search</button>
+                </div>
+                <div style="align-self:flex-end;">
+                  <button id="contacts-sync-btn">Sync now</button>
+                </div>
+              </div>
+              <div id="contacts-sync-result" class="small mt8"></div>
+              <div id="contacts-list" class="mt12">Loading...</div>
+            </div>
+          </div>
+
+          <!-- ===================== SKILLS PANEL ===================== -->
+          <div class="panel" id="panel-skills">
+            <div class="panel-section">
+              <h3>Skills Memory (read-only)</h3>
+              <div id="skills-list" class="card-grid">Loading...</div>
+            </div>
+          </div>
+
+          <!-- ===================== MEMORY PANEL ===================== -->
+          <div class="panel" id="panel-memory">
+            <div class="panel-section">
+              <h3>Memory</h3>
+              <div class="row">
+                <div>
+                  <label for="memory-search">Search</label>
+                  <input type="text" id="memory-search" placeholder="Query...">
+                </div>
+                <div style="align-self:flex-end;">
+                  <button id="memory-search-btn" class="primary">Search</button>
+                </div>
+              </div>
+              <div id="memory-list" class="card-grid mt12">Loading...</div>
+            </div>
+          </div>
+
+          <!-- ===================== JOBS PANEL ===================== -->
+          <div class="panel" id="panel-jobs">
+            <div class="panel-section">
+              <h3>New Job</h3>
+              <form id="new-job-form">
+                <label for="job-instruction">Instruction</label>
+                <textarea id="job-instruction" rows="2" style="width:100%;" required></textarea>
+
+                <div class="row mt8">
+                  <div>
+                    <label for="job-kind">Kind</label>
+                    <select id="job-kind">
+                      <option value="once">once</option>
+                      <option value="interval">interval</option>
+                      <option value="cron">cron</option>
+                    </select>
+                  </div>
+                  <div id="job-field-once">
+                    <label for="job-when">When</label>
+                    <input type="text" id="job-when" placeholder="2024-01-01T12:00:00">
+                  </div>
+                  <div id="job-field-interval" class="hidden">
+                    <label for="job-every">Every</label>
+                    <input type="text" id="job-every" placeholder="1h, 30m...">
+                  </div>
+                  <div id="job-field-cron" class="hidden">
+                    <label for="job-cron">Cron</label>
+                    <input type="text" id="job-cron" placeholder="*/15 * * * *">
+                  </div>
+                </div>
+
+                <div class="row mt8">
+                  <div>
+                    <label for="job-name">Name (optional)</label>
+                    <input type="text" id="job-name">
+                  </div>
+                  <div>
+                    <label for="job-max-runs">Max runs (optional)</label>
+                    <input type="number" id="job-max-runs" min="1">
+                  </div>
+                </div>
+
+                <button type="submit" class="primary mt12">Create job</button>
+              </form>
+            </div>
+
+            <div class="panel-section">
+              <h3>Scheduled Jobs</h3>
+              <div id="jobs-list">Loading...</div>
+            </div>
+          </div>
+
+          <!-- ===================== LLM PANEL ===================== -->
+          <div class="panel" id="panel-llm">
+            <div class="panel-section">
+              <h3>Active LLM</h3>
+              <div id="llm-active">Loading...</div>
+            </div>
+            <div class="panel-section">
+              <div class="row spread">
+                <h3 style="margin:0;">Providers</h3>
+                <button id="llm-refresh-btn">Refresh health</button>
+              </div>
+              <div id="llm-providers">Loading...</div>
+              <div id="llm-health-result" class="mt12"></div>
+            </div>
+          </div>
+
+          <!-- ===================== BRIDGES PANEL ===================== -->
+          <div class="panel" id="panel-bridges">
+            <div class="panel-section">
+              <h3>Bridge Connections</h3>
+              <div id="bridges-status">Loading...</div>
+            </div>
+            <div class="panel-section">
+              <h3>Owner Telegram Account</h3>
+              <div id="telegram-user-status">Loading...</div>
+            </div>
+          </div>
+
+          <!-- ===================== SETTINGS PANEL ===================== -->
+          <div class="panel" id="panel-settings">
+            <div class="panel-section">
+              <h3>Autonomy Level</h3>
+              <p class="small muted">
+                <strong>balanced</strong> — the sensible default; asks for confirmation on moderately risky or irreversible actions.<br>
+                <strong>high</strong> — asks for fewer confirmations, letting the agent act more freely on your behalf.<br>
+                <strong>paranoid</strong> — confirms almost everything before acting, favoring caution over speed.
+              </p>
+              <label for="autonomy-select">Level</label>
+              <select id="autonomy-select">
+                <option value="balanced">balanced</option>
+                <option value="high">high</option>
+                <option value="paranoid">paranoid</option>
+              </select>
+              <button id="autonomy-save-btn" class="primary mt12">Save</button>
+              <div id="autonomy-current" class="small muted mt8">Loading...</div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="confirm-msg"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ============================================================
+     STATE & CONSTANTS
+     ============================================================ */
+  var TASKS_POLL_MS = 5000;
+  var tasksPollTimer = null;
+  var currentPanel = "tasks";
+  var currentTaskDetailId = null;
+
+  /* ============================================================
+     GENERIC HELPERS
+     ============================================================ */
+
+  function qs(sel, root) { return (root || document).querySelector(sel); }
+  function qsa(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+
+  function escapeHtml(str) {
+    if (str === null || str === undefined) return "";
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function buildQuery(params) {
+    var parts = [];
+    Object.keys(params).forEach(function (key) {
+      var val = params[key];
+      if (val === undefined || val === null || val === "") return;
+      parts.push(encodeURIComponent(key) + "=" + encodeURIComponent(val));
+    });
+    return parts.length ? ("?" + parts.join("&")) : "";
+  }
+
+  function showBanner(message) {
+    var el = qs("#global-banner");
+    el.textContent = message;
+    el.style.display = "block";
+  }
+
+  function hideBanner() {
+    qs("#global-banner").style.display = "none";
+  }
+
+  function showConfirm(message) {
+    var el = qs("#confirm-msg");
+    el.textContent = message;
+    el.style.display = "block";
+    setTimeout(function () {
+      el.style.display = "none";
+    }, 2000);
+  }
+
+  function relativeTime(isoString) {
+    if (!isoString) return "unknown";
+    var then = new Date(isoString).getTime();
+    if (isNaN(then)) return "unknown";
+    var now = Date.now();
+    var diffSec = Math.round((now - then) / 1000);
+    if (diffSec < 0) diffSec = 0;
+    if (diffSec < 60) return diffSec + "s ago";
+    var diffMin = Math.round(diffSec / 60);
+    if (diffMin < 60) return diffMin + "m ago";
+    var diffHr = Math.round(diffMin / 60);
+    if (diffHr < 24) return diffHr + "h ago";
+    var diffDay = Math.round(diffHr / 24);
+    if (diffDay < 30) return diffDay + "d ago";
+    var diffMonth = Math.round(diffDay / 30);
+    if (diffMonth < 12) return diffMonth + "mo ago";
+    var diffYear = Math.round(diffMonth / 12);
+    return diffYear + "y ago";
+  }
+
+  /* ============================================================
+     CORE FETCH WRAPPER
+     Every call in this file goes through this so:
+       - credentials: 'include' is always set
+       - 401 anywhere triggers an immediate return to the login gate
+       - network errors / non-ok responses surface via the banner
+     ============================================================ */
+
+  function apiFetch(path, options) {
+    options = options || {};
+    var opts = {
+      method: options.method || "GET",
+      credentials: "include",
+      headers: {}
+    };
+    if (options.body !== undefined) {
+      opts.headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(options.body);
+    }
+    return fetch(path, opts).then(function (res) {
+      if (res.status === 401) {
+        showBanner("Session expired. Please log in again.");
+        goToLogin();
+        var err = new Error("unauthorized");
+        err.status = 401;
+        throw err;
+      }
+      return res;
+    }, function (networkErr) {
+      showBanner("Network error: could not reach the server.");
+      throw networkErr;
+    });
+  }
+
+  function apiFetchJson(path, options) {
+    return apiFetch(path, options).then(function (res) {
+      if (!res.ok) {
+        var err = new Error("Request failed: " + res.status);
+        err.status = res.status;
+        err.response = res;
+        throw err;
+      }
+      return res.json().catch(function () { return {}; });
+    });
+  }
+
+  /* ============================================================
+     LOGIN / AUTH
+     ============================================================ */
+
+  function goToLogin() {
+    stopTasksPolling();
+    qs("#app-shell").style.display = "none";
+    qs("#login-screen").style.display = "flex";
+  }
+
+  function goToApp() {
+    qs("#login-screen").style.display = "none";
+    qs("#app-shell").style.display = "block";
+    hideBanner();
+    initAppShell();
+  }
+
+  function checkAuth() {
+    return fetch("/api/auth/me", { credentials: "include" })
+      .then(function (res) {
+        if (!res.ok) {
+          // Treat non-ok (other than a handled 503 during login attempts) as unauthenticated.
+          return { authenticated: false };
+        }
+        return res.json().catch(function () { return { authenticated: false }; });
+      })
+      .catch(function () {
+        showBanner("Network error: could not reach the server.");
+        return { authenticated: false };
+      })
+      .then(function (data) {
+        if (data && data.authenticated) {
+          goToApp();
+        } else {
+          goToLogin();
+        }
+      });
+  }
+
+  function handleLoginSubmit(evt) {
+    evt.preventDefault();
+    var password = qs("#login-password").value;
+    var errBox = qs("#login-error");
+    var btn = qs("#login-submit-btn");
+    errBox.textContent = "";
+    btn.disabled = true;
+
+    fetch("/api/auth/login", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: password })
+    })
+      .then(function (res) {
+        if (res.status === 503) {
+          qs("#login-form-wrap").classList.add("hidden");
+          qs("#login-disabled-wrap").classList.remove("hidden");
+          return null;
+        }
+        if (!res.ok) {
+          return res.json().catch(function () { return {}; }).then(function (data) {
+            throw new Error((data && data.detail) || "Login failed.");
+          });
+        }
+        return res.json().catch(function () { return {}; });
+      })
+      .then(function (data) {
+        if (data !== null) {
+          // Successful login -> reload to re-run the auth check and reveal the dashboard.
+          window.location.reload();
+        }
+      })
+      .catch(function (e) {
+        errBox.textContent = e.message || "Login failed.";
+      })
+      .finally(function () {
+        btn.disabled = false;
+      });
+  }
+
+  function handleLogout() {
+    fetch("/api/auth/logout", { method: "POST", credentials: "include" })
+      .catch(function () { /* ignore network errors on logout */ })
+      .then(function () {
+        window.location.reload();
+      });
+  }
+
+  /* ============================================================
+     SIDEBAR NAV
+     ============================================================ */
+
+  var PANEL_TITLES = {
+    tasks: "Tasks",
+    approvals: "Approvals",
+    contacts: "Contacts",
+    skills: "Skills",
+    memory: "Memory",
+    jobs: "Jobs",
+    llm: "LLM",
+    bridges: "Bridges",
+    settings: "Settings"
+  };
+
+  function switchPanel(name) {
+    currentPanel = name;
+    qsa(".nav-item").forEach(function (btn) {
+      btn.classList.toggle("active", btn.getAttribute("data-panel") === name);
+    });
+    qsa(".panel").forEach(function (panel) {
+      panel.classList.toggle("active", panel.id === "panel-" + name);
+    });
+    qs("#panel-title").textContent = PANEL_TITLES[name] || name;
+
+    // Collapse mobile nav after selection.
+    qs("#sidebar-nav").classList.remove("open");
+
+    if (name === "tasks") {
+      startTasksPolling();
+      loadTasks();
+    } else {
+      stopTasksPolling();
+    }
+
+    if (name === "approvals") loadApprovals();
+    if (name === "contacts") loadContacts();
+    if (name === "skills") loadSkills();
+    if (name === "memory") loadMemory();
+    if (name === "jobs") loadJobs();
+    if (name === "llm") loadLlm();
+    if (name === "bridges") loadBridges();
+    if (name === "settings") loadAutonomy();
+  }
+
+  /* ============================================================
+     TASKS PANEL
+     ============================================================ */
+
+  function loadTasks() {
+    var activeOnly = qs("#tasks-active-only").checked;
+    var params = { limit: 50 };
+    if (activeOnly) params.active_only = "true";
+    apiFetchJson("/api/tasks" + buildQuery(params))
+      .then(function (data) {
+        renderTasks(Array.isArray(data) ? data : (data.tasks || []));
+      })
+      .catch(function () {
+        qs("#tasks-list").textContent = "Failed to load tasks.";
+      });
+  }
+
+  function renderTasks(tasks) {
+    var container = qs("#tasks-list");
+    if (!tasks || tasks.length === 0) {
+      container.innerHTML = '<p class="muted small">No tasks yet.</p>';
+      return;
+    }
+    var rows = tasks.map(function (t) {
+      var status = escapeHtml(t.status || "unknown");
+      var isActive = ["pending", "running", "queued", "active"].indexOf((t.status || "").toLowerCase()) !== -1;
+      var cancelBtn = isActive
+        ? '<button class="danger task-cancel-btn" data-id="' + escapeHtml(t.id) + '">Cancel</button>'
+        : "";
+      return (
+        '<tr class="clickable" data-id="' + escapeHtml(t.id) + '">' +
+          '<td>' + escapeHtml(t.id) + "</td>" +
+          "<td>" + status + "</td>" +
+          '<td>' + escapeHtml((t.request || t.instruction || "").slice(0, 60)) + "</td>" +
+          "<td>" + escapeHtml(t.created_at || "") + "</td>" +
+          "<td>" + cancelBtn + "</td>" +
+        "</tr>"
+      );
+    }).join("");
+
+    container.innerHTML =
+      "<table><thead><tr><th>ID</th><th>Status</th><th>Request</th><th>Created</th><th></th></tr></thead>" +
+      "<tbody>" + rows + "</tbody></table>";
+
+    qsa("tr.clickable", container).forEach(function (row) {
+      row.addEventListener("click", function (evt) {
+        if (evt.target.closest(".task-cancel-btn")) return;
+        openTaskDetail(row.getAttribute("data-id"));
+      });
+    });
+
+    qsa(".task-cancel-btn", container).forEach(function (btn) {
+      btn.addEventListener("click", function (evt) {
+        evt.stopPropagation();
+        cancelTask(btn.getAttribute("data-id"));
+      });
+    });
+  }
+
+  function openTaskDetail(id) {
+    currentTaskDetailId = id;
+    var section = qs("#task-detail-section");
+    section.classList.remove("hidden");
+    qs("#task-detail-body").textContent = "Loading...";
+
+    apiFetchJson("/api/tasks/" + encodeURIComponent(id))
+      .then(function (task) {
+        renderTaskDetail(task);
+      })
+      .catch(function () {
+        qs("#task-detail-body").textContent = "Failed to load task detail.";
+      });
+  }
+
+  function renderTaskDetail(task) {
+    var toolCalls = task.tool_calls || [];
+    var rows = toolCalls.map(function (tc) {
+      return (
+        "<tr>" +
+          "<td>" + escapeHtml(tc.name || tc.tool || "") + "</td>" +
+          "<td>" + escapeHtml(JSON.stringify(tc.arguments || tc.args || {})) + "</td>" +
+          "<td>" + escapeHtml(JSON.stringify(tc.result !== undefined ? tc.result : "")) + "</td>" +
+        "</tr>"
+      );
+    }).join("");
+
+    var toolCallsHtml = toolCalls.length
+      ? ('<table><thead><tr><th>Tool</th><th>Args</th><th>Result</th></tr></thead><tbody>' + rows + "</tbody></table>")
+      : '<p class="muted small">No tool calls recorded.</p>';
+
+    qs("#task-detail-body").innerHTML =
+      "<p><strong>Request:</strong></p>" +
+      '<div class="detail-box">' + escapeHtml(task.request || task.instruction || "") + "</div>" +
+      "<p class=\"mt12\"><strong>Result:</strong></p>" +
+      '<div class="detail-box">' + escapeHtml(task.result || "(none)") + "</div>" +
+      "<p class=\"mt12\"><strong>Error:</strong></p>" +
+      '<div class="detail-box">' + escapeHtml(task.error || "(none)") + "</div>" +
+      "<p class=\"mt12\"><strong>Tool calls:</strong></p>" +
+      toolCallsHtml;
+  }
+
+  function cancelTask(id) {
+    apiFetchJson("/api/tasks/" + encodeURIComponent(id) + "/cancel", { method: "POST" })
+      .then(function () {
+        showConfirm("Task cancelled.");
+        loadTasks();
+      })
+      .catch(function () {
+        showConfirm("Could not cancel task.");
+      });
+  }
+
+  function handleNewTaskSubmit(evt) {
+    evt.preventDefault();
+    var instruction = qs("#task-instruction").value.trim();
+    if (!instruction) return;
+    var body = { instruction: instruction };
+    var chatId = qs("#task-chat-id").value.trim();
+    var permission = qs("#task-permission").value.trim();
+    if (chatId) body.chat_id = chatId;
+    if (permission) body.permission = permission;
+
+    apiFetchJson("/api/tasks", { method: "POST", body: body })
+      .then(function () {
+        showConfirm("Task created.");
+        qs("#new-task-form").reset();
+        loadTasks();
+      })
+      .catch(function () {
+        showConfirm("Failed to create task.");
+      });
+  }
+
+  function startTasksPolling() {
+    stopTasksPolling();
+    if (document.hidden) return;
+    tasksPollTimer = setInterval(function () {
+      if (!document.hidden && currentPanel === "tasks") {
+        loadTasks();
+      }
+    }, TASKS_POLL_MS);
+  }
+
+  function stopTasksPolling() {
+    if (tasksPollTimer) {
+      clearInterval(tasksPollTimer);
+      tasksPollTimer = null;
+    }
+  }
+
+  function handleVisibilityChange() {
+    if (document.hidden) {
+      stopTasksPolling();
+    } else if (currentPanel === "tasks") {
+      loadTasks();
+      startTasksPolling();
+    }
+  }
+
+  /* ============================================================
+     APPROVALS PANEL
+     ============================================================ */
+
+  function loadApprovals() {
+    apiFetchJson("/api/approvals")
+      .then(function (data) {
+        renderApprovals(Array.isArray(data) ? data : (data.approvals || []));
+      })
+      .catch(function () {
+        qs("#approvals-list").textContent = "Failed to load approvals.";
+      });
+  }
+
+  function renderApprovals(approvals) {
+    var container = qs("#approvals-list");
+    if (!approvals || approvals.length === 0) {
+      container.innerHTML = '<p class="muted small">No pending approvals.</p>';
+      return;
+    }
+    var rows = approvals.map(function (a) {
+      return (
+        "<tr>" +
+          "<td>" + escapeHtml(a.id) + "</td>" +
+          "<td>" + escapeHtml(a.summary || a.description || a.request || "") + "</td>" +
+          "<td>" + escapeHtml(a.created_at || "") + "</td>" +
+          "<td>" +
+            '<button class="primary approve-btn" data-id="' + escapeHtml(a.id) + '">Approve</button> ' +
+            '<button class="danger reject-btn" data-id="' + escapeHtml(a.id) + '">Reject</button>' +
+          "</td>" +
+        "</tr>"
+      );
+    }).join("");
+
+    container.innerHTML =
+      "<table><thead><tr><th>ID</th><th>Summary</th><th>Created</th><th></th></tr></thead>" +
+      "<tbody>" + rows + "</tbody></table>";
+
+    qsa(".approve-btn", container).forEach(function (btn) {
+      btn.addEventListener("click", function () { decideApproval(btn.getAttribute("data-id"), true); });
+    });
+    qsa(".reject-btn", container).forEach(function (btn) {
+      btn.addEventListener("click", function () { decideApproval(btn.getAttribute("data-id"), false); });
+    });
+  }
+
+  function decideApproval(id, approve) {
+    var flag = approve ? "true" : "false";
+    apiFetchJson("/api/approvals/" + encodeURIComponent(id) + buildQuery({ approve: flag }), { method: "POST" })
+      .then(function () {
+        showConfirm(approve ? "Approved." : "Rejected.");
+        loadApprovals();
+      })
+      .catch(function () {
+        showConfirm("Failed to record decision.");
+      });
+  }
+
+  /* ============================================================
+     CONTACTS PANEL
+     ============================================================ */
+
+  function loadContacts() {
+    var query = qs("#contacts-search").value.trim();
+    var channel = qs("#contacts-channel").value;
+    var params = { limit: 100 };
+    if (query) params.query = query;
+    if (channel && channel !== "all") params.channel = channel;
+
+    qs("#contacts-list").textContent = "Loading...";
+    apiFetchJson("/api/contacts" + buildQuery(params))
+      .then(function (data) {
+        renderContacts(Array.isArray(data) ? data : (data.contacts || []));
+      })
+      .catch(function () {
+        qs("#contacts-list").textContent = "Failed to load contacts.";
+      });
+  }
+
+  function renderContacts(contacts) {
+    var container = qs("#contacts-list");
+    if (!contacts || contacts.length === 0) {
+      container.innerHTML = '<p class="muted small">No contacts found.</p>';
+      return;
+    }
+    var rows = contacts.map(function (c) {
+      return (
+        "<tr>" +
+          "<td>" + escapeHtml(c.name || "") + "</td>" +
+          "<td>" + escapeHtml(c.channel || "") + "</td>" +
+          "<td>" + escapeHtml(c.handle || c.phone || c.username || "") + "</td>" +
+        "</tr>"
+      );
+    }).join("");
+    container.innerHTML =
+      "<table><thead><tr><th>Name</th><th>Channel</th><th>Handle</th></tr></thead>" +
+      "<tbody>" + rows + "</tbody></table>";
+  }
+
+  function syncContacts() {
+    var btn = qs("#contacts-sync-btn");
+    btn.disabled = true;
+    apiFetchJson("/api/contacts/sync", { method: "POST" })
+      .then(function (data) {
+        var counts = data && (data.synced || data.counts || data);
+        var lines = [];
+        if (counts && typeof counts === "object") {
+          Object.keys(counts).forEach(function (channel) {
+            lines.push(escapeHtml(channel) + ": " + escapeHtml(counts[channel]));
+          });
+        }
+        qs("#contacts-sync-result").innerHTML = lines.length
+          ? ("Synced &mdash; " + lines.join(", "))
+          : "Sync completed.";
+        showConfirm("Contacts synced.");
+        loadContacts();
+      })
+      .catch(function () {
+        showConfirm("Sync failed.");
+      })
+      .finally(function () {
+        btn.disabled = false;
+      });
+  }
+
+  /* ============================================================
+     SKILLS PANEL
+     ============================================================ */
+
+  function loadSkills() {
+    var container = qs("#skills-list");
+    container.textContent = "Loading...";
+    apiFetchJson("/api/skills")
+      .then(function (data) {
+        renderSkills(data);
+      })
+      .catch(function () {
+        container.textContent = "Failed to load skills.";
+      });
+  }
+
+  function renderSkills(data) {
+    var container = qs("#skills-list");
+    var entries = [];
+
+    if (Array.isArray(data)) {
+      entries = data.map(function (item) {
+        return { key: item.key, value: item.value, updated_at: item.updated_at };
+      });
+    } else if (data && typeof data === "object") {
+      var source = data.skills || data;
+      entries = Object.keys(source).map(function (key) {
+        var item = source[key];
+        if (item && typeof item === "object" && "value" in item) {
+          return { key: key, value: item.value, updated_at: item.updated_at };
+        }
+        return { key: key, value: item, updated_at: undefined };
+      });
+    }
+
+    if (entries.length === 0) {
+      container.innerHTML = '<p class="muted small">No skills recorded yet.</p>';
+      return;
+    }
+
+    container.innerHTML = entries.map(function (entry) {
+      var bodyText = typeof entry.value === "string" ? entry.value : JSON.stringify(entry.value);
+      return (
+        '<div class="card">' +
+          '<div class="card-title">' + escapeHtml(entry.key) + "</div>" +
+          '<div class="card-body">' + escapeHtml(bodyText) + "</div>" +
+          '<div class="card-footer"><span>' + relativeTime(entry.updated_at) + "</span></div>" +
+        "</div>"
+      );
+    }).join("");
+  }
+
+  /* ============================================================
+     MEMORY PANEL
+     ============================================================ */
+
+  function loadMemory() {
+    var container = qs("#memory-list");
+    var query = qs("#memory-search").value.trim();
+    var params = { limit: 50 };
+    if (query) params.query = query;
+
+    container.textContent = "Loading...";
+    apiFetchJson("/api/memory" + buildQuery(params))
+      .then(function (data) {
+        renderMemory(Array.isArray(data) ? data : (data.memory || data.items || []));
+      })
+      .catch(function () {
+        container.textContent = "Failed to load memory.";
+      });
+  }
+
+  function renderMemory(items) {
+    var container = qs("#memory-list");
+    if (!items || items.length === 0) {
+      container.innerHTML = '<p class="muted small">No memory entries found.</p>';
+      return;
+    }
+    container.innerHTML = items.map(function (item) {
+      var title = item.key || item.title || "(entry)";
+      var bodyText = typeof item.value === "string" ? item.value : JSON.stringify(item.value);
+      return (
+        '<div class="card">' +
+          '<div class="card-title">' + escapeHtml(title) + "</div>" +
+          '<div class="card-body">' + escapeHtml(bodyText) + "</div>" +
+          '<div class="card-footer">' +
+            '<span class="badge">' + escapeHtml(item.kind || "note") + "</span>" +
+            "<span>" + relativeTime(item.updated_at) + "</span>" +
+          "</div>" +
+        "</div>"
+      );
+    }).join("");
+  }
+
+  /* ============================================================
+     JOBS PANEL
+     ============================================================ */
+
+  function loadJobs() {
+    var container = qs("#jobs-list");
+    container.textContent = "Loading...";
+    apiFetchJson("/api/jobs")
+      .then(function (data) {
+        renderJobs(Array.isArray(data) ? data : (data.jobs || []));
+      })
+      .catch(function () {
+        container.textContent = "Failed to load jobs.";
+      });
+  }
+
+  function renderJobs(jobs) {
+    var container = qs("#jobs-list");
+    if (!jobs || jobs.length === 0) {
+      container.innerHTML = '<p class="muted small">No scheduled jobs.</p>';
+      return;
+    }
+    var rows = jobs.map(function (j) {
+      return (
+        "<tr>" +
+          "<td>" + escapeHtml(j.name || j.id) + "</td>" +
+          "<td>" + escapeHtml(j.kind || "") + "</td>" +
+          "<td>" + (j.enabled ? "Yes" : "No") + "</td>" +
+          "<td>" + escapeHtml(j.next_run_at || "") + "</td>" +
+          "<td>" + escapeHtml(j.runs !== undefined ? j.runs : "") + "</td>" +
+          "<td><button class=\"danger job-delete-btn\" data-id=\"" + escapeHtml(j.id) + "\">Delete</button></td>" +
+        "</tr>"
+      );
+    }).join("");
+    container.innerHTML =
+      "<table><thead><tr><th>Name</th><th>Kind</th><th>Enabled</th><th>Next run</th><th>Runs</th><th></th></tr></thead>" +
+      "<tbody>" + rows + "</tbody></table>";
+
+    qsa(".job-delete-btn", container).forEach(function (btn) {
+      btn.addEventListener("click", function () { deleteJob(btn.getAttribute("data-id")); });
+    });
+  }
+
+  function deleteJob(id) {
+    apiFetch("/api/jobs/" + encodeURIComponent(id), { method: "DELETE" })
+      .then(function (res) {
+        if (!res.ok) throw new Error("delete failed");
+        showConfirm("Job deleted.");
+        loadJobs();
+      })
+      .catch(function () {
+        showConfirm("Failed to delete job.");
+      });
+  }
+
+  function updateJobKindFields() {
+    var kind = qs("#job-kind").value;
+    qs("#job-field-once").classList.toggle("hidden", kind !== "once");
+    qs("#job-field-interval").classList.toggle("hidden", kind !== "interval");
+    qs("#job-field-cron").classList.toggle("hidden", kind !== "cron");
+  }
+
+  function handleNewJobSubmit(evt) {
+    evt.preventDefault();
+    var instruction = qs("#job-instruction").value.trim();
+    if (!instruction) return;
+    var kind = qs("#job-kind").value;
+    var body = { instruction: instruction, kind: kind };
+
+    if (kind === "once") body.when = qs("#job-when").value.trim();
+    if (kind === "interval") body.every = qs("#job-every").value.trim();
+    if (kind === "cron") body.cron = qs("#job-cron").value.trim();
+
+    var name = qs("#job-name").value.trim();
+    var maxRuns = qs("#job-max-runs").value.trim();
+    if (name) body.name = name;
+    if (maxRuns) body.max_runs = parseInt(maxRuns, 10);
+
+    apiFetchJson("/api/jobs", { method: "POST", body: body })
+      .then(function () {
+        showConfirm("Job created.");
+        qs("#new-job-form").reset();
+        updateJobKindFields();
+        loadJobs();
+      })
+      .catch(function () {
+        showConfirm("Failed to create job.");
+      });
+  }
+
+  /* ============================================================
+     LLM PANEL
+     ============================================================ */
+
+  function loadLlm() {
+    qs("#llm-active").textContent = "Loading...";
+    qs("#llm-providers").textContent = "Loading...";
+    apiFetchJson("/api/llm")
+      .then(function (data) {
+        renderLlm(data);
+      })
+      .catch(function () {
+        qs("#llm-active").textContent = "Failed to load LLM status.";
+        qs("#llm-providers").textContent = "";
+      });
+  }
+
+  function renderLlm(data) {
+    qs("#llm-active").innerHTML =
+      "<p><strong>Active provider:</strong> " + escapeHtml(data.active_provider || "unknown") + "</p>" +
+      "<p><strong>Active model:</strong> " + escapeHtml(data.active_model || "unknown") + "</p>";
+
+    var providers = data.providers || [];
+    if (providers.length === 0) {
+      qs("#llm-providers").innerHTML = '<p class="muted small">No providers configured.</p>';
+      return;
+    }
+
+    var rows = providers.map(function (p) {
+      var name = escapeHtml(p.name || p.provider || "");
+      return (
+        "<tr>" +
+          "<td>" + name + "</td>" +
+          "<td>" + escapeHtml(p.model || "") + "</td>" +
+          "<td><button class=\"primary llm-switch-btn\" data-provider=\"" + name + "\" data-model=\"" + escapeHtml(p.model || "") + "\">Switch</button></td>" +
+        "</tr>"
+      );
+    }).join("");
+
+    qs("#llm-providers").innerHTML =
+      "<table><thead><tr><th>Provider</th><th>Model</th><th></th></tr></thead>" +
+      "<tbody>" + rows + "</tbody></table>";
+
+    qsa(".llm-switch-btn", qs("#llm-providers")).forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        switchLlmProvider(btn.getAttribute("data-provider"), btn.getAttribute("data-model"));
+      });
+    });
+  }
+
+  function switchLlmProvider(provider, model) {
+    var body = { provider: provider };
+    if (model) body.model = model;
+    apiFetchJson("/api/llm", { method: "POST", body: body })
+      .then(function () {
+        showConfirm("Switched LLM provider.");
+        loadLlm();
+      })
+      .catch(function () {
+        showConfirm("Failed to switch provider.");
+      });
+  }
+
+  function refreshLlmHealth() {
+    var out = qs("#llm-health-result");
+    out.textContent = "Loading...";
+    apiFetchJson("/api/llm/health")
+      .then(function (data) {
+        var list = Array.isArray(data) ? data : (data.providers || []);
+        if (list.length === 0) {
+          out.innerHTML = '<p class="muted small">No health data returned.</p>';
+          return;
+        }
+        out.innerHTML = list.map(function (p) {
+          var ok = !!p.ok;
+          return (
+            '<div class="status-card">' +
+              '<div class="dot' + (ok ? " ok" : "") + '"></div>' +
+              "<div>" +
+                '<div class="status-title">' + escapeHtml(p.name || p.provider || "") + "</div>" +
+                '<div class="status-detail">' + (ok ? "OK" : escapeHtml(p.error || "unhealthy")) + "</div>" +
+              "</div>" +
+            "</div>"
+          );
+        }).join("");
+      })
+      .catch(function () {
+        out.textContent = "Failed to load provider health.";
+      });
+  }
+
+  /* ============================================================
+     BRIDGES PANEL
+     ============================================================ */
+
+  function loadBridges() {
+    qs("#bridges-status").textContent = "Loading...";
+    qs("#telegram-user-status").textContent = "Loading...";
+
+    apiFetchJson("/api/bridges/status")
+      .then(function (data) {
+        renderBridgeStatus(data);
+      })
+      .catch(function () {
+        qs("#bridges-status").textContent = "Failed to load bridge status.";
+      });
+
+    apiFetchJson("/api/telegram_user/status")
+      .then(function (data) {
+        renderTelegramUserStatus(data);
+      })
+      .catch(function () {
+        qs("#telegram-user-status").textContent = "Failed to load Telegram account status.";
+      });
+  }
+
+  function statusCard(title, ok, detail) {
+    return (
+      '<div class="status-card">' +
+        '<div class="dot' + (ok ? " ok" : "") + '"></div>' +
+        "<div>" +
+          '<div class="status-title">' + escapeHtml(title) + "</div>" +
+          '<div class="status-detail">' + escapeHtml(detail || (ok ? "connected" : "disconnected")) + "</div>" +
+        "</div>" +
+      "</div>"
+    );
+  }
+
+  function renderBridgeStatus(data) {
+    var wa = data.whatsapp || {};
+    var teams = data.teams || {};
+    qs("#bridges-status").innerHTML =
+      statusCard("WhatsApp", !!(wa.connected || wa.ok || wa.linked), wa.detail || wa.state) +
+      statusCard("Teams", !!(teams.connected || teams.ok || teams.linked), teams.detail || teams.state);
+  }
+
+  function renderTelegramUserStatus(data) {
+    var linked = !!(data.linked || data.ok || data.connected);
+    qs("#telegram-user-status").innerHTML = statusCard(
+      "Telegram (owner)",
+      linked,
+      data.detail || data.username || (linked ? "linked" : "not linked")
+    );
+  }
+
+  /* ============================================================
+     SETTINGS PANEL (autonomy)
+     ============================================================ */
+
+  function loadAutonomy() {
+    qs("#autonomy-current").textContent = "Loading...";
+    apiFetchJson("/api/autonomy")
+      .then(function (data) {
+        var level = data.level || data.autonomy || "balanced";
+        qs("#autonomy-select").value = level;
+        qs("#autonomy-current").textContent = "Current level: " + level;
+      })
+      .catch(function () {
+        qs("#autonomy-current").textContent = "Failed to load autonomy level.";
+      });
+  }
+
+  function saveAutonomy() {
+    var level = qs("#autonomy-select").value;
+    apiFetchJson("/api/autonomy", { method: "POST", body: { level: level } })
+      .then(function () {
+        showConfirm("Autonomy level saved.");
+        loadAutonomy();
+      })
+      .catch(function () {
+        showConfirm("Failed to save autonomy level.");
+      });
+  }
+
+  /* ============================================================
+     INITIALIZATION
+     ============================================================ */
+
+  function initAppShell() {
+    switchPanel("tasks");
+  }
+
+  function bindStaticEvents() {
+    qs("#login-form").addEventListener("submit", handleLoginSubmit);
+    qs("#logout-btn").addEventListener("click", handleLogout);
+
+    qsa(".nav-item").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        switchPanel(btn.getAttribute("data-panel"));
+      });
+    });
+
+    qs("#sidebar-toggle").addEventListener("click", function () {
+      qs("#sidebar-nav").classList.toggle("open");
+    });
+
+    qs("#new-task-form").addEventListener("submit", handleNewTaskSubmit);
+    qs("#tasks-active-only").addEventListener("change", loadTasks);
+    qs("#task-detail-close").addEventListener("click", function () {
+      qs("#task-detail-section").classList.add("hidden");
+      currentTaskDetailId = null;
+    });
+
+    qs("#contacts-search-btn").addEventListener("click", loadContacts);
+    qs("#contacts-search").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); loadContacts(); }
+    });
+    qs("#contacts-channel").addEventListener("change", loadContacts);
+    qs("#contacts-sync-btn").addEventListener("click", syncContacts);
+
+    qs("#memory-search-btn").addEventListener("click", loadMemory);
+    qs("#memory-search").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") { e.preventDefault(); loadMemory(); }
+    });
+
+    qs("#new-job-form").addEventListener("submit", handleNewJobSubmit);
+    qs("#job-kind").addEventListener("change", updateJobKindFields);
+
+    qs("#llm-refresh-btn").addEventListener("click", refreshLlmHealth);
+
+    qs("#autonomy-save-btn").addEventListener("click", saveAutonomy);
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    bindStaticEvents();
+    updateJobKindFields();
+    checkAuth();
+  });
+})();
+</script>
+
+</body>
+</html>

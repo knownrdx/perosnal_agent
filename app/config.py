@@ -35,6 +35,14 @@ class Settings(BaseSettings):
     api_port: int = 8080
     api_token: str = ""
 
+    # --- web ui (browser dashboard, session-cookie auth) -------------------
+    # Empty disables web UI login entirely (matches the api_token pattern).
+    web_ui_password: str = ""
+    # Signs session cookies. If empty at startup, a random one is generated
+    # and persisted to a file under the workspace dir (see app/api.py), the
+    # same way app/security/vault.py persists its Fernet key.
+    web_ui_session_secret: str = ""
+
     # --- database ---------------------------------------------------------
     database_url: str = "postgresql+asyncpg://agent:agent@postgres:5432/agent"
     db_echo: bool = False

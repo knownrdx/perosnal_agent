@@ -1,29 +1,54 @@
-Attach an uploaded file to the very next instruction automatically
+Web dashboard: cookie-authed control surface at /ui behind agent.dubaivpn.xyz
 
-The owner sent a .txt file, then in a separate message said "add these
-numbers to @PBDxbot". The agent had no idea a file existed - task_create
-only ever saw the text of the instruction, never what had been uploaded
-moments earlier - so it stalled on WAITING_FOR_USER asking which file.
+The Telegram interface works well for conversational control, but the owner
+wants a real dashboard - click a button instead of remembering slash-command
+syntax, see everything at once instead of scrolling chat history.
 
-Telegram splits "here's a file" and "here's what to do with it" into two
-messages by design (you cannot caption a document with your real intent
-and expect an agent to parse that intent out of a caption reliably), so the
-fix has to bridge them without the owner repeating the path back.
+Cookie auth alongside the existing token
 
-The document handler already had nowhere to put "I just saved this" other
-than a reply string. Now it also writes {"pending_upload": {path, name}}
-onto the chat session's JSON context - the same context row conversation.py
-already reads every turn for mode/active-task state. handle_message folds
-it into the new task's request as a bracketed [Attached file: ...] note
-and clears it immediately, so a later unrelated task never inherits a
-stale reference. /reply gets the identical treatment, since a task sitting
-in WAITING_FOR_USER asking "which file?" is exactly the case this exists
-to prevent.
+The existing X-API-Token header is fine for scripts but wrong for a browser:
+shipping a long-lived secret into client-side JS defeats the point of having
+one. Added a parallel auth path - POST /api/auth/login with a password sets
+an HttpOnly signed session cookie (stdlib hmac+base64+json, no new
+dependency, no JWT library); require_api_access accepts either the header or
+the cookie, so nothing that already used the token breaks. WEB_UI_PASSWORD
+unset means no valid cookie can ever exist, so a token-only deployment is
+unaffected by any of this. The session-signing secret persists to a file
+under the workspace the same way vault.py's Fernet key does, so a redeploy
+does not invalidate every open session.
 
-Two new tests prove both directions: the attach happens when a pending
-upload exists, and requests are left untouched (no phantom "[Attached
-file: ...]" text) when there isn't one - a chat asking to search the web
-right after an unrelated upload from days ago must not silently pull that
-old file in.
+New read/control endpoints backing the dashboard
 
-548 tests (2 new), full suite green.
+Contacts, skills, memory search, scheduled jobs (list/create/delete),
+autonomy level, WhatsApp/Teams/Telegram-account connection status - all of
+it already existed as Telegram commands or internal repo functions; these
+endpoints expose the same operations over HTTP so the dashboard has
+something to call.
+
+One HTML file, no build step
+
+app/webui/index.html - inline CSS and JS, zero external requests, dark
+theme, nine panels (tasks, approvals, contacts, skills, memory, jobs, LLM,
+bridges, settings). Mounted at /ui via StaticFiles; the login gate is
+client-side (checks /api/auth/me on load), every actual API call is still
+independently authenticated server-side.
+
+Reverse proxy + domain
+
+The agent's port was loopback-only, correct for a bare VPS but useless
+behind a domain. Added an nginx container (both 80 and 443 - Cloudflare's
+"Full" SSL mode connects to the origin over HTTPS, and a self-signed cert is
+sufficient since Cloudflare doesn't validate the origin chain in that mode)
+proxying agent.dubaivpn.xyz to the agent container. nginx defaulted to
+spawning one worker per host CPU (auto), which on an 8-core box under a
+0.3-CPU container limit caused severe CFS throttling - requests hung rather
+than erroring. Pinned worker_processes to 1.
+
+Also fixed: the LLM health probe inside /health had no timeout, so a
+gateway that hangs instead of failing fast made every health check -
+including nginx's own and the domain's first byte - wait on it. Wrapped in
+asyncio.wait_for(5s); a slow/dead LLM now reports unhealthy quickly instead
+of making the whole health endpoint slow.
+
+558 tests (12 new), smoke 10/10. Live-verified: https://agent.dubaivpn.xyz/health
+resolves through Cloudflare to the VPS.
