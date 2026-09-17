@@ -823,10 +823,22 @@ def create_app() -> FastAPI:
         # elsewhere an upload is just an attachment for the next instruction.
         queued = False
         countries: dict[str, int] = {}
+        auto_started: dict[str, Any] | None = None
         if await otp_bot.is_otp_thread(chat_id):
             analysis = await otp_bot.enqueue_file(rel, safe_name)
             countries = analysis["countries"]
             queued = True
+            # An upload into this thread means "run it"; only files still
+            # waiting on a tag hold it back.
+            started = await otp_bot.maybe_auto_start()
+            if started is not None:
+                auto_started = {
+                    "ok": started["ok"],
+                    "error": started.get("error", ""),
+                    "summary": (
+                        otp_bot.format_start_result(started) if started["ok"] else ""
+                    ),
+                }
 
         return {
             "saved": True,
@@ -834,6 +846,7 @@ def create_app() -> FastAPI:
             "name": safe_name,
             "queued_for_otpbot": queued,
             "countries": countries,
+            "auto_started": auto_started,
         }
 
     @app.get("/api/chat/pending_upload", dependencies=[Depends(require_api_access)])

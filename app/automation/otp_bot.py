@@ -87,6 +87,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "delete_when_done": False,
     "delete_done_command": "/frcd {country} {uid}",
     "thread_id": "",             # dedicated chat thread; "" = not bound yet
+    # A file dropped in the thread is a request to run it. Asking "shall I
+    # start?" after every upload is the owner repeating themselves.
+    "auto_start": True,
+    # Before adding, read the bot's own stock: a country that already holds
+    # numbers does not need them sent again (the bot answers such an add with
+    # pure duplicates). Monitoring still starts, so the refill happens the
+    # moment it actually runs out.
+    "skip_add_if_stocked": True,
     "awaiting_tag_entry_id": None,  # set while a "what tag for X" prompt is pending
 }
 
@@ -312,6 +320,16 @@ SETTABLE_FIELDS: dict[str, dict[str, Any]] = {
         "type": "str",
         "label": "Delete-when-done command ({country}, {uid})",
         "example": "/frcd {country} {uid}",
+    },
+    "auto_start": {
+        "type": "bool",
+        "label": "Start by itself when a file is uploaded",
+        "example": "on / off",
+    },
+    "skip_add_if_stocked": {
+        "type": "bool",
+        "label": "Skip the add when the country already has stock",
+        "example": "on / off",
     },
     "stop_at": {
         "type": "time",
@@ -1267,6 +1285,35 @@ async def refresh_countries_from_bot() -> dict[str, Any]:
         return {"ok": False, "error": f"unexpected error ({type(exc).__name__}): {exc}", "countries": {}}
 
 
+async def _stock_snapshot(target: str, cfg: dict[str, Any]) -> dict[str, int]:
+    """Current per-country stock, or {} if the bot did not answer.
+
+    Returning {} rather than raising keeps a failed read from blocking a
+    start: worst case the add happens when it might not have been needed,
+    which is far better than refusing to run at all.
+    """
+    try:
+        before = await _last_bot_message(target)
+        before_id = int(before.get("id", 0)) if before else None
+        sent = await get_userbot().send_message(target, cfg["quota_command"])
+        reply = await _wait_for_new_bot_reply(
+            target,
+            after_id=before_id,
+            timeout_s=45.0,
+            matches=lambda text: bool(_parse_country_stock(text)),
+        )
+        if cfg.get("tidy_stock_messages", True):
+            await _tidy_messages(target, [sent.get("message_id"), (reply or {}).get("id")])
+        if reply is None:
+            return {}
+        stock = _parse_country_stock(reply["text"])
+        await learn_countries(stock)
+        return stock
+    except Exception:  # noqa: BLE001 - a failed read must not block the start
+        log.exception("otp_bot_stock_snapshot_error")
+        return {}
+
+
 async def start_automation() -> dict[str, Any]:
     """Consume every queued (and tagged) file: cleanup once, then add each
     file as its own reply-based command. On success the queue becomes the
@@ -1299,33 +1346,85 @@ async def start_automation() -> dict[str, Any]:
     result: dict[str, Any] = {"ok": False, "target_bot": target, "files": [], "error": "", "ran_at": _now_iso()}
 
     try:
-        await get_userbot().send_message(target, cfg["cleanup_command"])
-        await _sleep(2)
+        # Read the bot's own stock once, before adding anything. A country
+        # that is already stocked does not need the same numbers sent again -
+        # the bot answers that with pure duplicates and the file is burned
+        # for nothing. Monitoring still starts, so the file is added the
+        # moment the country actually runs out.
+        stock: dict[str, int] = {}
+        if cfg.get("skip_add_if_stocked", True):
+            stock = await _stock_snapshot(target, cfg)
 
+        needs_add: list[dict[str, Any]] = []
         for entry in queue:
+            country = entry.get("country") or entry["name"]
+            entry_cfg = await otp_schedule.effective_config(country, cfg)
+            have = _stock_for(stock, country) if stock else None
+            threshold = int(entry_cfg.get("quota_threshold") or 0)
+            if have is not None and have > threshold:
+                # Already stocked: hold the file, watch the country.
+                entry["skipped_add"] = True
+                entry["stock_at_start"] = have
+                result["files"].append({
+                    "name": entry["name"],
+                    "country": entry.get("country"),
+                    "count": entry.get("count"),
+                    "tag": entry["tag"],
+                    "interval_minutes": entry_cfg.get("interval_minutes"),
+                    "added": False,
+                    "stock": have,
+                    "reply": f"already has {have:,} - kept for when it runs out",
+                })
+            else:
+                entry.pop("skipped_add", None)
+                needs_add.append(entry)
+
+        # Only tidy up if something is actually going to be added; otherwise
+        # this is a pointless command in a chat the owner reads.
+        if needs_add:
+            await get_userbot().send_message(target, cfg["cleanup_command"])
+            await _sleep(2)
+
+        for entry in needs_add:
             country = entry.get("country") or entry["name"]
             # Each country runs on its own settings from the very first add,
             # not just from the second cycle onwards.
             entry_cfg = await otp_schedule.effective_config(country, cfg)
             reply = await _add_one_file(target, entry, entry_cfg)
-            await otp_schedule.arm_country(
-                country, int(entry_cfg.get("interval_minutes", 10))
-            )
-            # Fresh run: the refill count and the time limit both start now,
-            # not from whenever this country last ran.
-            await otp_schedule.begin_run(country)
             result["files"].append({
                 "name": entry["name"],
                 "country": entry.get("country"),
                 "count": entry.get("count"),
                 "tag": entry["tag"],
                 "interval_minutes": entry_cfg.get("interval_minutes"),
+                "added": True,
+                "stock": _stock_for(stock, country) if stock else None,
                 "reply": reply,
             })
 
+        # Arm every country, added or not: the whole point of skipping an add
+        # is that monitoring still runs and refills it later.
+        for entry in queue:
+            country = entry.get("country") or entry["name"]
+            entry_cfg = await otp_schedule.effective_config(country, cfg)
+            await otp_schedule.arm_country(
+                country, int(entry_cfg.get("interval_minutes", 10))
+            )
+            # Fresh run: the refill count and the time limit both start now,
+            # not from whenever this country last ran.
+            await otp_schedule.begin_run(country)
+
         await save_config({"enabled": True, "awaiting_tag_entry_id": None})
-        await _save_files(ACTIVE_KEY, queue)
+        # MERGE into the active set, never replace it. A second upload used to
+        # wipe every country already running - the owner adds Nigeria and
+        # silently loses the Bangladesh run started an hour ago. A new file
+        # for a country already running supersedes that country's entry only.
+        existing = await get_active_files()
+        fresh_countries = {(e.get("country") or e["name"]) for e in queue}
+        kept = [e for e in existing if (e.get("country") or e["name"]) not in fresh_countries]
+        await _save_files(ACTIVE_KEY, kept + queue)
         await _save_files(QUEUE_KEY, [])
+        result["kept_running"] = [e.get("country") or e["name"] for e in kept]
         # Surfaced so the owner is told up front when this run will end -
         # a silent finish minutes later looks identical to a crash.
         result["limits"] = {
@@ -1351,6 +1450,31 @@ async def start_automation() -> dict[str, Any]:
 
     async with session_scope() as session:
         await repo.set_setting(session, LAST_START_KEY, result)
+    return result
+
+
+async def maybe_auto_start() -> dict[str, Any] | None:
+    """Start by itself once every queued file knows its tag.
+
+    A file dropped into the OTP thread is a request to run it - making the
+    owner type "start" afterwards is asking a question whose answer is
+    always yes. Returns None when it did not act, so callers can fall back
+    to their normal "queued, say start" reply.
+    """
+    cfg = await get_config()
+    if not cfg.get("auto_start", True):
+        return None
+
+    queue = await get_queue()
+    if not queue:
+        return None
+    # A file still waiting on its tag is not ready; the tag answer itself
+    # calls back in here once it lands.
+    if any(not e.get("tag") for e in queue):
+        return None
+
+    result = await start_automation()
+    result["auto"] = True
     return result
 
 
@@ -1489,14 +1613,27 @@ async def _notify_owner(text: str) -> None:
 
 
 def _format_start_success(result: dict[str, Any]) -> str:
-    lines = [
-        f"\u2705 Shuru hoye geche - {len(result['files'])} file(s) add kora hoyeche "
-        f"{result['target_bot']}-e."
-    ]
-    for f in result["files"]:
+    added = [f for f in result["files"] if f.get("added", True)]
+    held = [f for f in result["files"] if not f.get("added", True)]
+
+    head = "\u2705 Auto-start" if result.get("auto") else "\u2705 Shuru hoye geche"
+    lines = [f"{head} - {len(added)} file add kora holo {result['target_bot']}-e."]
+    for f in added:
         country = f.get("country") or "?"
         lines.append(f"  {country} - {f['count']} number (tag: {f['tag']})")
-        lines.append(f"     {f['reply'][:150]}")
+        lines.append(f"     {str(f['reply'])[:150]}")
+    # Files held back are not failures - the country already had numbers, so
+    # sending them now would only produce duplicates. Say so plainly, or it
+    # reads as "my file was ignored".
+    for f in held:
+        country = f.get("country") or "?"
+        lines.append(
+            f"  \u23F8 {country} - {f['count']} number rakha holo "
+            f"(bot e ekhon {f.get('stock', 0):,} ache)"
+        )
+        lines.append("     Shesh hoar shathe shathe auto add hobe.")
+    if result.get("kept_running"):
+        lines.append(f"  \u267B\uFE0F Age theke cholche: {', '.join(result['kept_running'])}")
     lines.append("")
     # State the finish conditions explicitly. A run that stops on its own is
     # correct behaviour, but only if the owner knows it will - otherwise it
@@ -1519,6 +1656,11 @@ def _format_start_success(result: dict[str, Any]) -> str:
         "Periodically stock check hobe, khali hole nijei cleanup+re-add korbe."
     )
     return "\n".join(lines)
+
+
+def tag_question(entry: dict[str, Any]) -> str:
+    """Public wrapper for the tag prompt (used by the upload handlers)."""
+    return _tag_question(entry)
 
 
 def _tag_question(entry: dict[str, Any]) -> str:
@@ -1564,6 +1706,12 @@ async def handle_start_trigger() -> str:
         await _notify_owner(f"\U0001F7E2 OTP-bot automation started.\n\n{text}")
         return text
     return f"\u274C Start korte parlam na: {result['error']}"
+
+
+def format_start_result(result: dict[str, Any]) -> str:
+    """Public wrapper: callers outside this module format a start result
+    through here rather than reaching for the private helper."""
+    return _format_start_success(result)
 
 
 async def _continue_after_tagging(prefix: str) -> str:

@@ -1411,10 +1411,29 @@ class AgentBot:
                 queue = await otp_bot.get_queue()
                 lines += [
                     "",
-                    f"Queued ({len(queue)} entr{'y' if len(queue) == 1 else 'ies'} total). "
-                    "Send more files, then tap Start when you're finished.",
+                    f"Queued ({len(queue)} entr{'y' if len(queue) == 1 else 'ies'} total).",
                 ]
                 cfg = await otp_bot.get_config()
+
+                # A file dropped in this thread is a request to run it, so
+                # run it - but only once nothing is still waiting on a tag.
+                # Untagged entries ask their question first and auto-start
+                # from the tag answer instead.
+                started = await otp_bot.maybe_auto_start()
+                if started is not None:
+                    if started["ok"]:
+                        lines += ["", otp_bot.format_start_result(started)]
+                    else:
+                        lines += ["", f"\u274C Auto-start failed: {started['error']}"]
+                    cfg = await otp_bot.get_config()
+                elif any(not e.get("tag") for e in queue):
+                    pending = await otp_bot.next_untagged_entry()
+                    if pending is not None:
+                        await otp_bot.set_awaiting_tag_entry(pending["id"])
+                        lines += ["", otp_bot.tag_question(pending)]
+                else:
+                    lines.append("Send more files, then tap Start when you're finished.")
+
                 await message.answer(
                     "\n".join(lines),
                     reply_markup=otp_panel.control_keyboard(bool(cfg["enabled"])),

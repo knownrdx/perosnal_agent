@@ -1020,6 +1020,175 @@ async def test_the_owner_is_told_when_a_run_finishes(environment):
 
 
 # --------------------------------------------------------------------------- #
+# A new upload must not cancel what is already running
+# --------------------------------------------------------------------------- #
+async def _queue_tagged(name: str, prefix: str, tag: str) -> None:
+    """Queue one country's file with its tag already decided."""
+    rel = await _write_numbers_file(name, prefix)
+    result = await otp_bot.enqueue_file(rel, name)
+    for entry in result["entries"]:
+        await otp_bot.set_queue_tag(entry["id"], tag)
+
+
+async def test_a_new_file_keeps_the_countries_already_running(environment):
+    """The reported bug: uploading a second file wiped every country that was
+    already active, so an overnight Bangladesh run vanished the moment a
+    Nigeria file arrived.
+    """
+    set_userbot(FakeUserbot([{"text": "\u2705 2 added", "out": False}] * 8))
+    await _queue_tagged("bd.txt", "+880", "WA")
+    await otp_bot.start_automation()
+    assert {e["country"] for e in await otp_bot.get_active_files()} == {"Bangladesh"}
+
+    # A completely separate upload, later.
+    await _queue_tagged("ng.txt", "+234", "TG")
+    await otp_bot.start_automation()
+
+    running = {e["country"] for e in await otp_bot.get_active_files()}
+    assert running == {"Bangladesh", "Nigeria"}
+
+
+async def test_a_new_file_for_a_running_country_replaces_that_country_only(environment):
+    """Re-uploading Bangladesh should swap Bangladesh's file, not duplicate
+    it and not touch Nigeria.
+    """
+    set_userbot(FakeUserbot([{"text": "\u2705 2 added", "out": False}] * 10))
+    await _queue_tagged("bd.txt", "+880", "WA")
+    await _queue_tagged("ng.txt", "+234", "TG")
+    await otp_bot.start_automation()
+
+    await _queue_tagged("bd2.txt", "+880", "WA")
+    await otp_bot.start_automation()
+
+    active = await otp_bot.get_active_files()
+    assert sorted(e["country"] for e in active) == ["Bangladesh", "Nigeria"]
+    bd = [e for e in active if e["country"] == "Bangladesh"]
+    assert len(bd) == 1
+    assert "bd2" in bd[0]["name"]
+
+
+# --------------------------------------------------------------------------- #
+# Auto-start, and not re-sending numbers a country already has
+# --------------------------------------------------------------------------- #
+async def test_an_upload_starts_by_itself_when_the_tag_is_known(environment):
+    """No "start" needed: the file knows its tag, so it runs."""
+    set_userbot(FakeUserbot([{"text": "\u2705 2 added", "out": False}] * 4))
+    await otp_bot.save_config({"default_tag": "WA"})
+    rel = await _write_numbers_file("bd.txt", "+880")
+    await otp_bot.enqueue_file(rel, "bd.txt")
+
+    started = await otp_bot.maybe_auto_start()
+
+    assert started is not None and started["ok"] is True
+    assert (await otp_bot.get_config())["enabled"] is True
+    assert {e["country"] for e in await otp_bot.get_active_files()} == {"Bangladesh"}
+
+
+async def test_an_untagged_upload_waits_for_its_answer(environment):
+    """Starting with an unknown tag would file the numbers under the wrong
+    service, so this one case still asks.
+    """
+    set_userbot(FakeUserbot([]))
+    rel = await _write_numbers_file("mystery.txt", "+880")
+    await otp_bot.enqueue_file(rel, "mystery.txt")
+
+    assert await otp_bot.maybe_auto_start() is None
+    assert (await otp_bot.get_config())["enabled"] is False
+
+
+async def test_auto_start_can_be_turned_off(environment):
+    set_userbot(FakeUserbot([]))
+    await otp_bot.save_config({"default_tag": "WA", "auto_start": False})
+    rel = await _write_numbers_file("bd.txt", "+880")
+    await otp_bot.enqueue_file(rel, "bd.txt")
+
+    assert await otp_bot.maybe_auto_start() is None
+    assert (await otp_bot.get_config())["enabled"] is False
+
+
+async def test_a_stocked_country_is_watched_not_re_added(environment):
+    """Central African Republic already holds 90712 numbers in the real /st
+    reply. Sending the file now would return pure duplicates and burn it, so
+    it is held back - but the country is still monitored so it refills when
+    it empties.
+    """
+    fake = FakeUserbot([{"text": REAL_ST_REPLY, "out": False}])
+    set_userbot(fake)
+
+    await _queue_tagged("car.txt", "+236", "WA")
+    result = await otp_bot.start_automation()
+
+    assert result["ok"] is True
+    held = [f for f in result["files"] if not f["added"]]
+    assert len(held) == 1
+    assert held[0]["country"] == "Central African Republic"
+    assert held[0]["stock"] == 90712
+    # Held, not discarded: still active and still scheduled.
+    assert len(await otp_bot.get_active_files()) == 1
+    # Nothing was added: no file was ever sent.
+    assert fake.sent_files == []
+
+
+async def test_an_empty_country_is_added_immediately(environment):
+    """Bangladesh reads 0 in the same reply, so its file goes in now."""
+    fake = FakeUserbot([
+        {"text": REAL_ST_REPLY, "out": False},
+        {"text": "\u2705 2 added, 0 duplicates skipped", "out": False},
+    ])
+    set_userbot(fake)
+
+    await _queue_tagged("bd.txt", "+880", "WA")
+    result = await otp_bot.start_automation()
+
+    assert result["ok"] is True
+    assert [f["added"] for f in result["files"]] == [True]
+    assert fake.sent_files != []
+
+
+async def test_the_stock_check_can_be_turned_off(environment):
+    """With the check disabled the file is added regardless of stock."""
+    await otp_bot.save_config({"skip_add_if_stocked": False})
+    fake = FakeUserbot([{"text": "\u2705 2 added, 0 duplicates skipped", "out": False}])
+    set_userbot(fake)
+
+    await _queue_tagged("car.txt", "+236", "WA")
+    result = await otp_bot.start_automation()
+
+    assert [f["added"] for f in result["files"]] == [True]
+    assert fake.sent_files != []
+
+
+async def test_a_failed_stock_read_does_not_block_the_start(environment):
+    """If the bot never answers /st, adding anyway is better than refusing
+    to run - the worst case is duplicates, not a dead automation.
+    """
+    fake = FakeUserbot([
+        {"text": "something unrelated", "out": False},
+        {"text": "\u2705 2 added, 0 duplicates skipped", "out": False},
+    ])
+    set_userbot(fake)
+
+    await _queue_tagged("bd.txt", "+880", "WA")
+    result = await otp_bot.start_automation()
+
+    assert result["ok"] is True
+    assert [f["added"] for f in result["files"]] == [True]
+
+
+async def test_the_start_message_explains_a_held_file(environment):
+    """"Held" must not read as "ignored"."""
+    set_userbot(FakeUserbot([{"text": REAL_ST_REPLY, "out": False}]))
+
+    await _queue_tagged("car.txt", "+236", "WA")
+    result = await otp_bot.start_automation()
+    text = otp_bot.format_start_result(result)
+
+    assert "Central African Republic" in text
+    assert "90,712" in text
+    assert "auto add hobe" in text
+
+
+# --------------------------------------------------------------------------- #
 # Keeping the chat clean: the stock check is bookkeeping, not conversation
 # --------------------------------------------------------------------------- #
 class _DeletingBot(FakeUserbot):
@@ -1367,6 +1536,10 @@ async def test_start_asks_for_missing_tags_before_running(environment):
 
 
 async def test_start_sends_cleanup_then_reply_based_add_per_file(environment):
+    # This test is about the add mechanics (cleanup first, then file + reply
+    # command), so the stock pre-check is turned off - with it on, the first
+    # message sent is /st and the sequence under test starts one later.
+    await otp_bot.save_config({"skip_add_if_stocked": False})
     rel = await _write_numbers_file("numbers_BD.txt")
     entry = await _enqueue_single(rel, "numbers_BD.txt")
     assert entry["tag"] == "BD"  # inferred, start() should proceed with no prompt
@@ -1423,6 +1596,9 @@ async def test_add_waits_for_a_new_reply_not_the_previous_one(environment, monke
     was reported with the /useddelete reply ("Deleted 4,796 used numbers")
     instead of its own confirmation.
     """
+    # About the add's reply-waiting only; the stock pre-check would add an
+    # unrelated /st round-trip to this hand-rolled bot.
+    await otp_bot.save_config({"skip_add_if_stocked": False})
     rel = await _write_numbers_file("numbers_BD.txt")
     await otp_bot.enqueue_file(rel, "numbers_BD.txt")
 

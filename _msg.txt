@@ -1,45 +1,49 @@
-Per-country on/off and a wall-clock stop time, in Dubai time
+Uploads start themselves, and stop cancelling the runs already going
 
-Turning one country off meant deleting it and losing its file; stopping at a
-particular hour was not expressible at all - only "after N minutes", which
-is what ended an overnight run three minutes after it began.
+Three problems, all on the path between "owner drops a file" and "numbers
+are actually in the bot".
 
-Pause / resume per country
-  set_paused keeps the file, the tag and every setting and simply skips the
-  country until it is resumed. Distinct from removal, which throws the file
-  away. A paused country's timer is not advanced while it is off, and
-  resuming re-arms from now, so a country paused for hours does not fire the
-  instant it comes back just because its old due time went by.
+A new upload cancelled everything already running
+  start_automation wrote the queue over the active set. Uploading a Nigeria
+  file therefore silently ended the Bangladesh run started an hour earlier -
+  the countries simply disappeared from the active list with no message.
+  The active set is now MERGED: countries not in the new upload keep
+  running, and a new file for a country already running supersedes that
+  country's entry only, rather than being added alongside it as a duplicate.
 
-Stop at a time of day
-  stop_at is a wall-clock "HH:MM" in Dubai time, stored as a string rather
-  than a timestamp so "stop at 23:30" keeps meaning 23:30 on whatever day
-  the run is still going, instead of expiring after the first night.
+Uploading meant nothing until "start" was typed
+  A file dropped in the OTP thread is a request to run it; asking "shall I
+  start?" afterwards is a question whose answer is always yes. An upload now
+  starts by itself, from both Telegram and the web dashboard.
 
-  It is compared against the run's START, not against "today": a run begun
-  at 22:00 with a 01:00 stop ends at 01:00 the NEXT day. Comparing to today
-  would finish an overnight run immediately - the exact case this is for.
+  The one case that still asks is a file whose tag is unknown - starting
+  with a guessed tag would file the numbers under the wrong service, which
+  is not recoverable from this side. That path already auto-started from the
+  tag answer, so the question is asked once and the run follows immediately.
+  Switch the whole behaviour off with auto_start.
 
-  Dubai is UTC+4 year-round, so a fixed offset is exact and needs no tzdata
-  in the container.
+Re-adding numbers a country already had
+  Adding a file to a country that is already stocked produces nothing but
+  duplicates (live: 46,588 of them) and burns the file. Start now reads the
+  bot's own /st once, up front, and holds back any country whose stock is
+  above its restock point - the file stays queued and the country stays
+  monitored, so it goes in the moment it actually runs out.
 
-Show the clock
-  The server thinks in UTC, the owner reads Dubai time, and a stop time
-  picked against the wrong one is four hours out. Both are now shown
-  wherever a time is chosen: the Telegram settings list, the stop-time
-  prompt, and above the web schedule table.
+  A country's own restock point is used, not a global one, so a country set
+  to refill at 200 is topped up at 200 here too.
 
-  Input is forgiving ("2330", "23.30", "9:05") but validated - "25:00"
-  stored unvalidated would simply never fire and look like a broken
-  feature. The web form posts free text, so it goes through the same
-  validation as the chat command rather than trusting the browser.
+  If the stock read fails the add proceeds anyway: the worst case is
+  duplicates, whereas refusing to start is a dead automation. The cleanup
+  command is skipped entirely when nothing is going to be added, so a start
+  that holds every file leaves no trace in the chat.
 
-Both UIs: Telegram gets a country on/off picker, per-country off/remove
-buttons and a stop-time keyboard (six common times, custom, or never); the
-web schedule table gets a Turn on/off button and a time field per row.
+  Held files are reported as held, with the current stock and "auto add
+  hobe" - "ignored" and "held" look identical otherwise.
 
-Note: app/webui/index.html was briefly truncated to 0 bytes by a failed
-scripted edit (a lone surrogate in the replacement text raised mid-write)
-and was restored from git before being re-edited through the patch tool.
+format_start_result and tag_question are public wrappers so the Telegram and
+API upload handlers stop reaching for the private helpers.
 
-738 passing, smoke 10/10.
+Two existing tests turn the new pre-check off: they assert the exact message
+sequence of an add, which now legitimately begins with /st.
+
+748 passing, smoke 10/10.
