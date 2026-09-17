@@ -65,6 +65,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # reply, so a single round-trip answers for every country being run
     # instead of needing one check each.
     "quota_command": "/st",
+    # Delete the stock command and its reply after reading them. On a short
+    # interval this traffic otherwise buries the chat the owner reads.
+    "tidy_stock_messages": True,
     "quota_threshold": 0,        # refill when active quota <= this
     "cleanup_command": "/useddelete",
     # Force-delete (Owner-level "/frcd <country> <uid>"). /useddelete only
@@ -310,6 +313,11 @@ SETTABLE_FIELDS: dict[str, dict[str, Any]] = {
         "label": "Delete-when-done command ({country}, {uid})",
         "example": "/frcd {country} {uid}",
     },
+    "tidy_stock_messages": {
+        "type": "bool",
+        "label": "Delete the stock command + reply after each check",
+        "example": "on / off",
+    },
     "default_tag": {
         "type": "str",
         "label": "Default service (blank = ask/auto)",
@@ -371,7 +379,27 @@ async def set_setting_from_chat(key: str, raw: str) -> str:
     value = coerce_setting(key, raw)
     await save_config({key: value})
     shown = "on" if value is True else "off" if value is False else (value or "(blank)")
-    return f"\u2705 {key} = {shown}"
+    line = f"\u2705 {key} = {shown}"
+
+    # These two silently END a run, and a small number is very easy to read
+    # as "every N" rather than "stop after N". Saying so at the moment it is
+    # set is the difference between a deliberate short run and waking up to
+    # a task that stopped minutes after you went to bed.
+    if key == "run_minutes" and value:
+        line += (
+            f"\n\u26A0\uFE0F Mane: shuru hoar {value} min por task NIJEI BONDHO hobe."
+            "\n   Sara raat chalate chaile: /otpset run_minutes 0"
+        )
+    if key == "max_refills" and value:
+        line += (
+            f"\n\u26A0\uFE0F Mane: {value} bar re-add er por task NIJEI BONDHO hobe."
+            "\n   Limit chara chalate chaile: /otpset max_refills 0"
+        )
+    if key == "delete_when_done" and value is True:
+        line += (
+            "\n\u26A0\uFE0F Task shesh hole oi country-r number bot theke MUCHE jabe."
+        )
+    return line
 
 
 async def describe_settings() -> str:
@@ -1052,6 +1080,26 @@ async def _force_delete_country(target: str, country: str, cfg: dict[str, Any]) 
     return (reply.get("text") or "") if reply else ""
 
 
+async def _tidy_messages(target: str, message_ids: list[int | None]) -> None:
+    """Remove the automation's own bookkeeping messages from the chat.
+
+    Only ever called with ids this code sent or read back itself, and never
+    allowed to fail a run: keeping the chat clean is cosmetic, whereas
+    losing a cycle over it is not.
+    """
+    ids = [int(m) for m in message_ids if m]
+    if not ids:
+        return
+    try:
+        userbot = get_userbot()
+        deleter = getattr(userbot, "delete_messages", None)
+        if deleter is None:
+            return
+        await deleter(target, ids)
+    except Exception:  # noqa: BLE001 - tidying is cosmetic
+        log.warning("otp_bot_tidy_failed", extra={"ids": ids})
+
+
 async def _finish_country(
     target: str, entry: dict[str, Any], cfg: dict[str, Any], reason: str
 ) -> dict[str, Any]:
@@ -1161,13 +1209,15 @@ async def refresh_countries_from_bot() -> dict[str, Any]:
     try:
         before = await _last_bot_message(target)
         before_id = int(before.get("id", 0)) if before else None
-        await get_userbot().send_message(target, cfg["quota_command"])
+        sent = await get_userbot().send_message(target, cfg["quota_command"])
         reply = await _wait_for_new_bot_reply(
             target,
             after_id=before_id,
             timeout_s=45.0,
             matches=lambda text: bool(_parse_country_stock(text)),
         )
+        if cfg.get("tidy_stock_messages", True):
+            await _tidy_messages(target, [sent.get("message_id"), (reply or {}).get("id")])
         if reply is None:
             return {"ok": False, "error": "no stock reply from the bot", "countries": {}}
 
@@ -1240,6 +1290,13 @@ async def start_automation() -> dict[str, Any]:
         await save_config({"enabled": True, "awaiting_tag_entry_id": None})
         await _save_files(ACTIVE_KEY, queue)
         await _save_files(QUEUE_KEY, [])
+        # Surfaced so the owner is told up front when this run will end -
+        # a silent finish minutes later looks identical to a crash.
+        result["limits"] = {
+            "max_refills": int(cfg.get("max_refills") or 0),
+            "run_minutes": int(cfg.get("run_minutes") or 0),
+            "delete_when_done": bool(cfg.get("delete_when_done")),
+        }
         result["ok"] = True
 
     except UserbotError as exc:
@@ -1405,9 +1462,25 @@ def _format_start_success(result: dict[str, Any]) -> str:
         lines.append(f"  {country} - {f['count']} number (tag: {f['tag']})")
         lines.append(f"     {f['reply'][:150]}")
     lines.append("")
+    # State the finish conditions explicitly. A run that stops on its own is
+    # correct behaviour, but only if the owner knows it will - otherwise it
+    # reads as "the automation broke overnight".
+    limits = result.get("limits") or {}
+    max_refills, run_minutes = limits.get("max_refills"), limits.get("run_minutes")
+    if max_refills or run_minutes:
+        parts = []
+        if max_refills:
+            parts.append(f"{max_refills} bar re-add")
+        if run_minutes:
+            parts.append(f"{run_minutes} min")
+        lines.append(f"\u26A0\uFE0F Ei task {' othoba '.join(parts)} por NIJEI BONDHO hobe.")
+        if limits.get("delete_when_done"):
+            lines.append("   Tarpor oi country-r number bot theke muche jabe.")
+        lines.append("   Limit chara chalate: /otpset run_minutes 0, /otpset max_refills 0")
+    else:
+        lines.append("\u267E\uFE0F Kono time/count limit nai - 'stop' na bola porjonto cholbe.")
     lines.append(
-        "Ekhon periodically quota check hobe, quota shesh hole nijei cleanup+re-add "
-        "korbe. 'off' bolle bondho hobe."
+        "Periodically stock check hobe, khali hole nijei cleanup+re-add korbe."
     )
     return "\n".join(lines)
 
@@ -1611,7 +1684,7 @@ async def run_cycle(config: dict[str, Any] | None = None, *, force: bool = False
         before_quota = await _last_bot_message(target)
         before_quota_id = int(before_quota.get("id", 0)) if before_quota else None
 
-        await get_userbot().send_message(target, cfg["quota_command"])
+        sent_stock = await get_userbot().send_message(target, cfg["quota_command"])
         # Only a message that actually carries per-country stock counts as
         # the answer: the bot also posts its own add/progress notices, and
         # one of those arriving first previously produced a misread.
@@ -1621,6 +1694,17 @@ async def run_cycle(config: dict[str, Any] | None = None, *, force: bool = False
             timeout_s=45.0,
             matches=lambda text: bool(_parse_country_stock(text)) or _parse_quota(text) is not None,
         )
+
+        # Tidy up the check itself: the stock command and its reply are
+        # bookkeeping, and on a 2-minute interval they bury the chat the
+        # owner actually reads. Done after the reply is captured, so the
+        # data is already in hand.
+        if cfg.get("tidy_stock_messages", True):
+            await _tidy_messages(
+                target,
+                [sent_stock.get("message_id"), (stock_msg or {}).get("id")],
+            )
+
         if stock_msg is None:
             result.error = (
                 f"no reply from {target} to {cfg['quota_command']} "

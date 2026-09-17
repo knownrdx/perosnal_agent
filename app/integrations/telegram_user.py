@@ -523,6 +523,28 @@ class TelegramUserbot:
         sent = await client.send_file(entity, path, caption=caption or None, reply_to=reply_to)
         return {"sent": True, "message_id": sent.id, "to": str(target)}
 
+    async def delete_messages(self, target: str, message_ids: list[int]) -> dict[str, Any]:
+        """Delete messages in a chat, for everyone where the API allows it.
+
+        Used to keep an automation's own command traffic out of a chat the
+        owner also reads by hand. Never raises for a message that is already
+        gone or too old to delete - the caller only wants it absent.
+        """
+        if not message_ids:
+            return {"deleted": 0}
+        client = await self.client()
+        try:
+            if self._backend == BACKEND_PYROGRAM:
+                peer = self._resolve_pyrogram(target)
+                await client.delete_messages(peer, message_ids, revoke=True)
+            else:
+                entity = await self._resolve(client, target)
+                await client.delete_messages(entity, message_ids, revoke=True)
+        except Exception as exc:  # noqa: BLE001 - tidying up must never break a run
+            log.warning("userbot_delete_failed", extra={"error": str(exc)[:200]})
+            return {"deleted": 0, "error": str(exc)[:200]}
+        return {"deleted": len(message_ids)}
+
     async def read_messages(self, target: str, limit: int = 20) -> list[dict[str, Any]]:
         client = await self.client()
         out: list[dict[str, Any]] = []

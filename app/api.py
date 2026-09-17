@@ -221,6 +221,7 @@ class OtpBotConfigRequest(BaseModel):
     max_refills: int | None = Field(default=None, ge=0, le=10000)
     run_minutes: int | None = Field(default=None, ge=0, le=100000)
     delete_when_done: bool | None = None
+    tidy_stock_messages: bool | None = None
     delete_done_command: str | None = None
     interval_minutes: int | None = None
     default_tag: str | None = None

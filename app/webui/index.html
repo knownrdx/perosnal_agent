@@ -961,10 +961,17 @@
                          title="0 = no limit.">
                 </div>
               </div>
+              <p class="small" id="otpbot-limit-warning" style="display:none;"></p>
               <div class="row mt8">
                 <label class="small" style="margin:0; display:flex; align-items:center; gap:6px;">
                   <input type="checkbox" id="otpbot-delete-when-done">
                   Delete the numbers off the bot when a run finishes
+                </label>
+              </div>
+              <div class="row mt8">
+                <label class="small" style="margin:0; display:flex; align-items:center; gap:6px;">
+                  <input type="checkbox" id="otpbot-tidy-stock">
+                  Delete the stock command and its reply after each check
                 </label>
               </div>
 
@@ -2245,6 +2252,8 @@
         qs("#otpbot-max-refills").value = cfg.max_refills != null ? cfg.max_refills : 0;
         qs("#otpbot-run-minutes").value = cfg.run_minutes != null ? cfg.run_minutes : 0;
         qs("#otpbot-delete-when-done").checked = !!cfg.delete_when_done;
+        qs("#otpbot-tidy-stock").checked = cfg.tidy_stock_messages !== false;
+        renderOtpBotLimitWarning();
         qs("#otpbot-frcd-enabled").checked = !!cfg.force_delete_before_add;
         qs("#otpbot-frcd-cmd").value = cfg.force_delete_command || "/frcd {country} {uid}";
         qs("#otpbot-frcd-uid").value = cfg.force_delete_uid || "";
@@ -2430,6 +2439,7 @@
       run_minutes: isNaN(parseInt(qs("#otpbot-run-minutes").value, 10))
         ? 0 : parseInt(qs("#otpbot-run-minutes").value, 10),
       delete_when_done: qs("#otpbot-delete-when-done").checked,
+      tidy_stock_messages: qs("#otpbot-tidy-stock").checked,
       force_delete_before_add: qs("#otpbot-frcd-enabled").checked,
       force_delete_command: qs("#otpbot-frcd-cmd").value.trim() || "/frcd {country} {uid}",
       force_delete_uid: qs("#otpbot-frcd-uid").value.trim(),
@@ -2620,6 +2630,25 @@
     });
   }
 
+  function renderOtpBotLimitWarning() {
+    // "Stop after 3 minutes" reads naturally as "every 3 minutes". Saying
+    // what it actually does, next to the field, is what stops an overnight
+    // run from ending three minutes after it starts.
+    var el = qs("#otpbot-limit-warning");
+    var refills = parseInt(qs("#otpbot-max-refills").value, 10) || 0;
+    var minutes = parseInt(qs("#otpbot-run-minutes").value, 10) || 0;
+    if (!refills && !minutes) {
+      el.style.display = "none";
+      return;
+    }
+    var parts = [];
+    if (refills) parts.push(refills + " re-add(s)");
+    if (minutes) parts.push(minutes + " minute(s)");
+    el.textContent = "⚠️ This run will STOP BY ITSELF after " +
+      parts.join(" or ") + " - it will not keep going overnight. Set both to 0 to run until you stop it.";
+    el.style.display = "";
+  }
+
   function handleOtpBotSavePreset() {
     var name = qs("#otpbot-preset-name").value.trim();
     if (!name) { showConfirm("Give the preset a name first."); return; }
@@ -2774,6 +2803,8 @@
     qs("#otpbot-open-thread-btn").addEventListener("click", handleOtpBotOpenThread);
     qs("#otpbot-clear-queue-btn").addEventListener("click", handleOtpBotClearQueue);
     qs("#otpbot-preset-save-btn").addEventListener("click", handleOtpBotSavePreset);
+    qs("#otpbot-max-refills").addEventListener("input", renderOtpBotLimitWarning);
+    qs("#otpbot-run-minutes").addEventListener("input", renderOtpBotLimitWarning);
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
   }

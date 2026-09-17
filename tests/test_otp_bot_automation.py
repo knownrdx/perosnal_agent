@@ -1020,6 +1020,125 @@ async def test_the_owner_is_told_when_a_run_finishes(environment):
 
 
 # --------------------------------------------------------------------------- #
+# Keeping the chat clean: the stock check is bookkeeping, not conversation
+# --------------------------------------------------------------------------- #
+class _DeletingBot(FakeUserbot):
+    def __init__(self, replies: list[dict[str, Any]]) -> None:
+        super().__init__(replies)
+        self.deleted: list[int] = []
+
+    async def delete_messages(self, target: str, message_ids: list[int]) -> dict:
+        self.deleted.extend(message_ids)
+        return {"deleted": len(message_ids)}
+
+
+async def test_the_stock_command_and_its_reply_are_deleted(environment):
+    """On a 2-minute interval this traffic buries the chat the owner reads."""
+    await _start_with_one_active_file()
+    bot = _DeletingBot([{"text": REAL_ST_REPLY, "out": False}])
+    set_userbot(bot)
+
+    result = await otp_bot.run_cycle(await otp_bot.get_config(), force=True)
+
+    # Both sides of the exchange go: the command we sent and the bot's reply.
+    assert len(bot.deleted) == 2
+    # And the data was still read before deleting.
+    assert result.country_stock
+
+
+async def test_tidying_can_be_turned_off(environment):
+    await _start_with_one_active_file()
+    await otp_bot.save_config({"tidy_stock_messages": False})
+    bot = _DeletingBot([{"text": REAL_ST_REPLY, "out": False}])
+    set_userbot(bot)
+
+    await otp_bot.run_cycle(await otp_bot.get_config(), force=True)
+    assert bot.deleted == []
+
+
+async def test_a_userbot_that_cannot_delete_still_works(environment):
+    """Older backends have no delete_messages; tidying is cosmetic and must
+    never cost a cycle.
+    """
+    await _start_with_one_active_file()
+    set_userbot(FakeUserbot([{"text": REAL_ST_REPLY, "out": False}]))
+
+    result = await otp_bot.run_cycle(await otp_bot.get_config(), force=True)
+    assert result.ok is True
+
+
+async def test_a_failing_delete_does_not_fail_the_cycle(environment):
+    class _BrokenDeleter(FakeUserbot):
+        async def delete_messages(self, target, message_ids):
+            raise RuntimeError("cannot delete")
+
+    await _start_with_one_active_file()
+    set_userbot(_BrokenDeleter([{"text": REAL_ST_REPLY, "out": False}]))
+
+    result = await otp_bot.run_cycle(await otp_bot.get_config(), force=True)
+    assert result.ok is True
+    assert result.country_stock
+
+
+# --------------------------------------------------------------------------- #
+# Saying when a run will end - the overnight failure was a silent stop
+# --------------------------------------------------------------------------- #
+async def test_setting_a_run_limit_warns_that_it_ends_the_run(environment):
+    """"run_minutes 3" reads naturally as "every 3 minutes". It actually
+    means "stop after 3 minutes", which is how an overnight run ended
+    minutes after it started.
+    """
+    reply = await otp_bot.set_setting_from_chat("run_minutes", "3")
+    assert "BONDHO" in reply
+    assert "run_minutes 0" in reply  # tells you how to undo it
+
+    reply = await otp_bot.set_setting_from_chat("max_refills", "3")
+    assert "BONDHO" in reply
+
+
+async def test_clearing_a_limit_does_not_warn(environment):
+    reply = await otp_bot.set_setting_from_chat("run_minutes", "0")
+    assert "BONDHO" not in reply
+
+
+async def test_delete_when_done_warns_that_numbers_will_be_removed(environment):
+    reply = await otp_bot.set_setting_from_chat("delete_when_done", "on")
+    assert "MUCHE" in reply
+
+
+async def test_start_says_when_the_run_will_end(environment):
+    rel = await _write_numbers_file("bd.txt", prefix="+880")
+    entry = (await otp_bot.enqueue_file(rel, "bd.txt"))["entries"][0]
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    await otp_bot.save_config({"run_minutes": 3, "max_refills": 2})
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+
+    result = await otp_bot.start_automation()
+    text = otp_bot._format_start_success(result)
+
+    assert "3 min" in text
+    assert "2 bar" in text
+    assert "BONDHO" in text
+
+
+async def test_start_says_when_there_are_no_limits(environment):
+    """The common case needs to be equally explicit, or "it will keep
+    running" is just an assumption.
+    """
+    rel = await _write_numbers_file("bd.txt", prefix="+880")
+    entry = (await otp_bot.enqueue_file(rel, "bd.txt"))["entries"][0]
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    await otp_bot.save_config({"run_minutes": 0, "max_refills": 0})
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+
+    result = await otp_bot.start_automation()
+    text = otp_bot._format_start_success(result)
+
+    assert "limit nai" in text
+    assert "BONDHO" not in text
+
+
+# --------------------------------------------------------------------------- #
 # Removing things the owner decided against
 # --------------------------------------------------------------------------- #
 async def test_skip_during_the_tag_question_drops_that_country(environment):

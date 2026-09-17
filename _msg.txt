@@ -1,46 +1,33 @@
-Runs that end on their own: re-add limits, time limits, auto-delete
+Say when a run will end; delete the stock check's own chat traffic
 
-A started country ran until the owner remembered to stop it, and every
-interval/restock value had to be one of the fixed button choices.
+An overnight run stopped three minutes after it started. Not a crash - the
+config had run_minutes=3 and max_refills=3, so the automation did exactly
+what it was told and then turned itself off. Nothing ever said it would.
 
-Finish conditions, per country
-  max_refills stops after N re-adds; run_minutes stops N minutes after the
-  run started. 0 means no limit, so the previous behaviour is the default.
-  Both are checked BEFORE a re-add rather than after - "run it twice" has to
-  mean twice, not three times.
+"run_minutes 3" reads naturally as "check every 3 minutes". It actually
+means "stop after 3 minutes", and the same ambiguity applies to max_refills.
+That is a UI failure, not a user error:
 
-  Refill counts and start times are tracked per country and persisted, so a
-  restart does not reset a half-finished run. One country reaching its limit
-  retires only that country; siblings keep going.
+  - Setting either now replies with what it really does ("shuru hoar 3 min
+    por task NIJEI BONDHO hobe") and how to undo it. delete_when_done warns
+    that the numbers will be removed from the bot.
+  - Start states the finish conditions up front, including the common case:
+    with no limits it says so explicitly, so "it will keep running" is
+    confirmed rather than assumed.
+  - The web panel shows the same warning next to the fields, updating as you
+    type.
 
-delete_when_done
-  When a run ends, optionally clear that country's numbers off the target
-  bot with /frcd. Opt-in: the deletion is irreversible on the bot's side, so
-  a run merely ending must never trigger it by default.
+A run ending on its own is correct behaviour; a run ending silently is
+indistinguishable from a crash, which is what made this feel broken.
 
-  Two failure modes are handled rather than silently ignored: with no uid
-  configured the command would go out as a literal "/frcd Bangladesh {uid}",
-  which the bot accepts and does nothing with - that now reports the missing
-  uid instead of sending junk. And if the delete fails for any reason the
-  run still ends, so a failed cleanup cannot leave a country cycling
-  forever.
+Tidy the stock check
+  /st and its reply are bookkeeping, and on a 2-minute interval they bury
+  the chat. Both sides of the exchange are now deleted after the reply has
+  been read and parsed - the data is in hand before anything is removed.
 
-  Finishing is reported as its own "Task shesh" notification, separate from
-  the stock-empty alert, so a completed run never reads as a failure.
+  Added delete_messages to the userbot (Telethon and Pyrogram). Tidying is
+  cosmetic, so it can never cost a cycle: a backend without delete support,
+  a message too old to delete, or an outright API failure all leave the run
+  untouched. Controlled by tidy_stock_messages (default on).
 
-Custom values everywhere
-  The button lists (5/10/15/30/60 min, 0/100/200/500/1000/5000 left) are
-  shortcuts, not the range. Each keyboard gained a custom option that asks
-  for a value and reads the owner's next message, so 7 minutes or 1500 left
-  are reachable from Telegram. A rejected value keeps the question open
-  rather than dropping it, since the owner clearly meant to answer it.
-
-  Also added a restock-point picker (global and per country) - previously
-  the threshold could only be set from the web form, so from Telegram a
-  country could only ever refill at zero.
-
-New preset "One-shot burst": refills at 200 left, stops after 5 re-adds,
-then clears the country. Per-country settings, the schedule table and both
-UIs carry the new fields.
-
-717 passing, smoke 10/10.
+726 passing, smoke 10/10.
