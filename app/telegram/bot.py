@@ -771,6 +771,118 @@ class AgentBot:
                     )
                 return
 
+            if action == "cpause":
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                index = int(rest)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                country = names[index]
+                now_paused = not await otp_schedule.is_paused(country)
+                await otp_schedule.set_paused(country, now_paused)
+                await query.answer(f"{country}: {'off' if now_paused else 'on'}")
+                await refresh_panel(
+                    f"\u23F8 {country} off kora holo (file ar setting thakbe)."
+                    if now_paused
+                    else f"\u25B6\uFE0F {country} abar chalu kora holo."
+                )
+                return
+
+            if action == "rmc2":
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                index = int(rest)
+                if index >= len(names):
+                    await query.answer("Already gone.", show_alert=True)
+                    return
+                country = names[index]
+                removed = await otp_bot.remove_by_country(country)
+                await query.answer(f"{len(removed)} removed")
+                await refresh_panel(f"\U0001F5D1 {country} bad deoa holo.")
+                return
+
+            if action == "pickst":
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                index = int(rest)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                country = names[index]
+                cfg = await otp_bot.get_config()
+                current = await otp_schedule.effective_config(country, cfg)
+                clock = otp_schedule.clock_now()
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        f"\u23F0 {country}: kokhon off hobe?\n"
+                        f"Ekhon {clock['dubai']} Dubai ({clock['utc']} UTC)",
+                        reply_markup=otp_panel.stop_time_keyboard(
+                            index, str(current.get("stop_at") or "")
+                        ),
+                    )
+                return
+
+            if action == "cstop":
+                index_raw, value_raw = rest.split(":", 1)
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                index = int(index_raw)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                country = names[index]
+                stop_at = "" if value_raw == "never" else value_raw
+                await otp_schedule.set_country_settings(country, {"stop_at": stop_at})
+                await query.answer(f"{country}: {stop_at or 'no stop time'}")
+                clock = otp_schedule.clock_now()
+                await refresh_panel(
+                    f"\u23F0 {country} Dubai time {stop_at} e off hobe "
+                    f"(ekhon {clock['dubai']})."
+                    if stop_at
+                    else f"\u267E\uFE0F {country}: kono stop time nai."
+                )
+                return
+
+            if action == "cstopc":
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                index = int(rest)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                country = names[index]
+                await otp_bot.set_pending_input("stop_at", country)
+                clock = otp_schedule.clock_now()
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        f"\u23F0 {country}: kon time e off hobe? HH:MM likho "
+                        f"(Dubai time).\nEkhon {clock['dubai']} Dubai / "
+                        f"{clock['utc']} UTC\n\n(Bad dite 'bad' likho.)"
+                    )
+                return
+
+            if action == "ask_onoff":
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                paused = {n for n in names if await otp_schedule.is_paused(n)}
+                markup = otp_panel.country_toggle_keyboard(entries, paused)
+                await query.answer()
+                if markup is None:
+                    with contextlib.suppress(Exception):
+                        await query.message.answer("Kono country nai - age file dao.")
+                    return
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        "\u23FB Kon country on/off korbo?\n"
+                        "\u23F8 = ekhon cholche (chaple off hobe), "
+                        "\u25B6\uFE0F = ekhon off (chaple chalu hobe)",
+                        reply_markup=markup,
+                    )
+                return
+
             if action == "fields":
                 entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
                 names = otp_panel.country_names(entries)
@@ -788,10 +900,16 @@ class AgentBot:
                     f"Ekhon: {current.get('interval_minutes')} min por por check, "
                     + ("khali hole restock" if not threshold else f"{threshold} baki thakle restock")
                 )
+                if current.get("stop_at"):
+                    summary += f", {current['stop_at']} (Dubai) e off"
+                if current.get("paused"):
+                    summary += "\n\u23F8 Ekhon OFF ache."
                 with contextlib.suppress(Exception):
                     await query.message.answer(
                         f"{summary}\n\nKi bodlate chao?",
-                        reply_markup=otp_panel.country_field_keyboard(index, country),
+                        reply_markup=otp_panel.country_field_keyboard(
+                            index, country, bool(current.get("paused"))
+                        ),
                     )
                 return
 

@@ -107,10 +107,11 @@ def control_keyboard(enabled: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="\U0001F4E6 Restock at", callback_data=f"{PREFIX}:ask_thr:"),
         ],
         [
-            InlineKeyboardButton(text="\U0001F9F9 Cleanup", callback_data=f"{PREFIX}:ask_clean:"),
             InlineKeyboardButton(text="\U0001F30D Per country", callback_data=f"{PREFIX}:ask_country:"),
+            InlineKeyboardButton(text="\u23FB Country on/off", callback_data=f"{PREFIX}:ask_onoff:"),
         ],
         [
+            InlineKeyboardButton(text="\U0001F9F9 Cleanup", callback_data=f"{PREFIX}:ask_clean:"),
             InlineKeyboardButton(text="\U0001F4D0 Presets", callback_data=f"{PREFIX}:ask_preset:"),
         ],
         [
@@ -211,9 +212,18 @@ def country_threshold_keyboard(country_index: int, current: int | None) -> Inlin
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def country_field_keyboard(country_index: int, country: str) -> InlineKeyboardMarkup:
+def country_field_keyboard(country_index: int, country: str, paused: bool = False) -> InlineKeyboardMarkup:
     """What about this country do you want to change?"""
     return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=("\u25B6\uFE0F Chalu koro" if paused else "\u23F8 Off koro"),
+                callback_data=f"{PREFIX}:cpause:{country_index}",
+            ),
+            InlineKeyboardButton(
+                text="\U0001F5D1 Bad dao", callback_data=f"{PREFIX}:rmc2:{country_index}"
+            ),
+        ],
         [
             InlineKeyboardButton(
                 text="\u23F1 Koto por por check",
@@ -228,10 +238,54 @@ def country_field_keyboard(country_index: int, country: str) -> InlineKeyboardMa
         ],
         [
             InlineKeyboardButton(
+                text="\u23F0 Kokhon off hobe (time)",
+                callback_data=f"{PREFIX}:pickst:{country_index}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
                 text="\U0001F4D0 Preset", callback_data=f"{PREFIX}:prec:{country_index}"
             ),
         ],
     ])
+
+
+def stop_time_keyboard(country_index: int, current: str = "") -> InlineKeyboardMarkup:
+    """Common stop times, in Dubai time - plus a custom option and 'never'."""
+    choices = ("06:00", "09:00", "12:00", "18:00", "21:00", "23:30")
+    buttons = [
+        InlineKeyboardButton(
+            text=(f"\u2705 {t}" if t == current else t),
+            callback_data=f"{PREFIX}:cstop:{country_index}:{t}",
+        )
+        for t in choices
+    ]
+    rows = _rows(buttons, per_row=3)
+    rows.append([
+        InlineKeyboardButton(
+            text="\u270F\uFE0F Onno time", callback_data=f"{PREFIX}:cstopc:{country_index}"
+        ),
+        InlineKeyboardButton(
+            text=("\u2705 Kokhono na" if not current else "\u267E\uFE0F Kokhono na"),
+            callback_data=f"{PREFIX}:cstop:{country_index}:never",
+        ),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def country_toggle_keyboard(entries: list[dict[str, Any]], paused: set[str]) -> InlineKeyboardMarkup | None:
+    """One on/off button per country, showing its current state."""
+    names = country_names(entries)
+    if not names:
+        return None
+    buttons = [
+        InlineKeyboardButton(
+            text=("\u23F8 " if country not in paused else "\u25B6\uFE0F ") + country,
+            callback_data=f"{PREFIX}:cpause:{index}",
+        )
+        for index, country in enumerate(names)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=_rows(buttons, per_row=2))
 
 
 def removal_keyboard(entries: list[dict[str, Any]]) -> InlineKeyboardMarkup | None:
@@ -266,6 +320,7 @@ async def status_text() -> str:
 
     lines = [
         "\U0001F501 OTP-bot automation",
+        f"\U0001F551 {otp_schedule.clock_now()['dubai_full']}",
         "",
         f"Running: {'yes' if config['enabled'] else 'no'}",
         f"Target: {config['target_bot']}",
@@ -294,9 +349,12 @@ async def status_text() -> str:
                 "khali hole" if not row.get("quota_threshold")
                 else f"{row['quota_threshold']} baki"
             )
+            state = "\u23F8 OFF" if row.get("paused") else "\u25B6\uFE0F on"
+            stop_at = f", off at {row['stop_at']}" if row.get("stop_at") else ""
             lines.append(
-                f"  {country} ({entry.get('count') or 0}) - {entry.get('tag') or 'General'}"
-                f" | every {row.get('interval_minutes')}m, restock {restock},"
+                f"  {state} {country} ({entry.get('count') or 0})"
+                f" - {entry.get('tag') or 'General'}"
+                f" | every {row.get('interval_minutes')}m, restock {restock}{stop_at},"
                 f" next {when}{mark}"
             )
         if any(overview.get(c, {}).get("customised") for c in overview):

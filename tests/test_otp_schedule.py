@@ -170,6 +170,146 @@ async def test_low_stock_preset_refills_before_reaching_zero(environment):
     assert cfg["force_delete_before_add"] is True
 
 
+# --------------------------------------------------------------------------- #
+# Per-country on/off and a wall-clock stop time
+# --------------------------------------------------------------------------- #
+@asyncio_test
+async def test_pausing_a_country_skips_it_without_losing_anything(environment):
+    """Pausing is not removing: the file and every setting stay put."""
+    await otp_schedule.set_country_settings("Bangladesh", {"interval_minutes": 5})
+    await otp_schedule.due_countries(["Bangladesh", "Nigeria"], BASE)
+    await _backdate("Bangladesh")
+    await _backdate("Nigeria")
+
+    await otp_schedule.set_paused("Bangladesh", True)
+
+    ready = await otp_schedule.due_countries(["Bangladesh", "Nigeria"], BASE)
+    assert ready == ["Nigeria"]
+    # Settings survive the pause.
+    assert (await otp_schedule.get_country_settings("Bangladesh"))["interval_minutes"] == 5
+
+
+@asyncio_test
+async def test_resuming_starts_the_clock_from_now(environment):
+    """A country paused for hours must not fire the instant it comes back
+    just because its old due time went by.
+    """
+    await otp_schedule.due_countries(["Bangladesh"], BASE)
+    await otp_schedule.set_paused("Bangladesh", True)
+    await _backdate("Bangladesh")
+
+    await otp_schedule.set_paused("Bangladesh", False)
+
+    assert await otp_schedule.due_countries(["Bangladesh"], BASE) == []
+    assert await otp_schedule.is_paused("Bangladesh") is False
+
+
+@asyncio_test
+async def test_pause_is_per_country(environment):
+    await otp_schedule.set_paused("Bangladesh", True)
+    assert await otp_schedule.is_paused("Bangladesh") is True
+    assert await otp_schedule.is_paused("Nigeria") is False
+
+
+def test_stop_times_are_parsed_forgivingly():
+    assert otp_schedule.parse_stop_time("23:30") == "23:30"
+    assert otp_schedule.parse_stop_time("9:05") == "09:05"
+    assert otp_schedule.parse_stop_time("2330") == "23:30"    # no colon
+    assert otp_schedule.parse_stop_time("23.30") == "23:30"   # dot
+    assert otp_schedule.parse_stop_time("") == ""             # clears it
+
+
+def test_an_impossible_stop_time_is_rejected():
+    """Stored unvalidated, "25:00" would simply never fire and the owner
+    would think the feature was broken.
+    """
+    for bad in ("25:00", "12:75", "abc", "9pm"):
+        with pytest.raises(ValueError):
+            otp_schedule.parse_stop_time(bad)
+
+
+def test_the_clock_reports_both_zones():
+    clock = otp_schedule.clock_now()
+    assert ":" in clock["utc"] and ":" in clock["dubai"]
+    assert "Dubai" in clock["dubai_full"]
+    assert "UTC" in clock["utc_full"]
+
+    # Dubai is UTC+4 with no DST, so the gap is always exactly four hours.
+    utc_h = int(clock["utc"].split(":")[0])
+    dubai_h = int(clock["dubai"].split(":")[0])
+    assert (dubai_h - utc_h) % 24 == 4
+
+
+def test_a_stop_time_later_today_fires_only_after_it_passes():
+    now = datetime.now(otp_schedule.DUBAI_TZ)
+    started = (now - timedelta(minutes=30)).isoformat()
+
+    an_hour_ahead = (now + timedelta(hours=1)).strftime("%H:%M")
+    a_minute_ago = (now - timedelta(minutes=1)).strftime("%H:%M")
+
+    assert otp_schedule._stop_time_passed(an_hour_ahead, started) is False
+    assert otp_schedule._stop_time_passed(a_minute_ago, started) is True
+
+
+def test_an_overnight_stop_time_means_tomorrow():
+    """Started 22:00, stop at 01:00 - that is 01:00 the NEXT day, which is
+    the whole point of an overnight run. Comparing against "today" would
+    finish the run immediately.
+    """
+    now = datetime.now(otp_schedule.DUBAI_TZ)
+    started_two_hours_ago = (now - timedelta(hours=2)).isoformat()
+    # A time one hour BEFORE the start: already past on the start day.
+    earlier_than_start = (now - timedelta(hours=3)).strftime("%H:%M")
+
+    assert otp_schedule._stop_time_passed(earlier_than_start, started_two_hours_ago) is False
+
+
+@asyncio_test
+async def test_a_country_finishes_at_its_stop_time(environment):
+    """A run started earlier today, with a stop time that has since passed."""
+    now = datetime.now(otp_schedule.DUBAI_TZ)
+    await otp_schedule.begin_run("Bangladesh")
+
+    # Backdate the run two hours, then stop at one hour ago: the stop time
+    # falls between the start and now, so it has genuinely passed.
+    state = await otp_schedule._get_run_state()
+    state["bangladesh"]["started_at"] = (now - timedelta(hours=2)).isoformat()
+    await otp_schedule._save_run_state(state)
+
+    passed = (now - timedelta(hours=1)).strftime("%H:%M")
+    await otp_schedule.set_country_settings("Bangladesh", {"stop_at": passed})
+
+    reason = await otp_schedule.finished_reason("Bangladesh", BASE)
+    assert reason is not None
+    assert passed in reason
+
+
+@asyncio_test
+async def test_a_stop_time_not_yet_reached_keeps_it_running(environment):
+    now = datetime.now(otp_schedule.DUBAI_TZ)
+    await otp_schedule.begin_run("Bangladesh")
+    later = (now + timedelta(hours=2)).strftime("%H:%M")
+    await otp_schedule.set_country_settings("Bangladesh", {"stop_at": later})
+
+    assert await otp_schedule.finished_reason("Bangladesh", BASE) is None
+
+
+@asyncio_test
+async def test_no_stop_time_means_it_keeps_going(environment):
+    await otp_schedule.begin_run("Bangladesh")
+    assert await otp_schedule.finished_reason("Bangladesh", BASE) is None
+
+
+@asyncio_test
+async def test_the_overview_reports_pause_and_stop_time(environment):
+    await otp_schedule.set_country_settings("Bangladesh", {"stop_at": "23:30"})
+    await otp_schedule.set_paused("Bangladesh", True)
+
+    rows = {r["country"]: r for r in await otp_schedule.schedule_overview(["Bangladesh"], BASE)}
+    assert rows["Bangladesh"]["paused"] is True
+    assert rows["Bangladesh"]["stop_at"] == "23:30"
+
+
 @asyncio_test
 async def test_builtin_presets_are_available_out_of_the_box(environment):
     presets = await otp_schedule.get_presets()

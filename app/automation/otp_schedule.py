@@ -49,7 +49,81 @@ OVERRIDABLE = (
     "max_refills",       # stop after N re-adds (0 = no limit)
     "run_minutes",       # stop N minutes after starting (0 = no limit)
     "delete_when_done",  # clear the country's numbers off the bot at the end
+    "paused",            # temporarily off without losing its settings/place
+    "stop_at",           # wall-clock time to stop, e.g. "23:30" (Dubai time)
 )
+
+# Dubai is UTC+4 all year - no daylight saving - so a fixed offset is exact
+# and needs no tzdata in the container. Times the owner types are read in
+# this zone, because that is the clock they are actually looking at.
+DUBAI_TZ = timezone(timedelta(hours=4), name="Dubai")
+
+
+def clock_now() -> dict[str, str]:
+    """Current time in both zones, for any UI that offers a stop time.
+
+    Shown side by side deliberately: the server thinks in UTC, the owner
+    thinks in Dubai time, and a stop time picked against the wrong one is
+    four hours out.
+    """
+    now = _now()
+    local = now.astimezone(DUBAI_TZ)
+    return {
+        "utc": now.strftime("%H:%M"),
+        "dubai": local.strftime("%H:%M"),
+        "utc_full": now.strftime("%Y-%m-%d %H:%M UTC"),
+        "dubai_full": local.strftime("%Y-%m-%d %H:%M Dubai (UTC+4)"),
+    }
+
+
+def parse_stop_time(text: str) -> str:
+    """Validate a "HH:MM" stop time given in Dubai time.
+
+    Kept as a wall-clock string rather than a timestamp so "stop at 23:30"
+    keeps meaning 23:30 on whatever day the run is still going, instead of
+    silently expiring after the first night.
+    """
+    raw = text.strip().replace(".", ":").replace(" ", "")
+    if not raw:
+        return ""
+    if ":" not in raw and raw.isdigit() and len(raw) in (3, 4):
+        raw = f"{raw[:-2]}:{raw[-2:]}"          # "2330" -> "23:30"
+    try:
+        hour_s, minute_s = raw.split(":", 1)
+        hour, minute = int(hour_s), int(minute_s)
+    except ValueError:
+        raise ValueError("Time ta HH:MM format e dao (jemon 23:30).") from None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("Time ta 00:00 theke 23:59 er moddhe hote hobe.")
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _stop_time_passed(stop_at: str, started_at: str | None) -> bool:
+    """Has the chosen wall-clock time arrived since the run started?
+
+    Compared against the run's start rather than "today", so a run begun at
+    22:00 with a 01:00 stop ends at 01:00 the NEXT day - the obvious reading
+    of "stop at 1am", and the case an overnight run actually hits.
+    """
+    try:
+        hour, minute = (int(part) for part in stop_at.split(":", 1))
+    except (ValueError, AttributeError):
+        return False
+
+    now_local = _now().astimezone(DUBAI_TZ)
+    if started_at:
+        try:
+            began = datetime.fromisoformat(started_at).astimezone(DUBAI_TZ)
+        except ValueError:
+            began = now_local
+    else:
+        began = now_local
+
+    target = began.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= began:
+        # The time already passed on the start day, so it means tomorrow.
+        target += timedelta(days=1)
+    return now_local >= target
 
 # Starting points, not a closed list - the owner edits these or adds their
 # own. Chosen to span the range actually seen in practice: a country that
@@ -244,6 +318,13 @@ async def due_countries(countries: list[str], base: dict[str, Any]) -> list[str]
     for country in countries:
         key = _key(country)
         cfg = await effective_config(country, base)
+
+        # A paused country keeps its settings, its file and its place - it
+        # is simply skipped until resumed. Its timer is NOT advanced, so
+        # resuming does not have to wait out an interval it spent paused.
+        if cfg.get("paused"):
+            continue
+
         interval = max(1, int(cfg.get("interval_minutes", 10)))
 
         raw = due_map.get(key)
@@ -333,6 +414,10 @@ async def finished_reason(country: str, base: dict[str, Any]) -> str | None:
     if max_refills and int(state.get("refills", 0)) >= max_refills:
         return f"{max_refills} bar re-add shesh"
 
+    stop_at = str(cfg.get("stop_at") or "").strip()
+    if stop_at and _stop_time_passed(stop_at, state.get("started_at")):
+        return f"{stop_at} (Dubai) time hoye geche"
+
     run_minutes = int(cfg.get("run_minutes") or 0)
     if run_minutes:
         try:
@@ -342,6 +427,25 @@ async def finished_reason(country: str, base: dict[str, Any]) -> str | None:
         if _now() >= started + timedelta(minutes=run_minutes):
             return f"{run_minutes} min shomoy shesh"
     return None
+
+
+async def set_paused(country: str, paused: bool) -> dict[str, Any]:
+    """Turn one country off/on without losing its settings or its file.
+
+    Distinct from removing it: removal throws the file away, pausing keeps
+    everything and simply skips the country until it is resumed.
+    """
+    applied = await set_country_settings(country, {"paused": bool(paused)})
+    if not paused:
+        # Resume from now, so a country paused for hours does not fire the
+        # instant it comes back just because its old due time went by.
+        cfg = await get_country_settings(country)
+        await arm_country(country, int(cfg.get("interval_minutes") or 10))
+    return applied
+
+
+async def is_paused(country: str) -> bool:
+    return bool((await get_country_settings(country)).get("paused"))
 
 
 async def shortest_interval_minutes(base: dict[str, Any]) -> int:
@@ -378,6 +482,10 @@ async def schedule_overview(
             "count": cfg.get("count"),
             "tag": cfg.get("tag"),
             "force_delete_before_add": bool(cfg.get("force_delete_before_add")),
+            "paused": bool(cfg.get("paused")),
+            "stop_at": cfg.get("stop_at") or "",
+            "max_refills": cfg.get("max_refills") or 0,
+            "run_minutes": cfg.get("run_minutes") or 0,
             "customised": sorted(f for f in OVERRIDABLE if f in overrides),
             "next_check_at": when.isoformat() if when else None,
             "due_in_seconds": int((when - now).total_seconds()) if when else None,

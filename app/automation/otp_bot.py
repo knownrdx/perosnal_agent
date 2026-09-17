@@ -313,6 +313,16 @@ SETTABLE_FIELDS: dict[str, dict[str, Any]] = {
         "label": "Delete-when-done command ({country}, {uid})",
         "example": "/frcd {country} {uid}",
     },
+    "stop_at": {
+        "type": "time",
+        "label": "Stop at this time (Dubai, HH:MM; blank = never)",
+        "example": "23:30",
+    },
+    "paused": {
+        "type": "bool",
+        "label": "Paused (per country: off without losing its file)",
+        "example": "on / off",
+    },
     "tidy_stock_messages": {
         "type": "bool",
         "label": "Delete the stock command + reply after each check",
@@ -343,6 +353,14 @@ def coerce_setting(key: str, raw: str) -> Any:
         raise ValueError(f"'{key}' ta kono setting na. /otpset likhe list dekho.")
 
     value = raw.strip()
+    if spec["type"] == "time":
+        from app.automation import otp_schedule
+
+        # Blank clears it - "stop at nothing" has to be expressible.
+        if value.lower() in {"", "never", "off", "none", "kokhono na"}:
+            return ""
+        return otp_schedule.parse_stop_time(value)
+
     if spec["type"] == "bool":
         lowered = value.casefold()
         if lowered in _TRUE_WORDS:
@@ -399,13 +417,31 @@ async def set_setting_from_chat(key: str, raw: str) -> str:
         line += (
             "\n\u26A0\uFE0F Task shesh hole oi country-r number bot theke MUCHE jabe."
         )
+    if key == "stop_at":
+        from app.automation import otp_schedule
+
+        clock = otp_schedule.clock_now()
+        if value:
+            line += (
+                f"\n\u23F0 Dubai time {value} hole task bondho hobe."
+                f"\n   Ekhon: {clock['dubai']} Dubai / {clock['utc']} UTC"
+            )
+        else:
+            line += "\n\u267E\uFE0F Kono stop time nai."
     return line
 
 
 async def describe_settings() -> str:
     """Current values for everything settable, with how to change them."""
+    from app.automation import otp_schedule
+
     cfg = await get_config()
-    lines = ["\u2699\uFE0F OTP-bot settings", ""]
+    clock = otp_schedule.clock_now()
+    lines = [
+        "\u2699\uFE0F OTP-bot settings",
+        f"\U0001F551 {clock['dubai_full']}  |  {clock['utc']} UTC",
+        "",
+    ]
     for key, spec in SETTABLE_FIELDS.items():
         current = cfg.get(key, "")
         if current is True:

@@ -195,11 +195,17 @@ class OtpCountryRequest(BaseModel):
     max_refills: int | None = Field(default=None, ge=0, le=10000)
     run_minutes: int | None = Field(default=None, ge=0, le=100000)
     delete_when_done: bool | None = None
+    paused: bool | None = None
+    stop_at: str | None = Field(default=None, max_length=5)
     tag: str | None = Field(default=None, max_length=60)
     force_delete_before_add: bool | None = None
     note: str | None = Field(default=None, max_length=200, alias="_note")
 
     model_config = {"populate_by_name": True}
+
+
+class OtpPauseRequest(BaseModel):
+    paused: bool
 
 
 class OtpPresetApplyRequest(BaseModel):
@@ -962,6 +968,22 @@ def create_app() -> FastAPI:
 
         return await otp_bot.refresh_countries_from_bot()
 
+    @app.post("/api/otpbot/country/{country}/pause", dependencies=[Depends(require_api_access)])
+    async def otpbot_pause_country(country: str, payload: OtpPauseRequest) -> dict[str, Any]:
+        """Turn one country off/on without losing its file or settings."""
+        from app.automation import otp_bot, otp_schedule
+
+        canonical = await otp_bot.canonical_country(country)
+        await otp_schedule.set_paused(canonical, payload.paused)
+        return {"country": canonical, "paused": payload.paused}
+
+    @app.get("/api/otpbot/clock", dependencies=[Depends(require_api_access)])
+    async def otpbot_clock() -> dict[str, Any]:
+        """Server time in UTC and Dubai, for picking a stop time against."""
+        from app.automation import otp_schedule
+
+        return otp_schedule.clock_now()
+
     @app.get("/api/otpbot/schedule", dependencies=[Depends(require_api_access)])
     async def otpbot_schedule() -> dict[str, Any]:
         """Per-country settings and next-run times for everything in play."""
@@ -987,6 +1009,13 @@ def create_app() -> FastAPI:
         from app.automation import otp_bot, otp_schedule
 
         values = payload.model_dump(exclude_unset=True)
+        # stop_at arrives as free text from a form; validate it the same way
+        # the chat command does rather than storing "9pm" and never firing.
+        if values.get("stop_at") is not None:
+            try:
+                values["stop_at"] = otp_schedule.parse_stop_time(values["stop_at"])
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         applied = await otp_schedule.set_country_settings(country, values)
         if "interval_minutes" in values and values["interval_minutes"]:
             await otp_schedule.arm_country(country, int(values["interval_minutes"]))

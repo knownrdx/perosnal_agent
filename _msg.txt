@@ -1,33 +1,45 @@
-Say when a run will end; delete the stock check's own chat traffic
+Per-country on/off and a wall-clock stop time, in Dubai time
 
-An overnight run stopped three minutes after it started. Not a crash - the
-config had run_minutes=3 and max_refills=3, so the automation did exactly
-what it was told and then turned itself off. Nothing ever said it would.
+Turning one country off meant deleting it and losing its file; stopping at a
+particular hour was not expressible at all - only "after N minutes", which
+is what ended an overnight run three minutes after it began.
 
-"run_minutes 3" reads naturally as "check every 3 minutes". It actually
-means "stop after 3 minutes", and the same ambiguity applies to max_refills.
-That is a UI failure, not a user error:
+Pause / resume per country
+  set_paused keeps the file, the tag and every setting and simply skips the
+  country until it is resumed. Distinct from removal, which throws the file
+  away. A paused country's timer is not advanced while it is off, and
+  resuming re-arms from now, so a country paused for hours does not fire the
+  instant it comes back just because its old due time went by.
 
-  - Setting either now replies with what it really does ("shuru hoar 3 min
-    por task NIJEI BONDHO hobe") and how to undo it. delete_when_done warns
-    that the numbers will be removed from the bot.
-  - Start states the finish conditions up front, including the common case:
-    with no limits it says so explicitly, so "it will keep running" is
-    confirmed rather than assumed.
-  - The web panel shows the same warning next to the fields, updating as you
-    type.
+Stop at a time of day
+  stop_at is a wall-clock "HH:MM" in Dubai time, stored as a string rather
+  than a timestamp so "stop at 23:30" keeps meaning 23:30 on whatever day
+  the run is still going, instead of expiring after the first night.
 
-A run ending on its own is correct behaviour; a run ending silently is
-indistinguishable from a crash, which is what made this feel broken.
+  It is compared against the run's START, not against "today": a run begun
+  at 22:00 with a 01:00 stop ends at 01:00 the NEXT day. Comparing to today
+  would finish an overnight run immediately - the exact case this is for.
 
-Tidy the stock check
-  /st and its reply are bookkeeping, and on a 2-minute interval they bury
-  the chat. Both sides of the exchange are now deleted after the reply has
-  been read and parsed - the data is in hand before anything is removed.
+  Dubai is UTC+4 year-round, so a fixed offset is exact and needs no tzdata
+  in the container.
 
-  Added delete_messages to the userbot (Telethon and Pyrogram). Tidying is
-  cosmetic, so it can never cost a cycle: a backend without delete support,
-  a message too old to delete, or an outright API failure all leave the run
-  untouched. Controlled by tidy_stock_messages (default on).
+Show the clock
+  The server thinks in UTC, the owner reads Dubai time, and a stop time
+  picked against the wrong one is four hours out. Both are now shown
+  wherever a time is chosen: the Telegram settings list, the stop-time
+  prompt, and above the web schedule table.
 
-726 passing, smoke 10/10.
+  Input is forgiving ("2330", "23.30", "9:05") but validated - "25:00"
+  stored unvalidated would simply never fire and look like a broken
+  feature. The web form posts free text, so it goes through the same
+  validation as the chat command rather than trusting the browser.
+
+Both UIs: Telegram gets a country on/off picker, per-country off/remove
+buttons and a stop-time keyboard (six common times, custom, or never); the
+web schedule table gets a Turn on/off button and a time field per row.
+
+Note: app/webui/index.html was briefly truncated to 0 bytes by a failed
+scripted edit (a lone surrogate in the replacement text raised mid-write)
+and was restored from git before being re-edited through the patch tool.
+
+738 passing, smoke 10/10.

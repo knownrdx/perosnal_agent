@@ -881,6 +881,7 @@
                 every country at once, and only the empty ones get refilled.
                 Blank fields fall back to the global settings below.
               </p>
+              <p class="small" id="otpbot-clock">&nbsp;</p>
               <div id="otpbot-schedule-list">Loading...</div>
             </div>
 
@@ -2267,6 +2268,7 @@
         renderOtpBotThreadState(data);
         // Per-country schedule and presets come from their own endpoint so
         // the main status call stays cheap.
+        renderOtpBotClock();
         apiFetchJson("/api/otpbot/schedule")
           .then(function (sched) {
             var presetNames = Object.keys(sched.presets || {}).sort();
@@ -2510,9 +2512,26 @@
       var when = row.due_in_seconds == null
         ? "not scheduled"
         : (row.due_in_seconds <= 0 ? "due now" : "in " + Math.max(1, Math.floor(row.due_in_seconds / 60)) + "m");
-      label.textContent = row.country + " - every " + row.interval_minutes + "m, next " + when
+      label.textContent = (row.paused ? "OFF " : "")
+        + row.country + " - every " + row.interval_minutes + "m, next " + when
+        + (row.stop_at ? ", off at " + row.stop_at : "")
         + (row.customised && row.customised.length ? " *" : "");
+      if (row.paused) label.style.opacity = "0.6";
       box.appendChild(label);
+
+      var onOffBtn = document.createElement("button");
+      onOffBtn.type = "button";
+      onOffBtn.textContent = row.paused ? "Turn on" : "Turn off";
+      onOffBtn.title = "Pause keeps the file and settings - it just skips this country.";
+      onOffBtn.addEventListener("click", function () {
+        apiFetchJson("/api/otpbot/country/" + encodeURIComponent(row.country) + "/pause", {
+          method: "POST", body: { paused: !row.paused }
+        }).then(function () {
+          showConfirm(row.country + (row.paused ? " turned on." : " turned off."));
+          loadOtpBot();
+        }).catch(function () { showConfirm("Failed to change " + row.country + "."); });
+      });
+      box.appendChild(onOffBtn);
 
       var every = document.createElement("input");
       every.type = "number";
@@ -2538,6 +2557,13 @@
       limit.style.width = "60px";
       box.appendChild(limit);
 
+      var stopAt = document.createElement("input");
+      stopAt.type = "time";
+      stopAt.value = row.stop_at || "";
+      stopAt.title = "Stop this country at this time (Dubai). Blank = never.";
+      stopAt.style.width = "110px";
+      box.appendChild(stopAt);
+
       var saveBtn = document.createElement("button");
       saveBtn.type = "button";
       saveBtn.textContent = "Save";
@@ -2549,7 +2575,8 @@
             interval_minutes: parseInt(every.value, 10) || row.interval_minutes,
             // 0 is meaningful ("wait until empty"), so NaN is the only fallback.
             quota_threshold: isNaN(t) ? row.quota_threshold : t,
-            limit: parseInt(limit.value, 10) || row.limit
+            limit: parseInt(limit.value, 10) || row.limit,
+            stop_at: stopAt.value || ""
           }
         }).then(function () { showConfirm(row.country + " updated."); loadOtpBot(); })
           .catch(function () { showConfirm("Failed to save " + row.country + "."); });
@@ -2628,6 +2655,18 @@
 
       el.appendChild(row);
     });
+  }
+
+  function renderOtpBotClock() {
+    // The server runs on UTC and the owner reads Dubai time; a stop time
+    // picked against the wrong clock is four hours out, so show both.
+    apiFetchJson("/api/otpbot/clock")
+      .then(function (clock) {
+        qs("#otpbot-clock").textContent =
+          "Now: " + clock.dubai_full + "  |  " + clock.utc + " UTC" +
+          "  - stop times below are Dubai time.";
+      })
+      .catch(function () { qs("#otpbot-clock").textContent = ""; });
   }
 
   function renderOtpBotLimitWarning() {
