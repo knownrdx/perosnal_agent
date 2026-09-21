@@ -12,6 +12,7 @@ long-running overnight task does not die because one API blipped.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -88,6 +89,8 @@ class LLMManager(LLMClient):
         self._model_override: dict[str, str] = {}
         # name -> {base_url, model}; the API key lives in the encrypted vault.
         self._custom: dict[str, dict[str, str]] = {}
+        # provider key -> monotonic deadline; see _in_cooldown.
+        self._cooldowns: dict[str, float] = {}
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ #
@@ -458,15 +461,73 @@ class LLMManager(LLMClient):
             order += sorted(others, key=lambda key: rank.get(key, 9))
         return order
 
+    # ------------------------------------------------------------------ #
+    # Failure cooldowns
+    #
+    # A provider that just failed is very likely to fail again within
+    # seconds (rate limit windows, an outage, a dead container). Retrying it
+    # on every message makes the owner pay its timeout over and over - the
+    # dominant cost of a "slow bot" when a gateway is rate-limited.
+    # ------------------------------------------------------------------ #
+    _COOLDOWN_S = 120.0
+    _RATE_LIMIT_COOLDOWN_S = 300.0
+
+    def _in_cooldown(self, key: str) -> bool:
+        until = self._cooldowns.get(key)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            del self._cooldowns[key]
+            return False
+        return True
+
+    def _mark_failed(self, key: str, exc: Exception) -> None:
+        # Rate limits state their own window; back off longer for those than
+        # for a transient error.
+        text = str(exc).lower()
+        rate_limited = "429" in text or "rate limit" in text or "quota" in text
+        cooldown = self._RATE_LIMIT_COOLDOWN_S if rate_limited else self._COOLDOWN_S
+        self._cooldowns[key] = time.monotonic() + cooldown
+
+    def _clear_cooldown(self, key: str) -> None:
+        self._cooldowns.pop(key, None)
+
+    def provider_health_summary(self) -> list[dict[str, Any]]:
+        """Which providers are usable right now, for the dashboard."""
+        now = time.monotonic()
+        rows = []
+        for key in self.fallback_order():
+            until = self._cooldowns.get(key)
+            rows.append({
+                "provider": key,
+                "available": until is None or now >= until,
+                "cooldown_s": max(0, int(until - now)) if until else 0,
+            })
+        return rows
+
     async def chat(self, messages: list[Message], *, temperature: float | None = None) -> LLMResponse:
         errors: list[str] = []
-        for index, key in enumerate(self.fallback_order()):
+        order = self.fallback_order()
+
+        # Skip providers that failed moments ago. Without this, every single
+        # message pays the full failure cost of a dead provider again - a
+        # rate-limited gateway takes ~16s to say "429" and the owner waits
+        # that out before the working provider is even tried.
+        live = [k for k in order if not self._in_cooldown(k)]
+        if not live:
+            # Everything is cooling down: rather than refuse, retry the
+            # cheapest one (cooldowns are a latency optimisation, not a ban).
+            live = order[-1:]
+
+        for index, key in enumerate(live):
             try:
                 response = await self.client(key).chat(messages, temperature=temperature)
+                self._clear_cooldown(key)
                 if index > 0:
                     log.warning("llm_fallback_used", extra={"provider": key})
                 return response
             except Exception as exc:  # noqa: BLE001
+                self._mark_failed(key, exc)
                 errors.append(f"{key}: {str(exc)[:200]}")
                 log.warning("llm_provider_failed", extra={"provider": key, "error": str(exc)[:200]})
         raise LLMError("all LLM providers failed -> " + " | ".join(errors))

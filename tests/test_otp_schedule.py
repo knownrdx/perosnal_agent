@@ -311,6 +311,38 @@ async def test_the_overview_reports_pause_and_stop_time(environment):
 
 
 @asyncio_test
+async def test_a_global_stop_time_applies_to_every_country(environment):
+    """Set once in the panel, inherited everywhere - the owner should not
+    have to set the same 23:30 on each country.
+    """
+    now = datetime.now(otp_schedule.DUBAI_TZ)
+    await otp_schedule.begin_run("Bangladesh")
+    state = await otp_schedule._get_run_state()
+    state["bangladesh"]["started_at"] = (now - timedelta(hours=2)).isoformat()
+    await otp_schedule._save_run_state(state)
+
+    passed = (now - timedelta(hours=1)).strftime("%H:%M")
+    base = dict(BASE, stop_at=passed)
+
+    reason = await otp_schedule.finished_reason("Bangladesh", base)
+    assert reason is not None and passed in reason
+
+
+@asyncio_test
+async def test_a_country_can_override_the_global_stop_time(environment):
+    """A country set to "never" must not be stopped by the global default."""
+    now = datetime.now(otp_schedule.DUBAI_TZ)
+    await otp_schedule.begin_run("Bangladesh")
+    state = await otp_schedule._get_run_state()
+    state["bangladesh"]["started_at"] = (now - timedelta(hours=2)).isoformat()
+    await otp_schedule._save_run_state(state)
+
+    await otp_schedule.set_country_settings("Bangladesh", {"stop_at": ""})
+    base = dict(BASE, stop_at=(now - timedelta(hours=1)).strftime("%H:%M"))
+
+    assert await otp_schedule.finished_reason("Bangladesh", base) is None
+
+
 async def test_builtin_presets_are_available_out_of_the_box(environment):
     presets = await otp_schedule.get_presets()
     assert "Fast burn" in presets

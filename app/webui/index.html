@@ -882,6 +882,7 @@
                 Blank fields fall back to the global settings below.
               </p>
               <p class="small" id="otpbot-clock">&nbsp;</p>
+              <p class="small" id="otpbot-llm-health">&nbsp;</p>
               <div id="otpbot-schedule-list">Loading...</div>
             </div>
 
@@ -960,6 +961,11 @@
                   <label for="otpbot-run-minutes">Stop after N minutes</label>
                   <input type="number" id="otpbot-run-minutes" min="0" value="0"
                          title="0 = no limit.">
+                </div>
+                <div>
+                  <label for="otpbot-stop-at">Stop at (Dubai time)</label>
+                  <input type="time" id="otpbot-stop-at"
+                         title="Every country stops at this time of day unless it sets its own. Blank = never.">
                 </div>
               </div>
               <p class="small" id="otpbot-limit-warning" style="display:none;"></p>
@@ -2252,6 +2258,7 @@
         qs("#otpbot-cleanup-cmd").value = cfg.cleanup_command || "/useddelete";
         qs("#otpbot-max-refills").value = cfg.max_refills != null ? cfg.max_refills : 0;
         qs("#otpbot-run-minutes").value = cfg.run_minutes != null ? cfg.run_minutes : 0;
+        qs("#otpbot-stop-at").value = cfg.stop_at || "";
         qs("#otpbot-delete-when-done").checked = !!cfg.delete_when_done;
         qs("#otpbot-tidy-stock").checked = cfg.tidy_stock_messages !== false;
         renderOtpBotLimitWarning();
@@ -2269,6 +2276,7 @@
         // Per-country schedule and presets come from their own endpoint so
         // the main status call stays cheap.
         renderOtpBotClock();
+        renderOtpBotLlmHealth();
         apiFetchJson("/api/otpbot/schedule")
           .then(function (sched) {
             var presetNames = Object.keys(sched.presets || {}).sort();
@@ -2440,6 +2448,7 @@
         ? 0 : parseInt(qs("#otpbot-max-refills").value, 10),
       run_minutes: isNaN(parseInt(qs("#otpbot-run-minutes").value, 10))
         ? 0 : parseInt(qs("#otpbot-run-minutes").value, 10),
+      stop_at: qs("#otpbot-stop-at").value || "",
       delete_when_done: qs("#otpbot-delete-when-done").checked,
       tidy_stock_messages: qs("#otpbot-tidy-stock").checked,
       force_delete_before_add: qs("#otpbot-frcd-enabled").checked,
@@ -2655,6 +2664,29 @@
 
       el.appendChild(row);
     });
+  }
+
+  function renderOtpBotLlmHealth() {
+    // "The bot is slow" and "the active provider is rate-limited" look
+    // identical from the chat window, so name the cause here.
+    apiFetchJson("/api/llm/providers")
+      .then(function (data) {
+        var rows = data.providers || [];
+        if (!rows.length) { qs("#otpbot-llm-health").textContent = ""; return; }
+        var down = rows.filter(function (r) { return !r.available; });
+        var el = qs("#otpbot-llm-health");
+        if (!down.length) {
+          el.textContent = "LLM: " + (data.active || "?") + " - all providers healthy."
+            + " (The OTP automation itself never uses an LLM.)";
+          el.style.color = "";
+        } else {
+          el.textContent = "LLM: cooling down after failures - "
+            + down.map(function (r) { return r.provider + " (" + r.cooldown_s + "s)"; }).join(", ")
+            + ". Chat replies use the next provider; OTP automation is unaffected.";
+          el.style.color = "#c47f00";
+        }
+      })
+      .catch(function () { qs("#otpbot-llm-health").textContent = ""; });
   }
 
   function renderOtpBotClock() {

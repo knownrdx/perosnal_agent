@@ -233,6 +233,16 @@ async def handle_message(
             await _record_reply(chat_id, answer, thread_id=thread_id)
             return Reply(answer, Intent.CONTROL)
 
+        if otp_bot.is_status_trigger(text):
+            answer = await otp_bot.handle_status_trigger()
+            await _record_reply(chat_id, answer, thread_id=thread_id)
+            return Reply(answer, Intent.CONTROL)
+
+        if otp_bot.is_help_trigger(text):
+            answer = otp_bot.help_text()
+            await _record_reply(chat_id, answer, thread_id=thread_id)
+            return Reply(answer, Intent.CONTROL)
+
         if otp_bot.is_start_trigger(text):
             answer = await otp_bot.handle_start_trigger()
             await _record_reply(chat_id, answer, thread_id=thread_id)

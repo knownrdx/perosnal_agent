@@ -826,17 +826,31 @@ class AgentBot:
 
             if action == "cstop":
                 index_raw, value_raw = rest.split(":", 1)
+                index = int(index_raw)
+                stop_at = "" if value_raw == "never" else value_raw
+                clock = otp_schedule.clock_now()
+
+                # -1 is the global picker: set the default every country
+                # inherits, rather than one country's override.
+                if index < 0:
+                    await otp_bot.save_config({"stop_at": stop_at})
+                    await query.answer(f"All: {stop_at or 'no stop time'}")
+                    await refresh_panel(
+                        f"\u23F0 Shob country Dubai time {stop_at} e off hobe "
+                        f"(ekhon {clock['dubai']})."
+                        if stop_at
+                        else "\u267E\uFE0F Kono stop time nai - 'stop' na bola porjonto cholbe."
+                    )
+                    return
+
                 entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
                 names = otp_panel.country_names(entries)
-                index = int(index_raw)
                 if index >= len(names):
                     await query.answer("That country is gone.", show_alert=True)
                     return
                 country = names[index]
-                stop_at = "" if value_raw == "never" else value_raw
                 await otp_schedule.set_country_settings(country, {"stop_at": stop_at})
                 await query.answer(f"{country}: {stop_at or 'no stop time'}")
-                clock = otp_schedule.clock_now()
                 await refresh_panel(
                     f"\u23F0 {country} Dubai time {stop_at} e off hobe "
                     f"(ekhon {clock['dubai']})."
@@ -861,6 +875,21 @@ class AgentBot:
                         f"\u23F0 {country}: kon time e off hobe? HH:MM likho "
                         f"(Dubai time).\nEkhon {clock['dubai']} Dubai / "
                         f"{clock['utc']} UTC\n\n(Bad dite 'bad' likho.)"
+                    )
+                return
+
+            if action == "ask_stopall":
+                cfg = await otp_bot.get_config()
+                clock = otp_schedule.clock_now()
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        f"\u23F0 Puro task kokhon off hobe?\n"
+                        f"Ekhon {clock['dubai']} Dubai ({clock['utc']} UTC)\n"
+                        f"Ei time ta shob country-r jonno default hobe.",
+                        reply_markup=otp_panel.stop_time_keyboard(
+                            -1, str(cfg.get("stop_at") or "")
+                        ),
                     )
                 return
 
@@ -1456,11 +1485,20 @@ class AgentBot:
 
             from app.agent.conversation import handle_message
 
-            try:
-                await self.bot.send_chat_action(message.chat.id, "typing")
-            except Exception:  # noqa: BLE001 - cosmetic only
-                pass
+            # Telegram clears "typing" after ~5 seconds, so a single call
+            # leaves a long turn looking frozen. Refresh it until the reply
+            # is ready, then stop.
+            async def _keep_typing() -> None:
+                try:
+                    while True:
+                        await self.bot.send_chat_action(message.chat.id, "typing")
+                        await asyncio.sleep(4)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - cosmetic only
+                    pass
 
+            typing = asyncio.create_task(_keep_typing())
             try:
                 reply = await handle_message(
                     message.chat.id, message.from_user.id, text
@@ -1471,6 +1509,10 @@ class AgentBot:
                     "\u274C Something broke handling that. It is logged - try again."
                 )
                 return
+            finally:
+                typing.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await typing
 
             await message.answer(reply.text[:4000])
 

@@ -90,6 +90,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # A file dropped in the thread is a request to run it. Asking "shall I
     # start?" after every upload is the owner repeating themselves.
     "auto_start": True,
+    # Wall-clock stop time (Dubai, "HH:MM"), inherited by every country
+    # unless it sets its own. "" = never.
+    "stop_at": "",
     # Before adding, read the bot's own stock: a country that already holds
     # numbers does not need them sent again (the bot answers such an add with
     # pure duplicates). Monitoring still starts, so the refill happens the
@@ -1507,6 +1510,61 @@ async def stop_automation() -> dict[str, Any]:
 # handle_message with the same text). This is the whole point: the owner
 # must be able to run this even while every LLM provider is down.
 # --------------------------------------------------------------------------- #
+_STATUS_WORDS = {
+    "status", "ki obostha", "kemon cholche", "koto", "stock", "stock koto",
+    "ki hocche", "koto ache", "report", "ekhon ki", "chole", "cholche",
+    "kaj korche", "update", "info",
+}
+_HELP_WORDS = {
+    "help", "sahajjo", "ki korte pari", "commands", "command", "cmd",
+    "ki ki kora jay", "kivabe", "how", "?",
+}
+
+
+def is_status_trigger(text: str) -> bool:
+    """A plain "what's happening" question, answerable with no model."""
+    return _normalize(text) in _STATUS_WORDS
+
+
+def is_help_trigger(text: str) -> bool:
+    return _normalize(text) in _HELP_WORDS
+
+
+async def handle_status_trigger() -> str:
+    """Live status, read straight from state - no LLM, no waiting.
+
+    This is the single most common question in the thread; routing it
+    through a rate-limited provider made the bot look slow and stupid for
+    information it already has in hand.
+    """
+    from app.telegram import otp_panel
+
+    return await otp_panel.status_text()
+
+
+def help_text() -> str:
+    """Everything the thread understands, in the owner's own words."""
+    return (
+        "\U0001F501 OTP-bot - ja ja bola jay:\n"
+        "\n"
+        "File dile nijei shuru hoy (tag jana thakle). Tag na janle ekbar jiggesh korbe.\n"
+        "\n"
+        "Lekha:\n"
+        "  start / shuru    - shuru koro\n"
+        "  stop / bondho    - thamao\n"
+        "  status           - ekhon ki cholche\n"
+        "  <country> bad dao - oi country bad\n"
+        "  sob bad dao      - queue khali koro\n"
+        "\n"
+        "Command:\n"
+        "  /otpbot    - button panel (sob ekhane)\n"
+        "  /otpset    - setting dekho / bodlao\n"
+        "  /otppreset - preset list / save / apply\n"
+        "\n"
+        "Button diye: interval, restock point, country on/off, off-time, preset - sob."
+    )
+
+
 _START_WORDS = {
     "start", "shuru", "shuru koro", "shuru korbo", "start koro", "cholo",
     "run", "go", "begin", "done", "shesh", "sesh", "shesh hoise", "sesh hoise",

@@ -229,6 +229,9 @@ class OtpBotConfigRequest(BaseModel):
     delete_when_done: bool | None = None
     tidy_stock_messages: bool | None = None
     delete_done_command: str | None = None
+    auto_start: bool | None = None
+    skip_add_if_stocked: bool | None = None
+    stop_at: str | None = Field(default=None, max_length=5)
     interval_minutes: int | None = None
     default_tag: str | None = None
 
@@ -881,9 +884,18 @@ def create_app() -> FastAPI:
 
     @app.post("/api/otpbot/config", dependencies=[Depends(require_api_access)])
     async def otpbot_set_config(payload: OtpBotConfigRequest) -> dict[str, Any]:
-        from app.automation import otp_bot
+        from app.automation import otp_bot, otp_schedule
 
-        patch = {k: v for k, v in payload.model_dump().items() if v is not None}
+        # exclude_unset, not "is not None": an empty stop_at means "never"
+        # and an explicit 0 means "no limit" - both are real choices that a
+        # None-filter would silently discard.
+        patch = payload.model_dump(exclude_unset=True)
+        patch = {k: v for k, v in patch.items() if v is not None}
+        if "stop_at" in patch:
+            try:
+                patch["stop_at"] = otp_schedule.parse_stop_time(patch["stop_at"])
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         return await otp_bot.save_config(patch)
 
     @app.get("/api/otpbot/status", dependencies=[Depends(require_api_access)])
@@ -989,6 +1001,26 @@ def create_app() -> FastAPI:
         canonical = await otp_bot.canonical_country(country)
         await otp_schedule.set_paused(canonical, payload.paused)
         return {"country": canonical, "paused": payload.paused}
+
+    @app.get("/api/llm/providers", dependencies=[Depends(require_api_access)])
+    async def llm_provider_health() -> dict[str, Any]:
+        """Which providers are usable right now, and which are cooling down.
+
+        Surfaced because "the bot is slow" and "the active provider is
+        rate-limited" look identical from the chat window.
+        """
+        from app.llm import get_llm
+
+        manager = get_llm()
+        summary = (
+            manager.provider_health_summary()
+            if hasattr(manager, "provider_health_summary")
+            else []
+        )
+        return {
+            "active": manager.active_key() if hasattr(manager, "active_key") else "",
+            "providers": summary,
+        }
 
     @app.get("/api/otpbot/clock", dependencies=[Depends(require_api_access)])
     async def otpbot_clock() -> dict[str, Any]:

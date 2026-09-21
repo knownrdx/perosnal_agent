@@ -36,6 +36,10 @@ class OllamaClient(LLMClient):
         self.timeout_s = timeout_s or settings.llm_timeout_s
         self.num_ctx = num_ctx or settings.llm_num_ctx
         self.temperature = settings.llm_temperature if temperature is None else temperature
+        # How long ollama keeps the weights in memory after a request. The
+        # default 5m expires between messages and the reload dominates reply
+        # time on a CPU-only host, so hold them much longer.
+        self.keep_alive = getattr(settings, "ollama_keep_alive", "2h")
         self._client: httpx.AsyncClient | None = None
 
     def _http(self) -> httpx.AsyncClient:
@@ -53,6 +57,11 @@ class OllamaClient(LLMClient):
             "model": self.model,
             "messages": [m.as_dict() for m in messages],
             "stream": False,
+            # Keep the weights resident between messages. Ollama's default
+            # (5 min) expires during normal gaps in a conversation, and the
+            # reload costs 18-60s on this CPU-only box - which is most of
+            # what "the bot is slow" actually was.
+            "keep_alive": self.keep_alive,
             "options": {
                 "temperature": self.temperature if temperature is None else temperature,
                 "num_ctx": self.num_ctx,

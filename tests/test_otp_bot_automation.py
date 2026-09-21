@@ -1189,6 +1189,47 @@ async def test_the_start_message_explains_a_held_file(environment):
 
 
 # --------------------------------------------------------------------------- #
+# Instant answers: the common questions must not wait on a model
+# --------------------------------------------------------------------------- #
+def test_status_and_help_words_are_recognised():
+    for word in ("status", "ki obostha", "stock koto", "cholche"):
+        assert otp_bot.is_status_trigger(word) is True, word
+    for word in ("help", "commands", "kivabe"):
+        assert otp_bot.is_help_trigger(word) is True, word
+
+
+def test_ordinary_sentences_are_not_status_questions():
+    """These words are common; only the bare question is a trigger, or an
+    instruction mentioning them would be swallowed.
+    """
+    for text in (
+        "status report banao ekta file theke",
+        "Bangladesh stock shesh hole amake bolo",
+        "help kore dao ei kaj ta",
+    ):
+        assert otp_bot.is_status_trigger(text) is False, text
+        assert otp_bot.is_help_trigger(text) is False, text
+
+
+async def test_status_is_answered_without_any_llm(environment):
+    """The whole point: this must work with every provider down."""
+    set_userbot(FakeUserbot([]))
+    rel = await _write_numbers_file("numbers_BD.txt")
+    await _enqueue_single(rel, "numbers_BD.txt")
+
+    answer = await otp_bot.handle_status_trigger()
+
+    assert "OTP-bot" in answer
+    assert "Bangladesh" in answer
+
+
+def test_help_lists_what_actually_exists():
+    text = otp_bot.help_text()
+    for expected in ("start", "stop", "status", "bad dao", "/otpset", "/otppreset"):
+        assert expected in text, expected
+
+
+# --------------------------------------------------------------------------- #
 # Keeping the chat clean: the stock check is bookkeeping, not conversation
 # --------------------------------------------------------------------------- #
 class _DeletingBot(FakeUserbot):

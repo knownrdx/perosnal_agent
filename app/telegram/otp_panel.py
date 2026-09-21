@@ -111,7 +111,10 @@ def control_keyboard(enabled: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="\u23FB Country on/off", callback_data=f"{PREFIX}:ask_onoff:"),
         ],
         [
+            InlineKeyboardButton(text="\u23F0 Off at", callback_data=f"{PREFIX}:ask_stopall:"),
             InlineKeyboardButton(text="\U0001F9F9 Cleanup", callback_data=f"{PREFIX}:ask_clean:"),
+        ],
+        [
             InlineKeyboardButton(text="\U0001F4D0 Presets", callback_data=f"{PREFIX}:ask_preset:"),
         ],
         [

@@ -198,6 +198,29 @@ async def test_router_falls_back_to_task_when_llm_dies(environment):
     assert decision.intent is Intent.TASK
 
 
+async def test_a_question_is_answered_in_chat_when_the_router_is_down():
+    """With every provider rate-limited, a plain question must not spawn a
+    whole task pipeline - that is slow and reads as unintelligent.
+    """
+    from app.llm import LLMError
+    from app.llm.base import LLMClient
+
+    class Dead(LLMClient):
+        name = "dead"
+
+        async def chat(self, messages, *, temperature=None):
+            raise LLMError("down")
+
+        async def health(self):
+            return {"ok": False}
+
+    decision = await classify(
+        "ei duita jinish er moddhe kon ta beshi bhalo hobe tomar mote?", llm=Dead()
+    )
+    assert decision.intent is Intent.CHAT
+    assert "question" in decision.reason
+
+
 # --------------------------------------------------------------------------- #
 # Conversation: chatting creates no tasks
 # --------------------------------------------------------------------------- #

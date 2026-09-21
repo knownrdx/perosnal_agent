@@ -1,49 +1,57 @@
-Uploads start themselves, and stop cancelling the runs already going
+Stop paying for dead providers; answer the common questions instantly
 
-Three problems, all on the path between "owner drops a file" and "numbers
-are actually in the bot".
+Measured first, rather than guessing at "the bot is slow":
 
-A new upload cancelled everything already running
-  start_automation wrote the queue over the active set. Uploading a Nigeria
-  file therefore silently ended the Bangladesh run started an hour earlier -
-  the countries simply disappeared from the active list with no message.
-  The active set is now MERGED: countries not in the new upload keep
-  running, and a new file for a country already running supersedes that
-  country's entry only, rather than being added alongside it as a duplicate.
+  app itself      0.5ms   (not the problem)
+  API over CF     0.7s    (network hop)
+  omniroute       16s     to return 429 - every free model rate-limited
+  ollama 7b       2.6s    warm
+  ollama 1.5b     64s cold / 1.4s warm
 
-Uploading meant nothing until "start" was typed
-  A file dropped in the OTP thread is a request to run it; asking "shall I
-  start?" afterwards is a question whose answer is always yes. An upload now
-  starts by itself, from both Telegram and the web dashboard.
+So a reply cost ~16s of guaranteed failure before a working provider was
+even tried, and the local model was usually cold because ollama's default
+keep_alive (5m) expires during ordinary gaps in a conversation.
 
-  The one case that still asks is a file whose tag is unknown - starting
-  with a guessed tag would file the numbers under the wrong service, which
-  is not recoverable from this side. That path already auto-started from the
-  tag answer, so the question is asked once and the run follows immediately.
-  Switch the whole behaviour off with auto_start.
+Failure cooldowns in the LLM manager
+  A provider that just failed is skipped for a while instead of being
+  retried on every single message: 120s normally, 300s for a rate limit
+  (429s state their own window). Success clears it immediately. If every
+  provider is cooling down the request is still attempted rather than
+  refused - a cooldown is a latency optimisation, not a ban.
+  Mutation-verified: removing the skip makes the test fail.
 
-Re-adding numbers a country already had
-  Adding a file to a country that is already stocked produces nothing but
-  duplicates (live: 46,588 of them) and burns the file. Start now reads the
-  bot's own /st once, up front, and holds back any country whose stock is
-  above its restock point - the file stays queued and the country stays
-  monitored, so it goes in the moment it actually runs out.
+Keep the local model resident
+  keep_alive is now sent explicitly (2h). The 18-64s reload was most of
+  what "slow" actually meant on a CPU-only host.
 
-  A country's own restock point is used, not a global one, so a country set
-  to refill at 200 is topped up at 200 here too.
+Don't spawn a task pipeline when the router is down
+  The fallback was a blanket TASK, so while providers were rate-limited
+  even a plain question started a whole job. A direct question is now
+  answered in chat: cheap and reversible, where a wrongly-spawned task is
+  neither. Everything else still defaults to TASK so real work is never
+  dropped.
 
-  If the stock read fails the add proceeds anyway: the worst case is
-  duplicates, whereas refusing to start is a dead automation. The cleanup
-  command is skipped entirely when nothing is going to be added, so a start
-  that holds every file leaves no trace in the chat.
+Instant status and help in the OTP thread
+  "status", "ki obostha", "stock koto", "help" and friends are answered
+  from state with no model at all - these are the most common messages in
+  that thread and they were waiting on a rate-limited provider for
+  information already in hand. Matching is exact-phrase only, so
+  "status report banao ekta file theke" is still a task.
 
-  Held files are reported as held, with the current stock and "auto add
-  hobe" - "ignored" and "held" look identical otherwise.
+Interface
+  - Telegram: the typing indicator now refreshes every 4s (Telegram clears
+    it after ~5s, so a long turn looked frozen), and there is a global
+    "Off at" time picker - previously a stop time could only be set one
+    country at a time.
+  - stop_at is now a real global default that each country inherits and can
+    override; the web UI gets the same field, plus a provider-health line
+    that names a cooling-down provider instead of leaving "slow" unexplained.
+  - The config endpoint uses exclude_unset, so clearing a stop time (empty
+    string) is no longer silently dropped by the None-filter, and a stop
+    time posted from the browser is validated like any other.
 
-format_start_result and tag_question are public wrappers so the Telegram and
-API upload handlers stop reaching for the private helpers.
+One existing test correctly pinned the old router behaviour for an
+imperative sentence; my first heuristic was too broad and it caught it.
+Narrowed to questions only.
 
-Two existing tests turn the new pre-check off: they assert the exact message
-sequence of an add, which now legitimately begins with /st.
-
-748 passing, smoke 10/10.
+762 passing, smoke 10/10.

@@ -174,7 +174,15 @@ async def classify(
         )
     except (LLMError, Exception) as exc:  # noqa: BLE001 - never block on the router
         log.warning("router_llm_failed", extra={"error": str(exc)[:200]})
-        # Safe default: treat it as a task so real work is never silently dropped.
+        # The model is unavailable, so decide from the text itself. A direct
+        # question is the one signal reliable enough to act on: answering it
+        # in chat is cheap and reversible, whereas spawning a task pipeline
+        # for "kemon acho?" is slow and visibly not smart.
+        #
+        # Anything else still defaults to TASK so real work is never dropped.
+        # (Short remarks never reach here - they are settled earlier.)
+        if stripped.endswith("?"):
+            return Decision(Intent.CHAT, "router unavailable, direct question", 0.4)
         return Decision(Intent.TASK, "router unavailable, defaulting to task", 0.4)
 
     raw = str(data.get("intent", "")).upper().strip()
