@@ -90,12 +90,12 @@ def check_languages() -> None:
     print("  caption:", parse_caption("সকাল ৬টা থেকে রাত ১১টা পর্যন্ত"))
 
     async def routes() -> None:
-        for text, want in (("বট টা কি এখন চলছে?", "control"),
-                           ("একটা রিপোর্ট বানাও", "task"),
-                           ("কেমন আছো", "chat")):
+        for text, want in (("বট টা কি এখন চলছে?", "CONTROL"),
+                           ("একটা রিপোর্ট বানাও", "TASK"),
+                           ("কেমন আছো", "CHAT")):
             started = time.time()
             decision = await classify(text)
-            mark = "OK  " if decision.intent.value == want else "DIFF"
+            mark = "OK  " if decision.intent.value.upper() == want else "DIFF"
             print(f"  {mark} {text[:20]:22} -> {decision.intent.value:9}"
                   f" {time.time() - started:5.3f}s ({decision.reason})")
 
