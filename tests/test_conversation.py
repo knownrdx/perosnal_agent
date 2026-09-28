@@ -76,7 +76,9 @@ async def test_otp_tag_answer_intercepted_before_router(environment, monkeypatch
     uploads.mkdir(parents=True, exist_ok=True)
     (uploads / "plain_numbers.txt").write_text("+880***1111\n", encoding="utf-8")
     await otp_bot.ensure_thread(CHAT_ID)
-    await otp_bot.enqueue_file("uploads/plain_numbers.txt", "plain_numbers.txt")
+    # Caption states the run length, so the only question left is the tag -
+    # which is what this test is about.
+    await otp_bot.enqueue_file("uploads/plain_numbers.txt", "plain_numbers.txt", "20h")
     await handle_message(CHAT_ID, USER_ID, "start")  # arms the tag prompt
 
     async def _no_sleep(seconds):

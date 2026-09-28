@@ -212,6 +212,15 @@ async def handle_message(
             await _record_reply(chat_id, answer, thread_id=thread_id)
             return Reply(answer, Intent.CONTROL)
 
+        # "How long should this run?" is answered by the next message too.
+        # Checked after the tag question (that one is asked first) but before
+        # every other trigger, so a bare "20h" is read as the answer it is
+        # rather than as small talk.
+        if await otp_bot.get_awaiting_runtime():
+            answer = await otp_bot.handle_runtime_answer(text)
+            await _record_reply(chat_id, answer, thread_id=thread_id)
+            return Reply(answer, Intent.CONTROL)
+
         if otp_bot.is_clear_trigger(text):
             answer = await otp_bot.handle_clear_queue()
             await _record_reply(chat_id, answer, thread_id=thread_id)

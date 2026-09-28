@@ -1,57 +1,81 @@
-Stop paying for dead providers; answer the common questions instantly
+Read the caption; ask only for what it did not say
 
-Measured first, rather than guessing at "the bot is slow":
+Uploading a numbers file meant answering the same three questions every
+time - which country, which service, how long - even when the caption
+sent with the file had already said all three. And a run with no stated
+limit ran until someone remembered to stop it, so runs were found still
+going days later.
 
-  app itself      0.5ms   (not the problem)
-  API over CF     0.7s    (network hop)
-  omniroute       16s     to return 429 - every free model rate-limited
-  ollama 7b       2.6s    warm
-  ollama 1.5b     64s cold / 1.4s warm
+Captions now answer those questions
+  "bangladesh whatsapp 20h", "shuru 21:00 bondho 06:00", "nigeria 2 din",
+  "telegram, kono stop nai" - service, country, start time, stop time and
+  run length are all read out of the text sent with the file, and only
+  what is missing gets asked. A caption that says nothing parses to
+  nothing and the old questions happen exactly as before.
 
-So a reply cost ~16s of guaranteed failure before a working provider was
-even tried, and the local model was usually cold because ollama's default
-keep_alive (5m) expires during ordinary gaps in a conversation.
+  A country named in the caption overrides what the numbers look like:
+  the owner knows which stock a file is for and a prefix table does not.
+  Not applied to genuinely mixed files - there the per-number split is
+  the better answer and overriding it would merge distinct stock.
 
-Failure cooldowns in the LLM manager
-  A provider that just failed is skipped for a while instead of being
-  retried on every single message: 120s normally, 300s for a rate limit
-  (429s state their own window). Success clears it immediately. If every
-  provider is cooling down the request is still attempted rather than
-  refused - a cooldown is a latency optimisation, not a ban.
-  Mutation-verified: removing the skip makes the test fail.
+  Two-letter aliases ("wa", "x", "gm") need an explicit "service:" first.
+  They are ordinary words in Banglish, and guessing one wrong files
+  numbers under the wrong service - worse than one extra question.
 
-Keep the local model resident
-  keep_alive is now sent explicitly (2h). The 18-64s reload was most of
-  what "slow" actually meant on a CPU-only host.
+Country detection covers every country, not a hand-written hundred
+  The old table held the regions that had come up so far, so anything
+  else landed in a "+370" bucket the target bot has never heard of.
+  Detection now goes through libphonenumber (pure Python, no compiler):
+  245 regions, and it resolves the ranges a flat prefix table cannot -
+  +1 splits across 25 NANP countries by area code, +7 into Russia and
+  Kazakhstan, +44 into the UK and its crown dependencies. Inside a shared
+  code a micro-territory is handed back to the main region when the
+  number is equally valid there; NANP is exempt because there the area
+  code genuinely is the country. The library is optional - without it a
+  generated calling-code table takes over.
 
-Don't spawn a task pipeline when the router is down
-  The fallback was a blanket TASK, so while providers were rate-limited
-  even a plain question started a whole job. A direct question is now
-  answered in chat: cheap and reversible, where a wrongly-spawned task is
-  neither. Everything else still defaults to TASK so real work is never
-  dropped.
+Runs can start at a wall-clock time, and end on their own
+  "start at 21:00" now means nothing is sent before 21:00: the country is
+  armed and listed, and its first add happens in the cycle after its time
+  arrives. Three things had to be right for that to mean anything:
 
-Instant status and help in the OTP thread
-  "status", "ki obostha", "stock koto", "help" and friends are answered
-  from state with no model at all - these are the most common messages in
-  that thread and they were waiting on a rate-limited provider for
-  information already in hand. Matching is exact-phrase only, so
-  "status report banao ekta file theke" is still a task.
+  - the time is anchored on the upload, not on "today", so a file queued
+    at 22:00 asking for 21:00 waits for tomorrow instead of firing at once
+  - a country that has not started cannot be "finished", or a 20h run
+    scheduled for 21:00 and uploaded at 09:00 would be declared complete
+    at 17:00 having never run
+  - the run clock re-bases to the start time, so 20h means twenty hours
+    from 21:00, not twenty hours minus however long it waited
 
-Interface
-  - Telegram: the typing indicator now refreshes every 4s (Telegram clears
-    it after ~5s, so a long turn looked frozen), and there is a global
-    "Off at" time picker - previously a stop time could only be set one
-    country at a time.
-  - stop_at is now a real global default that each country inherits and can
-    override; the web UI gets the same field, plus a provider-health line
-    that names a cooling-down provider instead of leaving "slow" unexplained.
-  - The config endpoint uses exclude_unset, so clearing a stop time (empty
-    string) is no longer silently dropped by the None-filter, and a stop
-    time posted from the browser is validated like any other.
+  New uploads are asked how long they should run, with the default (20h)
+  stated in the question rather than applied silently. Skipping takes that
+  default - an unanswered question must never become the riskier option -
+  and "limit nai" stays expressible for runs that genuinely should go
+  until stopped by hand.
 
-One existing test correctly pinned the old router behaviour for an
-imperative sentence; my first heuristic was too broad and it caught it.
-Narrowed to questions only.
+Telegram can now do what the dashboard could
+  Deleting ONE entry (the country buttons drop every entry for a country,
+  which is wrong when two uploads of the same country are in play), and
+  setting start time, stop time and run length - per country and globally.
 
-762 passing, smoke 10/10.
+The local model stops derailing
+  chat_json now CONSTRAINS the reply to JSON where the backend supports it
+  (ollama format=json, OpenAI response_format) instead of only asking for
+  it in the prompt. A small local model told "reply with one JSON object"
+  returns prose often enough to matter, and that failure surfaced as the
+  router defaulting to "spawn a task" for a plain question. Gateways that
+  reject the field get the request retried without it.
+
+  The router also reads Banglish deterministically now - "banao",
+  "pathao", "ki obostha", "ar ekta" - so the common instructions never
+  need the model at all, which is the point: they have to keep working
+  when every provider is rate-limited.
+
+Two hot-path costs found while chasing an end-to-end test that passed
+alone and failed in the suite: inspect.signature() ran on every chat_json
+call, and the router recompiled every regex on every message. Both are
+now done once. The symptom to recognise is notify_interrupted in the log
+- the worker was stopped mid-notification, i.e. the test ran out of wall
+clock rather than the logic breaking.
+
+810 passing.

@@ -27,7 +27,17 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, Response, UploadFile
+from fastapi import (
+    Body,
+    Depends,
+    FastAPI,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -197,6 +207,7 @@ class OtpCountryRequest(BaseModel):
     delete_when_done: bool | None = None
     paused: bool | None = None
     stop_at: str | None = Field(default=None, max_length=5)
+    start_at: str | None = Field(default=None, max_length=5)
     tag: str | None = Field(default=None, max_length=60)
     force_delete_before_add: bool | None = None
     note: str | None = Field(default=None, max_length=200, alias="_note")
@@ -232,6 +243,9 @@ class OtpBotConfigRequest(BaseModel):
     auto_start: bool | None = None
     skip_add_if_stocked: bool | None = None
     stop_at: str | None = Field(default=None, max_length=5)
+    start_at: str | None = Field(default=None, max_length=5)
+    default_run_minutes: int | None = Field(default=None, ge=0, le=100000)
+    ask_run_time: bool | None = None
     interval_minutes: int | None = None
     default_tag: str | None = None
 
@@ -763,7 +777,9 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/api/chat/upload", dependencies=[Depends(require_api_access)])
-    async def chat_upload(file: UploadFile) -> dict[str, Any]:
+    async def chat_upload(
+        file: UploadFile, caption: str = Form(default="")
+    ) -> dict[str, Any]:
         """Save an uploaded file the exact same way Telegram's F.document
         handler does (app/telegram/bot.py): into uploads/, remembered as
         pending_upload on the owner's chat session so it auto-attaches to
@@ -826,13 +842,16 @@ def create_app() -> FastAPI:
         # elsewhere an upload is just an attachment for the next instruction.
         queued = False
         countries: dict[str, int] = {}
+        caption_note = ""
+        needs_run_time: dict[str, Any] | None = None
         auto_started: dict[str, Any] | None = None
         if await otp_bot.is_otp_thread(chat_id):
-            analysis = await otp_bot.enqueue_file(rel, safe_name)
+            analysis = await otp_bot.enqueue_file(rel, safe_name, caption)
             countries = analysis["countries"]
+            caption_note = analysis.get("caption_note", "")
             queued = True
             # An upload into this thread means "run it"; only files still
-            # waiting on a tag hold it back.
+            # waiting on a tag (or on a run length) hold it back.
             started = await otp_bot.maybe_auto_start()
             if started is not None:
                 auto_started = {
@@ -842,6 +861,20 @@ def create_app() -> FastAPI:
                         otp_bot.format_start_result(started) if started["ok"] else ""
                     ),
                 }
+            else:
+                needing = await otp_bot.countries_needing_runtime(
+                    await otp_bot.get_queue()
+                )
+                if needing:
+                    cfg = await otp_bot.get_config()
+                    await otp_bot.set_awaiting_runtime(needing)
+                    needs_run_time = {
+                        "countries": needing,
+                        "default_minutes": int(cfg.get("default_run_minutes") or 0),
+                        "question": otp_bot.runtime_question(
+                            needing, int(cfg.get("default_run_minutes") or 0)
+                        ),
+                    }
 
         return {
             "saved": True,
@@ -849,6 +882,8 @@ def create_app() -> FastAPI:
             "name": safe_name,
             "queued_for_otpbot": queued,
             "countries": countries,
+            "caption_note": caption_note,
+            "needs_run_time": needs_run_time,
             "auto_started": auto_started,
         }
 
@@ -891,11 +926,14 @@ def create_app() -> FastAPI:
         # None-filter would silently discard.
         patch = payload.model_dump(exclude_unset=True)
         patch = {k: v for k, v in patch.items() if v is not None}
-        if "stop_at" in patch:
-            try:
-                patch["stop_at"] = otp_schedule.parse_stop_time(patch["stop_at"])
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Both clock fields are free text from a form; validate them the same
+        # way the chat command does rather than storing "9pm" and never firing.
+        for field in ("stop_at", "start_at"):
+            if field in patch:
+                try:
+                    patch[field] = otp_schedule.parse_stop_time(patch[field])
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
         return await otp_bot.save_config(patch)
 
     @app.get("/api/otpbot/status", dependencies=[Depends(require_api_access)])
@@ -1054,13 +1092,14 @@ def create_app() -> FastAPI:
         from app.automation import otp_bot, otp_schedule
 
         values = payload.model_dump(exclude_unset=True)
-        # stop_at arrives as free text from a form; validate it the same way
-        # the chat command does rather than storing "9pm" and never firing.
-        if values.get("stop_at") is not None:
-            try:
-                values["stop_at"] = otp_schedule.parse_stop_time(values["stop_at"])
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Clock fields arrive as free text from a form; validate them the same
+        # way the chat command does rather than storing "9pm" and never firing.
+        for field in ("stop_at", "start_at"):
+            if values.get(field) is not None:
+                try:
+                    values[field] = otp_schedule.parse_stop_time(values[field])
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
         applied = await otp_schedule.set_country_settings(country, values)
         if "interval_minutes" in values and values["interval_minutes"]:
             await otp_schedule.arm_country(country, int(values["interval_minutes"]))

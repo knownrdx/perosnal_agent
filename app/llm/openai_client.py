@@ -62,7 +62,12 @@ class OpenAIClient(LLMClient):
     def _is_reasoning_model(self) -> bool:
         return self.model.lower().startswith(_REASONING_PREFIXES)
 
-    def _payload(self, messages: list[Message], temperature: float | None) -> dict[str, Any]:
+    def _payload(
+        self,
+        messages: list[Message],
+        temperature: float | None,
+        json_mode: bool = False,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [m.as_dict() for m in messages],
@@ -73,15 +78,24 @@ class OpenAIClient(LLMClient):
         else:
             payload["temperature"] = self.temperature if temperature is None else temperature
             payload["max_tokens"] = self.max_tokens
+        if json_mode:
+            # Constrain the reply to a JSON object where the endpoint supports
+            # it. Unknown gateways may reject the field, so the caller retries
+            # without it rather than losing the request (see chat()).
+            payload["response_format"] = {"type": "json_object"}
         return payload
 
     async def chat(
-        self, messages: list[Message], *, temperature: float | None = None
+        self,
+        messages: list[Message],
+        *,
+        temperature: float | None = None,
+        json_mode: bool = False,
     ) -> LLMResponse:
         if not self.api_key:
             raise LLMError(f"{self.name}: API key is not configured")
 
-        payload = self._payload(messages, temperature)
+        payload = self._payload(messages, temperature, json_mode)
         last_error: Exception | None = None
 
         for attempt in range(1, 4):
@@ -98,6 +112,20 @@ class OpenAIClient(LLMClient):
                     raise LLMError(f"{self.name}: server error {response.status_code}")
                 if response.status_code >= 400:
                     detail = _error_detail(response)
+                    # Not every OpenAI-compatible gateway implements
+                    # response_format. Dropping it and retrying is strictly
+                    # better than failing the request: extract_json() already
+                    # copes with a prose-wrapped reply.
+                    if "response_format" in payload and (
+                        "response_format" in detail.lower()
+                        or "json_object" in detail.lower()
+                    ):
+                        log.info(
+                            "llm_json_mode_unsupported",
+                            extra={"provider": self.name, "model": self.model},
+                        )
+                        payload.pop("response_format", None)
+                        continue
                     raise LLMError(f"{self.name}: {response.status_code} {detail}")
 
                 data = response.json()

@@ -6,6 +6,7 @@ llama.cpp / an API provider later means adding one file here, nothing else.
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 from abc import ABC, abstractmethod
@@ -56,14 +57,61 @@ class LLMClient(ABC):
     ) -> dict[str, Any]:
         """Chat and parse a JSON object out of the reply.
 
-        Local models often wrap JSON in prose or ```json fences, so we extract
-        the first balanced object rather than trusting ``json.loads`` blindly.
+        Backends that can CONSTRAIN generation to JSON (ollama's format=json,
+        the OpenAI response_format) are asked to - a 3B local model told
+        "reply with one JSON object" in the prompt will still return prose
+        often enough to matter, and that failure surfaces as the router
+        falling back to "spawn a task" for a plain question.
+
+        Prose is still handled: local models wrap JSON in ```json fences, so
+        the first balanced object is extracted rather than trusting
+        ``json.loads`` blindly.
         """
-        response = await self.chat(messages, temperature=temperature)
+        response = await self.chat(
+            messages, temperature=temperature, **_json_kwargs(self.chat)
+        )
         data = extract_json(response.content)
         if data is None:
             raise LLMError(f"model did not return JSON: {response.content[:400]!r}")
         return data
+
+
+def _json_kwargs(chat_callable: Any) -> dict[str, Any]:
+    """``{"json_mode": True}`` if this backend accepts it, else ``{}``.
+
+    Checked by signature rather than by catching TypeError: a TypeError
+    raised INSIDE a backend's chat() would otherwise be silently retried as
+    "this backend is old", hiding a real bug.
+
+    Cached on the underlying function, because this runs on every single
+    chat_json() call and ``inspect.signature`` is not cheap - the answer
+    depends only on the method's declaration, which never changes at runtime.
+    """
+    func = getattr(chat_callable, "__func__", chat_callable)
+    cached = _JSON_KWARGS_CACHE.get(func)
+    if cached is not None:
+        return cached
+
+    try:
+        parameters = inspect.signature(chat_callable).parameters
+    except (TypeError, ValueError):  # pragma: no cover - exotic callables
+        result: dict[str, Any] = {}
+    else:
+        supported = "json_mode" in parameters or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+        )
+        result = {"json_mode": True} if supported else {}
+
+    try:
+        _JSON_KWARGS_CACHE[func] = result
+    except TypeError:  # pragma: no cover - unhashable callable
+        pass
+    return result
+
+
+# Keyed on the function object, so it is bounded by the number of backend
+# classes (a handful) rather than growing per client instance.
+_JSON_KWARGS_CACHE: dict[Any, dict[str, Any]] = {}
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)

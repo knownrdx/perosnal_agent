@@ -51,7 +51,11 @@ class OllamaClient(LLMClient):
         return self._client
 
     async def chat(
-        self, messages: list[Message], *, temperature: float | None = None
+        self,
+        messages: list[Message],
+        *,
+        temperature: float | None = None,
+        json_mode: bool = False,
     ) -> LLMResponse:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -67,6 +71,13 @@ class OllamaClient(LLMClient):
                 "num_ctx": self.num_ctx,
             },
         }
+        if json_mode:
+            # Ollama constrains generation to valid JSON at the sampler, so a
+            # small local model cannot wander off into prose or a markdown
+            # fence. Asking a 3B model nicely in the prompt does not work;
+            # this does, and it is what makes the local fallback usable for
+            # routing and planning at all.
+            payload["format"] = "json"
 
         last_error: Exception | None = None
         for attempt in range(1, 4):

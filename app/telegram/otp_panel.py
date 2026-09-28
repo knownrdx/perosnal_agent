@@ -111,11 +111,16 @@ def control_keyboard(enabled: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="\u23FB Country on/off", callback_data=f"{PREFIX}:ask_onoff:"),
         ],
         [
+            InlineKeyboardButton(text="\u25B6\uFE0F On at", callback_data=f"{PREFIX}:ask_startall:"),
             InlineKeyboardButton(text="\u23F0 Off at", callback_data=f"{PREFIX}:ask_stopall:"),
+        ],
+        [
+            InlineKeyboardButton(text="\u23F3 Koto somoy", callback_data=f"{PREFIX}:ask_runall:"),
             InlineKeyboardButton(text="\U0001F9F9 Cleanup", callback_data=f"{PREFIX}:ask_clean:"),
         ],
         [
             InlineKeyboardButton(text="\U0001F4D0 Presets", callback_data=f"{PREFIX}:ask_preset:"),
+            InlineKeyboardButton(text="\U0001F5D1 File delete", callback_data=f"{PREFIX}:ask_del1:"),
         ],
         [
             InlineKeyboardButton(
@@ -241,8 +246,18 @@ def country_field_keyboard(country_index: int, country: str, paused: bool = Fals
         ],
         [
             InlineKeyboardButton(
-                text="\u23F0 Kokhon off hobe (time)",
+                text="\u25B6\uFE0F Kokhon shuru hobe",
+                callback_data=f"{PREFIX}:pickstart:{country_index}",
+            ),
+            InlineKeyboardButton(
+                text="\u23F0 Kokhon off hobe",
                 callback_data=f"{PREFIX}:pickst:{country_index}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="\u23F3 Koto somoy cholbe",
+                callback_data=f"{PREFIX}:pickrt:{country_index}",
             ),
         ],
         [
@@ -251,6 +266,39 @@ def country_field_keyboard(country_index: int, country: str, paused: bool = Fals
             ),
         ],
     ])
+
+
+def file_delete_keyboard(
+    queue: list[dict[str, Any]], active: list[dict[str, Any]]
+) -> InlineKeyboardMarkup | None:
+    """One button per individual entry, queued or running, to drop just it.
+
+    The country-level buttons elsewhere remove every entry for that country
+    at once. That is usually what is wanted, but not when two uploads of the
+    same country are in play and only one is wrong - the web dashboard could
+    always delete a single entry and Telegram could not, which is the gap
+    this closes.
+    """
+    buttons: list[InlineKeyboardButton] = []
+    for entry in queue:
+        label = entry.get("country") or entry.get("name") or "?"
+        buttons.append(
+            InlineKeyboardButton(
+                text=f"\U0001F5D1 {label} ({entry.get('count') or 0}) \u00b7 queue",
+                callback_data=f"{PREFIX}:rm1:q:{entry['id']}",
+            )
+        )
+    for entry in active:
+        label = entry.get("country") or entry.get("name") or "?"
+        buttons.append(
+            InlineKeyboardButton(
+                text=f"\U0001F5D1 {label} ({entry.get('count') or 0}) \u00b7 running",
+                callback_data=f"{PREFIX}:rm1:a:{entry['id']}",
+            )
+        )
+    if not buttons:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=_rows(buttons, per_row=1))
 
 
 def stop_time_keyboard(country_index: int, current: str = "") -> InlineKeyboardMarkup:
@@ -271,6 +319,81 @@ def stop_time_keyboard(country_index: int, current: str = "") -> InlineKeyboardM
         InlineKeyboardButton(
             text=("\u2705 Kokhono na" if not current else "\u267E\uFE0F Kokhono na"),
             callback_data=f"{PREFIX}:cstop:{country_index}:never",
+        ),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def start_time_keyboard(country_index: int, current: str = "") -> InlineKeyboardMarkup:
+    """When should this country BEGIN, in Dubai time.
+
+    Index -1 sets the global default every country inherits, matching how the
+    stop-time picker already works.
+    """
+    choices = ("06:00", "09:00", "12:00", "18:00", "21:00", "23:00")
+    buttons = [
+        InlineKeyboardButton(
+            text=(f"\u2705 {t}" if t == current else t),
+            callback_data=f"{PREFIX}:cstart:{country_index}:{t}",
+        )
+        for t in choices
+    ]
+    rows = _rows(buttons, per_row=3)
+    rows.append([
+        InlineKeyboardButton(
+            text="\u270F\uFE0F Onno time", callback_data=f"{PREFIX}:cstartc:{country_index}"
+        ),
+        InlineKeyboardButton(
+            text=("\u2705 Ekhoni" if not current else "\u25B6\uFE0F Ekhoni"),
+            callback_data=f"{PREFIX}:cstart:{country_index}:now",
+        ),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def runtime_keyboard() -> InlineKeyboardMarkup:
+    """How long a fresh upload should run. 0 = no limit, kept expressible."""
+    buttons = [
+        InlineKeyboardButton(
+            text=otp_bot.format_run_minutes(minutes),
+            callback_data=f"{PREFIX}:rt:{minutes}",
+        )
+        for minutes in otp_bot.RUNTIME_CHOICES
+        if minutes > 0
+    ]
+    rows = _rows(buttons, per_row=3)
+    rows.append([
+        InlineKeyboardButton(
+            text="\u270F\uFE0F Onno somoy", callback_data=f"{PREFIX}:rtc:"
+        ),
+        InlineKeyboardButton(
+            text="\u267E\uFE0F Limit nai", callback_data=f"{PREFIX}:rt:0"
+        ),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def country_runtime_keyboard(country_index: int, current: int | None) -> InlineKeyboardMarkup:
+    """Same choices, for one already-running country."""
+    buttons = [
+        InlineKeyboardButton(
+            text=(
+                ("\u2705 " if minutes == (current or 0) else "")
+                + otp_bot.format_run_minutes(minutes)
+            ),
+            callback_data=f"{PREFIX}:crt:{country_index}:{minutes}",
+        )
+        for minutes in otp_bot.RUNTIME_CHOICES
+        if minutes > 0
+    ]
+    rows = _rows(buttons, per_row=3)
+    rows.append([
+        InlineKeyboardButton(
+            text="\u270F\uFE0F Onno somoy", callback_data=f"{PREFIX}:crtc:{country_index}"
+        ),
+        InlineKeyboardButton(
+            text=("\u2705 Limit nai" if not current else "\u267E\uFE0F Limit nai"),
+            callback_data=f"{PREFIX}:crt:{country_index}:0",
         ),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -354,11 +477,20 @@ async def status_text() -> str:
             )
             state = "\u23F8 OFF" if row.get("paused") else "\u25B6\uFE0F on"
             stop_at = f", off at {row['stop_at']}" if row.get("stop_at") else ""
+            run_for = (
+                f", {otp_bot.format_run_minutes(row['run_minutes'])} cholbe"
+                if row.get("run_minutes") else ""
+            )
+            if row.get("waiting_to_start"):
+                # Not running yet - saying "next in 5m" for a country that
+                # will not touch the bot until 21:00 is simply false.
+                state = "\u23F0 WAIT"
+                when = f"starts {row.get('start_at')}"
             lines.append(
                 f"  {state} {country} ({entry.get('count') or 0})"
                 f" - {entry.get('tag') or 'General'}"
-                f" | every {row.get('interval_minutes')}m, restock {restock}{stop_at},"
-                f" next {when}{mark}"
+                f" | every {row.get('interval_minutes')}m, restock {restock}"
+                f"{stop_at}{run_for}, next {when}{mark}"
             )
         if any(overview.get(c, {}).get("customised") for c in overview):
             lines.append("  (* = custom settings for that country)")

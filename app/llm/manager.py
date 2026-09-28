@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.config import get_settings
-from app.llm.base import LLMClient, LLMError, LLMResponse, Message
+from app.llm.base import LLMClient, LLMError, LLMResponse, Message, _json_kwargs
 from app.logging_conf import get_logger
 
 log = get_logger(__name__)
@@ -505,7 +505,13 @@ class LLMManager(LLMClient):
             })
         return rows
 
-    async def chat(self, messages: list[Message], *, temperature: float | None = None) -> LLMResponse:
+    async def chat(
+        self,
+        messages: list[Message],
+        *,
+        temperature: float | None = None,
+        json_mode: bool = False,
+    ) -> LLMResponse:
         errors: list[str] = []
         order = self.fallback_order()
 
@@ -521,7 +527,11 @@ class LLMManager(LLMClient):
 
         for index, key in enumerate(live):
             try:
-                response = await self.client(key).chat(messages, temperature=temperature)
+                client = self.client(key)
+                extra = _json_kwargs(client.chat) if json_mode else {}
+                response = await client.chat(
+                    messages, temperature=temperature, **extra
+                )
                 self._clear_cooldown(key)
                 if index > 0:
                     log.warning("llm_fallback_used", extra={"provider": key})
@@ -537,7 +547,12 @@ class LLMManager(LLMClient):
     ) -> dict[str, Any]:
         from app.llm.base import extract_json
 
-        response = await self.chat(messages, temperature=temperature)
+        # json_mode asks every backend that supports it to CONSTRAIN output to
+        # JSON rather than merely being told to in the prompt. This is the
+        # difference between the local fallback being usable for routing and
+        # it derailing into prose, which showed up as a plain question
+        # spawning a whole task pipeline.
+        response = await self.chat(messages, temperature=temperature, json_mode=True)
         data = extract_json(response.content)
         if data is None:
             raise LLMError(f"model did not return JSON: {response.content[:400]!r}")

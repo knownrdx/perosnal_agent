@@ -51,6 +51,10 @@ OVERRIDABLE = (
     "delete_when_done",  # clear the country's numbers off the bot at the end
     "paused",            # temporarily off without losing its settings/place
     "stop_at",           # wall-clock time to stop, e.g. "23:30" (Dubai time)
+    # Wall-clock time to BEGIN, e.g. "21:00" (Dubai). Until it arrives the
+    # country sits in the active set doing nothing - the owner uploads during
+    # the day for a run that should only touch the target bot at night.
+    "start_at",
 )
 
 # Dubai is UTC+4 all year - no daylight saving - so a fixed offset is exact
@@ -124,6 +128,67 @@ def _stop_time_passed(stop_at: str, started_at: str | None) -> bool:
         # The time already passed on the start day, so it means tomorrow.
         target += timedelta(days=1)
     return now_local >= target
+
+
+def next_occurrence(clock: str, *, after: datetime | None = None) -> datetime | None:
+    """The next moment a "HH:MM" Dubai wall-clock time comes around.
+
+    Returns an aware UTC datetime, or None if the string is unusable. Used
+    for start times: "21:00" means 21:00 today if that is still ahead,
+    otherwise 21:00 tomorrow.
+    """
+    try:
+        hour, minute = (int(part) for part in str(clock).split(":", 1))
+    except (ValueError, AttributeError):
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+
+    reference = (after or _now()).astimezone(DUBAI_TZ)
+    target = reference.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= reference:
+        target += timedelta(days=1)
+    return target.astimezone(timezone.utc)
+
+
+def _start_time_reached(start_at: str, armed_at: str | None) -> bool:
+    """Has a country's start time arrived yet?
+
+    Measured from when the country was armed (upload/start), not from "today
+    at 00:00": a file queued at 22:00 with a 21:00 start is asking for 21:00
+    TOMORROW, not for a start time that technically already passed an hour
+    ago. Without the anchor such a run would begin instantly, which is the
+    opposite of what a start time is for.
+    """
+    clock = str(start_at or "").strip()
+    if not clock:
+        return True
+
+    anchor: datetime | None = None
+    if armed_at:
+        try:
+            anchor = datetime.fromisoformat(armed_at)
+        except ValueError:
+            anchor = None
+    begins = next_occurrence(clock, after=anchor)
+    if begins is None:
+        return True
+    return _now() >= begins
+
+
+def starts_at(start_at: str, armed_at: str | None) -> datetime | None:
+    """When a country with this start time will actually begin, or None."""
+    clock = str(start_at or "").strip()
+    if not clock:
+        return None
+    anchor: datetime | None = None
+    if armed_at:
+        try:
+            anchor = datetime.fromisoformat(armed_at)
+        except ValueError:
+            anchor = None
+    return next_occurrence(clock, after=anchor)
+
 
 # Starting points, not a closed list - the owner edits these or adds their
 # own. Chosen to span the range actually seen in practice: a country that
@@ -325,6 +390,12 @@ async def due_countries(countries: list[str], base: dict[str, Any]) -> list[str]
         if cfg.get("paused"):
             continue
 
+        # Not started yet: the owner asked for this country to begin at a
+        # wall-clock time. It sits in the active set, visible and countable,
+        # but nothing is sent to the target bot until that time arrives.
+        if not await has_started(country, base):
+            continue
+
         interval = max(1, int(cfg.get("interval_minutes", 10)))
 
         raw = due_map.get(key)
@@ -363,15 +434,49 @@ async def _save_run_state(state: dict[str, dict[str, Any]]) -> None:
         await repo.set_setting(session, RUN_STATE_KEY, state)
 
 
-async def begin_run(country: str) -> None:
-    """Mark a country as freshly started: zero refills, clock from now."""
+async def begin_run(country: str, *, armed_at: str | None = None) -> None:
+    """Mark a country as freshly started: zero refills, clock from now.
+
+    ``armed_at`` anchors a wall-clock start time. It defaults to now, which
+    is what an ordinary start means; callers pass it explicitly only to keep
+    an existing anchor across a re-arm.
+    """
     state = await _get_run_state()
+    now_iso = _now().isoformat()
     state[_key(country)] = {
-        "started_at": _now().isoformat(),
+        "started_at": now_iso,
+        "armed_at": armed_at or now_iso,
         "refills": 0,
         "display_name": country.strip(),
     }
     await _save_run_state(state)
+
+
+async def has_started(country: str, base: dict[str, Any]) -> bool:
+    """False while a country is still waiting for its wall-clock start time.
+
+    A country with no start_at (the common case) is always started, so this
+    is a no-op for everything that never asked to be scheduled.
+    """
+    cfg = await effective_config(country, base)
+    start_at = str(cfg.get("start_at") or "").strip()
+    if not start_at:
+        return True
+    state = await get_run_state(country)
+    return _start_time_reached(start_at, state.get("armed_at") or state.get("started_at"))
+
+
+async def pending_start_at(country: str, base: dict[str, Any]) -> datetime | None:
+    """When a not-yet-started country will begin, or None if it already has."""
+    cfg = await effective_config(country, base)
+    start_at = str(cfg.get("start_at") or "").strip()
+    if not start_at:
+        return None
+    state = await get_run_state(country)
+    anchor = state.get("armed_at") or state.get("started_at")
+    if _start_time_reached(start_at, anchor):
+        return None
+    return starts_at(start_at, anchor)
 
 
 async def record_refill(country: str) -> int:
@@ -410,23 +515,53 @@ async def finished_reason(country: str, base: dict[str, Any]) -> str | None:
     if not state:
         return None
 
+    # A country waiting for its start time has not run for a single minute,
+    # so no finish condition can have been met. Without this a "start 21:00,
+    # 8h run" upload made at 09:00 would be declared finished at 17:00 -
+    # before it had ever sent anything.
+    if not await has_started(country, base):
+        return None
+
     max_refills = int(cfg.get("max_refills") or 0)
     if max_refills and int(state.get("refills", 0)) >= max_refills:
         return f"{max_refills} bar re-add shesh"
 
     stop_at = str(cfg.get("stop_at") or "").strip()
-    if stop_at and _stop_time_passed(stop_at, state.get("started_at")):
+    if stop_at and _stop_time_passed(stop_at, _effective_start(cfg, state)):
         return f"{stop_at} (Dubai) time hoye geche"
 
     run_minutes = int(cfg.get("run_minutes") or 0)
     if run_minutes:
+        began_iso = _effective_start(cfg, state)
         try:
-            started = datetime.fromisoformat(state["started_at"])
-        except (KeyError, ValueError):
+            started = datetime.fromisoformat(began_iso) if began_iso else None
+        except (TypeError, ValueError):
+            return None
+        if started is None:
             return None
         if _now() >= started + timedelta(minutes=run_minutes):
             return f"{run_minutes} min shomoy shesh"
     return None
+
+
+def _effective_start(cfg: dict[str, Any], state: dict[str, Any]) -> str | None:
+    """When this run's clock actually began.
+
+    For a country with a wall-clock start time that is the moment the start
+    time arrived, NOT when the file was uploaded - "20h run, starts 21:00"
+    means twenty hours of running, not twenty hours minus however long it
+    waited. Everything else keeps using started_at unchanged.
+    """
+    start_at = str(cfg.get("start_at") or "").strip()
+    fallback = state.get("started_at")
+    if not start_at:
+        return fallback
+
+    anchor = state.get("armed_at") or fallback
+    began = starts_at(start_at, anchor)
+    if began is None:
+        return fallback
+    return began.isoformat()
 
 
 async def set_paused(country: str, paused: bool) -> dict[str, Any]:
@@ -474,6 +609,7 @@ async def schedule_overview(
         cfg = await effective_config(country, base)
         overrides = await get_country_settings(country)
         when = await get_due_at(country)
+        begins = await pending_start_at(country, base)
         rows.append({
             "country": country,
             "interval_minutes": cfg.get("interval_minutes"),
@@ -484,6 +620,12 @@ async def schedule_overview(
             "force_delete_before_add": bool(cfg.get("force_delete_before_add")),
             "paused": bool(cfg.get("paused")),
             "stop_at": cfg.get("stop_at") or "",
+            "start_at": cfg.get("start_at") or "",
+            # Null once running, so a UI can show "waiting until X" without
+            # having to recompute the wall-clock arithmetic itself.
+            "starts_at": begins.isoformat() if begins else None,
+            "starts_in_seconds": int((begins - now).total_seconds()) if begins else None,
+            "waiting_to_start": begins is not None,
             "max_refills": cfg.get("max_refills") or 0,
             "run_minutes": cfg.get("run_minutes") or 0,
             "customised": sorted(f for f in OVERRIDABLE if f in overrides),

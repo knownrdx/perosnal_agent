@@ -216,6 +216,30 @@ class SchedulerRunner:
             )
             return result.ok
 
+        # A country whose scheduled start time just arrived has only now sent
+        # its numbers for the first time. Said plainly, because from the
+        # owner's side the upload happened hours ago and silence since then
+        # is indistinguishable from the schedule having been forgotten.
+        if result.started_now:
+            lines = ["\u25B6\uFE0F Schedule onujayi shuru holo", ""]
+            for item in result.started_now:
+                if item.get("added"):
+                    lines.append(
+                        f"\u2022 {item['country']} - {item.get('count') or 0} number "
+                        f"add kora holo (tag: {item.get('tag') or 'General'})"
+                    )
+                else:
+                    lines.append(
+                        f"\u2022 \u26A0\uFE0F {item['country']} - add hoyni: "
+                        f"{item.get('error', '')[:150]}"
+                    )
+                    lines.append("    Porer cycle-e abar chesta korbo.")
+            await self.notifier.send(
+                self.settings.owner_chat_id,
+                "\n".join(lines),
+                dedupe_key=f"otp_started:{result.ran_at}",
+            )
+
         # A country that reached its own finish line is a completed run, not
         # a problem - reported separately so it never reads as a failure.
         if result.finished:

@@ -93,6 +93,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Wall-clock stop time (Dubai, "HH:MM"), inherited by every country
     # unless it sets its own. "" = never.
     "stop_at": "",
+    # Wall-clock START time (Dubai, "HH:MM"), same inheritance. "" = begin
+    # immediately, which is what every run did before this existed.
+    "start_at": "",
+    # How long a fresh upload runs for when the owner says nothing about it.
+    # 20h covers "upload tonight, still going tomorrow evening" without the
+    # run being immortal; 0 would mean forever, which is what silently
+    # happened before and is why runs were found still going days later.
+    "default_run_minutes": 1200,
+    # Ask about timing once per upload instead of assuming the default. Turn
+    # this off and every upload just takes default_run_minutes.
+    "ask_run_time": True,
     # Before adding, read the bot's own stock: a country that already holds
     # numbers does not need them sent again (the bot answers such an add with
     # pure duplicates). Monitoring still starts, so the refill happens the
@@ -338,6 +349,23 @@ SETTABLE_FIELDS: dict[str, dict[str, Any]] = {
         "type": "time",
         "label": "Stop at this time (Dubai, HH:MM; blank = never)",
         "example": "23:30",
+    },
+    "start_at": {
+        "type": "time",
+        "label": "Start at this time (Dubai, HH:MM; blank = right away)",
+        "example": "21:00",
+    },
+    "default_run_minutes": {
+        "type": "int",
+        "label": "Default run length for a new upload (minutes, 0 = no limit)",
+        "min": 0,
+        "max": 100000,
+        "example": "1200",
+    },
+    "ask_run_time": {
+        "type": "bool",
+        "label": "Ask how long a new upload should run",
+        "example": "on / off",
     },
     "paused": {
         "type": "bool",
@@ -655,6 +683,9 @@ class CycleResult:
     new_countries: list[str] = field(default_factory=list)
     # Countries that hit their own finish line (max re-adds / time limit).
     finished: list[dict[str, Any]] = field(default_factory=list)
+    # Countries whose wall-clock start time arrived during this cycle, so
+    # this pass is where their numbers were actually sent for the first time.
+    started_now: list[dict[str, Any]] = field(default_factory=list)
     files_processed: list[str] = field(default_factory=list)
     error: str = ""
     ran_at: str = field(default_factory=_now_iso)
@@ -865,7 +896,9 @@ async def get_active_files() -> list[dict[str, Any]]:
     return await _load_files(ACTIVE_KEY)
 
 
-async def enqueue_file(path: str, name: str) -> dict[str, Any]:
+async def enqueue_file(
+    path: str, name: str, caption: str = ""
+) -> dict[str, Any]:
     """Analyse an uploaded file and queue one entry PER COUNTRY found in it.
 
     A single upload routinely mixes countries (a "numbers" export can hold
@@ -874,12 +907,31 @@ async def enqueue_file(path: str, name: str) -> dict[str, Any]:
     one country's tag. Each country therefore becomes its own queue entry
     with its own split-out file, and each carries the service/tag last used
     for that country so the common case needs no questions at all.
+
+    ``caption`` is whatever the owner typed alongside the file. Anything it
+    states - service, country, start/stop time, run length - is taken as the
+    answer to a question that would otherwise be asked. Saying it once in the
+    caption and being asked it again anyway is the bot wasting the owner's
+    time.
     """
-    from app.automation import phone_countries
+    from app.automation import otp_caption, phone_countries
 
     source = safe_path(path, must_exist=True)
     lines = source.read_text(encoding="utf-8", errors="ignore").splitlines()
     grouped = phone_countries.split_by_country(lines)
+
+    stated = otp_caption.parse_caption(caption)
+
+    # A country named in the caption OVERRIDES what the numbers look like:
+    # the owner knows which stock this file is for, and a prefix table does
+    # not (routing prefixes, ported ranges, a country the bot lists under a
+    # name of its own). Only applied when the file is one bucket - with a
+    # genuinely mixed file the per-number split is the more informative
+    # answer and overriding it would merge distinct stock.
+    if stated.get("country") and len(grouped) == 1:
+        only = next(iter(grouped))
+        if only != stated["country"]:
+            grouped = {stated["country"]: grouped[only]}
 
     queue = await get_queue()
     created: list[dict[str, Any]] = []
@@ -909,17 +961,35 @@ async def enqueue_file(path: str, name: str) -> dict[str, Any]:
             "source_name": name,
             "country": country,
             "count": len(numbers),
-            "tag": await _decide_tag(name, country),
+            "tag": stated.get("tag") or await _decide_tag(name, country),
             "uploaded_at": _now_iso(),
         }
+        if caption.strip():
+            entry["caption"] = caption.strip()[:300]
         queue.append(entry)
         created.append(entry)
+
+        # Timing the caption stated is a per-country setting, so it survives
+        # into the run exactly like one set from a button.
+        timing: dict[str, Any] = {}
+        if "start_at" in stated:
+            timing["start_at"] = stated["start_at"]
+        if "stop_at" in stated:
+            timing["stop_at"] = stated["stop_at"]
+        if "run_minutes" in stated:
+            timing["run_minutes"] = int(stated["run_minutes"])
+        if timing:
+            await otp_schedule.set_country_settings(country, timing)
+        if stated.get("tag"):
+            await _set_last_tag(stated["tag"], country)
 
     await _save_files(QUEUE_KEY, queue)
     return {
         "batch_id": batch_id,
         "entries": created,
         "countries": {c: len(n) for c, n in grouped.items()},
+        "caption": stated,
+        "caption_note": otp_caption.describe(stated),
     }
 
 
@@ -1034,6 +1104,145 @@ async def get_awaiting_tag_entry() -> dict[str, Any] | None:
 
 async def set_awaiting_tag_entry(entry_id: str | None) -> None:
     await save_config({"awaiting_tag_entry_id": entry_id})
+
+
+# --------------------------------------------------------------------------- #
+# "How long should this run?" - asked once per upload, per country.
+#
+# Before this, an upload with no explicit limit ran until the owner
+# remembered to stop it, which in practice meant runs found still going days
+# later. The default is stated rather than silently applied: the owner is
+# told "20h" and can take it, change it, or say there is no limit at all.
+# --------------------------------------------------------------------------- #
+RUNTIME_ASK_KEY = f"{SETTING_KEY}_awaiting_runtime"
+
+# Offered as buttons. 0 means "no limit", which has to stay expressible -
+# some runs genuinely should go until stopped by hand.
+RUNTIME_CHOICES = (240, 480, 720, 1200, 1440, 2880, 0)
+
+
+def format_run_minutes(minutes: int) -> str:
+    """Human-readable run length, e.g. 1200 -> '20h'."""
+    minutes = int(minutes or 0)
+    if minutes <= 0:
+        return "kono limit nai"
+    if minutes % 1440 == 0:
+        return f"{minutes // 1440} din"
+    if minutes % 60 == 0:
+        return f"{minutes // 60}h"
+    if minutes > 60:
+        return f"{minutes // 60}h {minutes % 60}m"
+    return f"{minutes} min"
+
+
+def parse_run_minutes(text: str) -> int:
+    """Read a run length from free text. Raises ValueError with a message.
+
+    Accepts the way the owner actually writes it: "20h", "20 ghonta",
+    "90 min", "2 din", a bare number (minutes), and the various ways of
+    saying "no limit at all".
+    """
+    from app.automation import otp_caption
+
+    raw = text.strip()
+    if not raw:
+        raise ValueError("Koto somoy cholbe likho (jemon 20h), othoba 'limit nai'.")
+
+    lowered = " ".join(raw.casefold().split())
+    if any(phrase in lowered for phrase in otp_caption._NEVER_PHRASES):
+        return 0
+    if lowered in {"0", "no", "na", "never", "kichu na"}:
+        return 0
+
+    match = otp_caption._DURATION_RE.search(raw)
+    if match:
+        minutes = otp_caption._duration_minutes(int(match.group(1)), match.group(2))
+        if minutes > 0:
+            return minutes
+
+    digits = raw.replace(",", "").strip()
+    if digits.isdigit():
+        # A bare number is minutes - consistent with run_minutes everywhere
+        # else, and the buttons cover the common hour values anyway.
+        value = int(digits)
+        if value > 100_000:
+            raise ValueError("Eto boro somoy dite parbo na (max 100000 min).")
+        return value
+
+    raise ValueError(
+        "Bujhlam na. '20h', '90 min', '2 din', ba 'limit nai' emn kore likho."
+    )
+
+
+async def get_awaiting_runtime() -> dict[str, Any] | None:
+    """The upload batch currently being asked about, if that prompt is open."""
+    async with session_scope() as session:
+        stored = await repo.get_setting(session, RUNTIME_ASK_KEY)
+    return dict(stored) if stored else None
+
+
+async def set_awaiting_runtime(countries: list[str] | None) -> None:
+    async with session_scope() as session:
+        await repo.set_setting(
+            session,
+            RUNTIME_ASK_KEY,
+            {"countries": list(countries)} if countries else {},
+        )
+
+
+async def countries_needing_runtime(entries: list[dict[str, Any]]) -> list[str]:
+    """Which of these countries have no run limit of their own yet.
+
+    A country whose caption already said "20h", or that carries a limit from
+    an earlier run, is not asked again - the question exists to stop runs
+    being immortal by accident, not to be answered twice.
+    """
+    cfg = await get_config()
+    if not cfg.get("ask_run_time", True):
+        return []
+
+    needing: list[str] = []
+    for entry in entries:
+        country = entry.get("country") or entry.get("name") or ""
+        if not country or country in needing:
+            continue
+        own = await otp_schedule.get_country_settings(country)
+        if own.get("run_minutes") or own.get("stop_at"):
+            continue
+        if int(cfg.get("run_minutes") or 0) or str(cfg.get("stop_at") or "").strip():
+            # A global limit already applies; the country inherits it.
+            continue
+        needing.append(country)
+    return needing
+
+
+def runtime_question(countries: list[str], default_minutes: int) -> str:
+    """Ask how long this upload should run, stating the default plainly."""
+    from app.automation import otp_schedule
+
+    who = ", ".join(countries[:4]) + (" ..." if len(countries) > 4 else "")
+    clock = otp_schedule.clock_now()
+    return (
+        f"\u23F3 {who} - koto somoy cholbe?\n"
+        f"Ekhon {clock['dubai']} Dubai.\n\n"
+        f"Default: {format_run_minutes(default_minutes)} "
+        f"(kichu na bolle eitai boshbe).\n"
+        "Niche button, ba nijer moto likho: '20h', '90 min', '2 din', "
+        "'limit nai'."
+    )
+
+
+async def apply_runtime_answer(countries: list[str], minutes: int) -> str:
+    """Store the answer for every country in the batch and describe it."""
+    for country in countries:
+        await otp_schedule.set_country_settings(
+            country, {"run_minutes": int(minutes)}
+        )
+    await set_awaiting_runtime(None)
+    who = ", ".join(countries[:4]) + (" ..." if len(countries) > 4 else "")
+    if minutes <= 0:
+        return f"\u267E\uFE0F {who}: kono somoy limit nai - 'stop' na bola porjonto cholbe."
+    return f"\u23F3 {who}: {format_run_minutes(minutes)} cholbe, tarpor nijei bondho hobe."
 
 
 class AddRejected(Exception):
@@ -1211,6 +1420,67 @@ async def _finish_country(
     return outcome
 
 
+async def _add_after_wait(
+    target: str, entries: list[dict[str, Any]], cfg: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Do the first add for countries whose start time has just arrived.
+
+    Kept apart from the refill path because it is genuinely a start, not a
+    top-up: the cleanup command runs once, the run clock begins now, and the
+    waiting_start marker comes off so the next cycle treats the country as
+    ordinary. Never raises - a failure here is reported and the country is
+    retried next cycle rather than being silently dropped.
+    """
+    outcomes: list[dict[str, Any]] = []
+    if not entries:
+        return outcomes
+
+    try:
+        await get_userbot().send_message(target, cfg["cleanup_command"])
+        await _sleep(2)
+    except Exception as exc:  # noqa: BLE001 - cleanup is best-effort
+        log.warning("otp_bot_wait_cleanup_failed", extra={"error": str(exc)[:200]})
+
+    active = await get_active_files()
+    by_id = {e["id"]: e for e in active}
+    changed = False
+
+    for entry in entries:
+        country = entry.get("country") or entry["name"]
+        entry_cfg = await otp_schedule.effective_config(country, cfg)
+        outcome: dict[str, Any] = {
+            "country": country,
+            "count": entry.get("count"),
+            "tag": entry.get("tag"),
+            "added": False,
+            "error": "",
+        }
+        try:
+            outcome["reply"] = (await _add_one_file(target, entry, entry_cfg))[:300]
+            outcome["added"] = True
+        except (UserbotError, AddRejected, FileNotFoundError) as exc:
+            outcome["error"] = str(exc)[:300]
+        except Exception as exc:  # noqa: BLE001 - one bad country must not
+            log.exception("otp_bot_wait_add_error")   # kill the whole cycle
+            outcome["error"] = f"{type(exc).__name__}: {exc}"[:300]
+
+        outcomes.append(outcome)
+
+        if outcome["added"]:
+            # The run clock starts NOW, not when the file was uploaded: a
+            # "20h" run scheduled for 21:00 means twenty hours from 21:00.
+            await otp_schedule.begin_run(country)
+            stored = by_id.get(entry["id"])
+            if stored is not None:
+                stored.pop("waiting_start", None)
+                changed = True
+            entry.pop("waiting_start", None)
+
+    if changed:
+        await _save_files(ACTIVE_KEY, active)
+    return outcomes
+
+
 async def _add_one_file(target: str, entry: dict[str, Any], cfg: dict[str, Any]) -> str:
     """Send one file as a reply-based add; returns the bot's reply text.
     Raises AddRejected if the bot's own reply indicates the add failed
@@ -1359,9 +1629,33 @@ async def start_automation() -> dict[str, Any]:
             stock = await _stock_snapshot(target, cfg)
 
         needs_add: list[dict[str, Any]] = []
+        waiting: list[dict[str, Any]] = []
         for entry in queue:
             country = entry.get("country") or entry["name"]
             entry_cfg = await otp_schedule.effective_config(country, cfg)
+
+            # A country with a wall-clock start time must not touch the
+            # target bot yet. Arm it, show it, add nothing - the whole point
+            # of "start at 21:00" is that nothing happens before 21:00.
+            start_at = str(entry_cfg.get("start_at") or "").strip()
+            if start_at:
+                entry["waiting_start"] = start_at
+                waiting.append(entry)
+                begins = otp_schedule.next_occurrence(start_at)
+                result["files"].append({
+                    "name": entry["name"],
+                    "country": entry.get("country"),
+                    "count": entry.get("count"),
+                    "tag": entry["tag"],
+                    "interval_minutes": entry_cfg.get("interval_minutes"),
+                    "added": False,
+                    "waiting_start": start_at,
+                    "starts_at": begins.isoformat() if begins else None,
+                    "reply": f"{start_at} (Dubai) e shuru hobe",
+                })
+                continue
+            entry.pop("waiting_start", None)
+
             have = _stock_for(stock, country) if stock else None
             threshold = int(entry_cfg.get("quota_threshold") or 0)
             if have is not None and have > threshold:
@@ -1414,7 +1708,10 @@ async def start_automation() -> dict[str, Any]:
                 country, int(entry_cfg.get("interval_minutes", 10))
             )
             # Fresh run: the refill count and the time limit both start now,
-            # not from whenever this country last ran.
+            # not from whenever this country last ran. For a country waiting
+            # on a start time the clock is re-based when that time actually
+            # arrives (see _add_after_wait) - what begin_run records here is
+            # the anchor the start time is measured from.
             await otp_schedule.begin_run(country)
 
         await save_config({"enabled": True, "awaiting_tag_entry_id": None})
@@ -1474,6 +1771,10 @@ async def maybe_auto_start() -> dict[str, Any] | None:
     # A file still waiting on its tag is not ready; the tag answer itself
     # calls back in here once it lands.
     if any(not e.get("tag") for e in queue):
+        return None
+    # Nor is one still waiting on "how long should this run?" - starting
+    # first and asking after would leave a gap where the run has no limit.
+    if await countries_needing_runtime(queue):
         return None
 
     result = await start_automation()
@@ -1547,12 +1848,20 @@ def help_text() -> str:
     return (
         "\U0001F501 OTP-bot - ja ja bola jay:\n"
         "\n"
-        "File dile nijei shuru hoy (tag jana thakle). Tag na janle ekbar jiggesh korbe.\n"
+        "File dile nijei shuru hoy. File-er sathe caption likhle oitai\n"
+        "answer hishebe nibo - ja likhbe na, shudhu oitai jiggesh korbo.\n"
+        "\n"
+        "Caption-e ja bola jay:\n"
+        "  bangladesh whatsapp 20h      - country + service + koto somoy\n"
+        "  shuru 21:00 bondho 06:00     - kokhon on, kokhon off (Dubai)\n"
+        "  telegram, kono stop nai      - service, somoy limit chara\n"
+        "  nigeria 2 din                - country + koto din cholbe\n"
         "\n"
         "Lekha:\n"
         "  start / shuru    - shuru koro\n"
         "  stop / bondho    - thamao\n"
         "  status           - ekhon ki cholche\n"
+        "  20h / 90 min / limit nai - koto somoy cholbe (jiggesh korle)\n"
         "  <country> bad dao - oi country bad\n"
         "  sob bad dao      - queue khali koro\n"
         "\n"
@@ -1561,7 +1870,8 @@ def help_text() -> str:
         "  /otpset    - setting dekho / bodlao\n"
         "  /otppreset - preset list / save / apply\n"
         "\n"
-        "Button diye: interval, restock point, country on/off, off-time, preset - sob."
+        "Button diye: interval, restock point, country on/off, on-time,\n"
+        "off-time, koto somoy cholbe, ekta file delete, preset - sob."
     )
 
 
@@ -1672,7 +1982,11 @@ async def _notify_owner(text: str) -> None:
 
 def _format_start_success(result: dict[str, Any]) -> str:
     added = [f for f in result["files"] if f.get("added", True)]
-    held = [f for f in result["files"] if not f.get("added", True)]
+    waiting = [f for f in result["files"] if f.get("waiting_start")]
+    held = [
+        f for f in result["files"]
+        if not f.get("added", True) and not f.get("waiting_start")
+    ]
 
     head = "\u2705 Auto-start" if result.get("auto") else "\u2705 Shuru hoye geche"
     lines = [f"{head} - {len(added)} file add kora holo {result['target_bot']}-e."]
@@ -1680,6 +1994,14 @@ def _format_start_success(result: dict[str, Any]) -> str:
         country = f.get("country") or "?"
         lines.append(f"  {country} - {f['count']} number (tag: {f['tag']})")
         lines.append(f"     {str(f['reply'])[:150]}")
+    # Scheduled countries have not been touched at all yet - saying so is the
+    # difference between "waiting as asked" and "my file was ignored".
+    for f in waiting:
+        country = f.get("country") or "?"
+        lines.append(
+            f"  \u23F0 {country} - {f['count']} number, "
+            f"{f['waiting_start']} (Dubai) e shuru hobe (tag: {f['tag']})"
+        )
     # Files held back are not failures - the country already had numbers, so
     # sending them now would only produce duplicates. Say so plainly, or it
     # reads as "my file was ignored".
@@ -1758,6 +2080,12 @@ async def handle_start_trigger() -> str:
             return await handle_resume_trigger()
         return "Kono file queue-e nai. Age file upload koro, tarpor 'start' bolo."
 
+    needing = await countries_needing_runtime(queue)
+    if needing:
+        cfg = await get_config()
+        await set_awaiting_runtime(needing)
+        return runtime_question(needing, int(cfg.get("default_run_minutes") or 0))
+
     result = await start_automation()
     if result["ok"]:
         text = _format_start_success(result)
@@ -1779,8 +2107,64 @@ async def _continue_after_tagging(prefix: str) -> str:
         await set_awaiting_tag_entry(next_entry["id"])
         return f"{prefix}\n\n{_tag_question(next_entry)}"
 
-    if not await get_queue():
+    queue = await get_queue()
+    if not queue:
         return f"{prefix}\n\nQueue ekhon khali. Notun file dao, tarpor 'start' bolo."
+
+    # Tags are settled; the remaining question is how long it should run.
+    # Asked once for the whole batch, and only for the countries that do not
+    # already have an answer from their caption or a previous run.
+    needing = await countries_needing_runtime(queue)
+    if needing:
+        cfg = await get_config()
+        await set_awaiting_runtime(needing)
+        return (
+            f"{prefix}\n\n"
+            + runtime_question(needing, int(cfg.get("default_run_minutes") or 0))
+        )
+
+    result = await start_automation()
+    if result["ok"]:
+        text_out = _format_start_success(result)
+        await _notify_owner(f"\U0001F7E2 OTP-bot automation started.\n\n{text_out}")
+        return f"{prefix}\n\n{text_out}"
+    return f"{prefix}\n\n\u274C Start korte parlam na: {result['error']}"
+
+
+async def handle_runtime_answer(text: str) -> str:
+    """Owner answered the "how long should this run?" question."""
+    pending = await get_awaiting_runtime()
+    countries = list((pending or {}).get("countries") or [])
+    if not countries:
+        return "Kono somoy-er proshno khola nai."
+
+    if is_skip_trigger(text):
+        # Skipping takes the stated default rather than leaving the run
+        # unlimited - an unanswered question must not quietly become the
+        # riskier option.
+        cfg = await get_config()
+        minutes = int(cfg.get("default_run_minutes") or 0)
+        note = await apply_runtime_answer(countries, minutes)
+        return await _continue_after_runtime(f"{note} (default)")
+
+    try:
+        minutes = parse_run_minutes(text)
+    except ValueError as exc:
+        return f"\u274C {exc}\n\nAbar likho, othoba 'bad' bollei default boshbe."
+
+    note = await apply_runtime_answer(countries, minutes)
+    return await _continue_after_runtime(note)
+
+
+async def _continue_after_runtime(prefix: str) -> str:
+    """The run length is settled - start, unless something else is pending."""
+    next_entry = await next_untagged_entry()
+    if next_entry is not None:
+        await set_awaiting_tag_entry(next_entry["id"])
+        return f"{prefix}\n\n{_tag_question(next_entry)}"
+
+    if not await get_queue():
+        return f"{prefix}\n\nQueue khali - notun file dao."
 
     result = await start_automation()
     if result["ok"]:
@@ -1901,9 +2285,11 @@ async def run_cycle(config: dict[str, Any] | None = None, *, force: bool = False
     countries = [e.get("country") or e["name"] for e in active_files]
     if force:
         # A manual check looks at everything, and still re-arms the timers so
-        # the next automatic pass is measured from now.
-        ready = countries
-        for country in countries:
+        # the next automatic pass is measured from now. A country still
+        # waiting for its start time is exempt: "Check now" means check what
+        # is running, not "override the schedule I just set".
+        ready = [c for c in countries if await otp_schedule.has_started(c, cfg)]
+        for country in ready:
             entry_cfg = await otp_schedule.effective_config(country, cfg)
             await otp_schedule.arm_country(
                 country, int(entry_cfg.get("interval_minutes", 10))
@@ -1919,6 +2305,13 @@ async def run_cycle(config: dict[str, Any] | None = None, *, force: bool = False
     due_files = [
         e for e in active_files if (e.get("country") or e["name"]) in set(ready)
     ]
+
+    # A scheduled country whose start time has now arrived was deliberately
+    # never added at start(). Its first cycle is that add - without this it
+    # would sit forever being "checked" against stock it never contributed.
+    newly_started = [e for e in due_files if e.get("waiting_start")]
+    if newly_started:
+        result.started_now = await _add_after_wait(target, newly_started, cfg)
 
     try:
         # Anchor on the last bot message before asking, so a slow answer is

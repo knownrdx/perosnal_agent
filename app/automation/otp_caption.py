@@ -1,0 +1,295 @@
+"""Read the settings out of an upload's caption.
+
+The owner uploads a numbers file and, more often than not, already says what
+they want in the caption: "bangladesh whatsapp 20h", "start 21:00 stop 06:00",
+"facebook, kono stop nai". Asking those same questions back one button at a
+time is the bot making the owner repeat themselves.
+
+So: anything the caption states is taken, and ONLY what is missing is asked.
+Three things can be stated -
+
+    service/tag   "whatsapp", "tag: fb", "service telegram"
+    country       any country name this module's table knows
+    timing        a start time, a stop time, or a run length
+
+Deliberately conservative. A caption that says nothing parses to nothing and
+the normal questions happen exactly as before; a word that merely looks like a
+service is not one. Getting this wrong silently files numbers under the wrong
+service, which is worse than one extra question.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+# Services the target bot actually sells. Matched case-insensitively with a
+# few spellings/abbreviations the owner uses in practice.
+SERVICE_ALIASES: dict[str, str] = {
+    "whatsapp": "WhatsApp", "whats app": "WhatsApp", "wa": "WhatsApp",
+    "wp": "WhatsApp", "wtsp": "WhatsApp", "hoyatsapp": "WhatsApp",
+    "telegram": "Telegram", "tg": "Telegram", "tele": "Telegram",
+    "facebook": "Facebook", "fb": "Facebook", "face book": "Facebook",
+    "google": "Google", "gmail": "Google", "gm": "Google",
+    "instagram": "Instagram", "insta": "Instagram", "ig": "Instagram",
+    "signal": "Signal",
+    "viber": "Viber", "imo": "IMO", "tiktok": "TikTok", "tik tok": "TikTok",
+    "twitter": "Twitter", "x": "Twitter", "discord": "Discord",
+    "snapchat": "Snapchat", "snap": "Snapchat", "line": "Line",
+    "wechat": "WeChat", "uber": "Uber", "amazon": "Amazon",
+    "general": "General", "gen": "General",
+}
+
+# Two-letter aliases are real words in Banglish ("wa", "x", "gm"), so they
+# only count when explicitly introduced as a service/tag.
+_SHORT_ALIASES = {alias for alias in SERVICE_ALIASES if len(alias) <= 2}
+
+_TAG_INTRO_RE = re.compile(
+    r"\b(?:service|tag|sarvice|servis)\s*[:=\-]?\s*([A-Za-z][A-Za-z ]{0,18})",
+    re.IGNORECASE,
+)
+
+# "23:30", "23.30", "2330" (4 digits only - "230" is far more likely a count).
+_CLOCK_RE = re.compile(r"\b([01]?\d|2[0-3])\s*[:.\u0964]\s*([0-5]\d)\b")
+_CLOCK_COMPACT_RE = re.compile(r"\b([01]\d|2[0-3])([0-5]\d)\b")
+# "9pm", "9 pm", "11:30pm"
+_AMPM_RE = re.compile(r"\b(1[0-2]|0?\d)(?:\s*[:.]\s*([0-5]\d))?\s*(am|pm)\b", re.IGNORECASE)
+
+# "20h", "20 hours", "20 ghonta", "2 din", "90 min"
+_DURATION_RE = re.compile(
+    r"\b(\d{1,4})\s*"
+    r"(h|hr|hrs|hour|hours|ghonta|ghanta|ghonda|"
+    r"m|min|mins|minute|minutes|minit|"
+    r"d|day|days|din)\b",
+    re.IGNORECASE,
+)
+
+_HOUR_UNITS = {"h", "hr", "hrs", "hour", "hours", "ghonta", "ghanta", "ghonda"}
+_MINUTE_UNITS = {"m", "min", "mins", "minute", "minutes", "minit"}
+_DAY_UNITS = {"d", "day", "days", "din"}
+
+# Words placing a time as a START rather than a stop.
+_START_WORDS = (
+    "start", "shuru", "suru", "begin", "chalu", "theke", "thekei", "from",
+)
+# Words placing a time as a STOP.
+_STOP_WORDS = (
+    "stop", "off", "bondho", "bondo", "end", "shesh", "ses", "porjonto",
+    "until", "till", "porjonto",
+)
+# "no stop time at all"
+_NEVER_PHRASES = (
+    "kono stop nai", "kono stop time nai", "stop nai", "kono time nai",
+    "no stop", "never stop", "no limit", "limit nai", "unlimited",
+    "sara din", "sara rat", "sararat", "always", "24/7", "24x7",
+    "kokhono na", "bondho korbe na", "cholte thakbe",
+)
+
+
+def _nearest(text: str, words: tuple[str, ...], start: int, end: int) -> float | None:
+    """Distance from the match to the closest of ``words``, or None.
+
+    Distance, not position: "start 21:00 stop 06:00" names both, and each
+    time belongs to whichever keyword sits nearer to IT. Ranking by position
+    in the string instead would hand both times to the same keyword.
+
+    A keyword BEFORE the time counts as very slightly nearer than one the
+    same distance after it, because "start 21:00 stop 06:00" is written that
+    way round - the label precedes the value it labels.
+    """
+    lowered = text.casefold()
+    best: float | None = None
+    for word in words:
+        for match in re.finditer(rf"(?<![a-z0-9]){re.escape(word)}(?![a-z0-9])", lowered):
+            if match.end() <= start:
+                distance = float(start - match.end()) - 0.5
+            elif match.start() >= end:
+                distance = float(match.start() - end)
+            else:
+                distance = 0.0
+            if distance > 24:  # too far away to be talking about this time
+                continue
+            if best is None or distance < best:
+                best = distance
+    return best
+
+
+def _classify(text: str, start: int, end: int) -> str:
+    """Is the time at [start:end] a start time, a stop time, or unqualified?"""
+    start_at = _nearest(text, _START_WORDS, start, end)
+    stop_at = _nearest(text, _STOP_WORDS, start, end)
+    if start_at is not None and stop_at is not None:
+        return "start" if start_at < stop_at else "stop"
+    if start_at is not None:
+        return "start"
+    if stop_at is not None:
+        return "stop"
+    return ""
+
+
+def _clock_matches(text: str) -> list[tuple[str, int, int]]:
+    """Every wall-clock time in the caption as ("HH:MM", start, end)."""
+    found: list[tuple[str, int, int]] = []
+    taken: list[tuple[int, int]] = []
+
+    def overlaps(span: tuple[int, int]) -> bool:
+        return any(span[0] < end and start < span[1] for start, end in taken)
+
+    for match in _AMPM_RE.finditer(text):
+        hour = int(match.group(1)) % 12
+        minute = int(match.group(2) or 0)
+        if match.group(3).lower() == "pm":
+            hour += 12
+        found.append((f"{hour:02d}:{minute:02d}", match.start(), match.end()))
+        taken.append(match.span())
+
+    for match in _CLOCK_RE.finditer(text):
+        if overlaps(match.span()):
+            continue
+        found.append(
+            (f"{int(match.group(1)):02d}:{match.group(2)}", match.start(), match.end())
+        )
+        taken.append(match.span())
+
+    for match in _CLOCK_COMPACT_RE.finditer(text):
+        if overlaps(match.span()):
+            continue
+        found.append(
+            (f"{match.group(1)}:{match.group(2)}", match.start(), match.end())
+        )
+        taken.append(match.span())
+
+    return found
+
+
+def _duration_minutes(value: int, unit: str) -> int:
+    unit = unit.casefold()
+    if unit in _HOUR_UNITS:
+        return value * 60
+    if unit in _DAY_UNITS:
+        return value * 1440
+    if unit in _MINUTE_UNITS:
+        return value
+    return 0
+
+
+def _find_service(text: str) -> str | None:
+    """Service named in the caption, or None.
+
+    An explicit "service: X" wins and may name anything (the bot's service
+    list is the owner's to extend). Otherwise only a known alias counts, and
+    the very short ones need that explicit introduction - "wa" and "x" are
+    ordinary words.
+    """
+    intro = _TAG_INTRO_RE.search(text)
+    if intro:
+        raw = intro.group(1).strip().rstrip(".,;")
+        # Greedy capture: "tag fb bangladesh" must give "fb", not the country
+        # that followed it. Longest known alias first, so "whats app" beats
+        # "whatsapp" never mattering and "tik tok" stays one token.
+        lowered_raw = raw.casefold()
+        for alias in sorted(SERVICE_ALIASES, key=len, reverse=True):
+            if lowered_raw == alias or lowered_raw.startswith(alias + " "):
+                return SERVICE_ALIASES[alias]
+        if raw:
+            # Unknown service: take the first word only. The bot's service
+            # list is the owner's to extend, but a whole trailing sentence is
+            # never the tag.
+            return raw.split()[0][:60]
+
+    lowered = f" {' '.join(text.casefold().split())} "
+    best: tuple[int, str] | None = None
+    for alias, canonical in SERVICE_ALIASES.items():
+        if alias in _SHORT_ALIASES:
+            continue
+        if re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", lowered):
+            if best is None or len(alias) > best[0]:
+                best = (len(alias), canonical)
+    return best[1] if best else None
+
+
+def parse_caption(text: str) -> dict[str, Any]:
+    """Everything the caption states, as a dict of only the keys it stated.
+
+    Possible keys:
+        tag         str  - service to add the numbers under
+        country     str  - overrides what the numbers themselves say
+        start_at    str  - "HH:MM" Dubai, when the run should begin
+        stop_at     str  - "HH:MM" Dubai, when it should end
+        run_minutes int  - run this long from the start ("20h")
+        no_stop     bool - explicitly asked for no stop time at all
+    """
+    from app.automation import phone_countries
+
+    out: dict[str, Any] = {}
+    if not text or not text.strip():
+        return out
+
+    text = text.strip()
+    lowered = " ".join(text.casefold().split())
+
+    service = _find_service(text)
+    if service:
+        out["tag"] = service
+
+    country = phone_countries.find_country_name(text)
+    if country:
+        out["country"] = country
+
+    if any(phrase in lowered for phrase in _NEVER_PHRASES):
+        out["no_stop"] = True
+        out["stop_at"] = ""
+        out["run_minutes"] = 0
+
+    for value, start, end in _clock_matches(text):
+        kind = _classify(text, start, end)
+        if kind == "start":
+            out.setdefault("start_at", value)
+        elif kind == "stop":
+            out.pop("no_stop", None)
+            out["stop_at"] = value
+        else:
+            # An unqualified clock time in a caption about a run starting now
+            # reads as "run until then".
+            out.setdefault("stop_at", value)
+            out.pop("no_stop", None)
+
+    for match in _DURATION_RE.finditer(text):
+        minutes = _duration_minutes(int(match.group(1)), match.group(2))
+        if minutes <= 0:
+            continue
+        # A duration is a run LENGTH unless it is explicitly a delay
+        # ("2 ghonta por start"). Classifying it by nearby start/stop words
+        # instead swallowed "21:00 e start, 8h cholbe" entirely.
+        after = text[match.end() : match.end() + 12].casefold()
+        if re.match(r"\s*(por|pore|later|after)\b", after):
+            continue
+        out.pop("no_stop", None)
+        out["run_minutes"] = minutes
+        break
+
+    return out
+
+
+def describe(parsed: dict[str, Any]) -> str:
+    """One line naming what was read out of the caption, for the reply."""
+    parts: list[str] = []
+    if parsed.get("country"):
+        parts.append(f"country {parsed['country']}")
+    if parsed.get("tag"):
+        parts.append(f"service {parsed['tag']}")
+    if parsed.get("start_at"):
+        parts.append(f"start {parsed['start_at']}")
+    if parsed.get("stop_at"):
+        parts.append(f"stop {parsed['stop_at']}")
+    if parsed.get("run_minutes"):
+        minutes = int(parsed["run_minutes"])
+        if minutes % 60 == 0:
+            parts.append(f"{minutes // 60}h cholbe")
+        else:
+            parts.append(f"{minutes} min cholbe")
+    if parsed.get("no_stop"):
+        parts.append("kono stop time nai")
+    if not parts:
+        return ""
+    return "Caption theke: " + ", ".join(parts)

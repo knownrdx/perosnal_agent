@@ -967,6 +967,16 @@
                   <input type="time" id="otpbot-stop-at"
                          title="Every country stops at this time of day unless it sets its own. Blank = never.">
                 </div>
+                <div>
+                  <label for="otpbot-start-at">Start at (Dubai time)</label>
+                  <input type="time" id="otpbot-start-at"
+                         title="Nothing is sent to the target bot until this time of day. Blank = start right away.">
+                </div>
+                <div>
+                  <label for="otpbot-default-run">New upload runs for (minutes)</label>
+                  <input type="number" id="otpbot-default-run" min="0" value="1200"
+                         title="Offered as the default when a new upload does not say how long it should run. 0 = no limit.">
+                </div>
               </div>
               <p class="small" id="otpbot-limit-warning" style="display:none;"></p>
               <div class="row mt8">
@@ -1561,6 +1571,13 @@
 
     var formData = new FormData();
     formData.append("file", file);
+    // Whatever is already typed in the message box travels with the file as
+    // its caption - same as Telegram, where the owner types "bangladesh
+    // whatsapp 20h" alongside the upload and expects it to be read, not to
+    // be asked those three things back one at a time.
+    var messageBox = qs("#chat-input");
+    var caption = messageBox && messageBox.value ? messageBox.value.trim() : "";
+    if (caption) formData.append("caption", caption);
 
     fetch("/api/chat/upload", { method: "POST", credentials: "include", body: formData })
       .then(function (res) {
@@ -1578,7 +1595,21 @@
       })
       .then(function (data) {
         showPendingFile(data.name);
-        showConfirm("File attached - tell me what to do with it.");
+        if (caption && data.queued_for_otpbot && messageBox) {
+          // It was consumed as the caption, so leaving it in the box would
+          // send it again as a separate message.
+          messageBox.value = "";
+        }
+        if (data.caption_note) {
+          showConfirm(data.caption_note);
+        } else if (data.needs_run_time) {
+          showConfirm(data.needs_run_time.question);
+        } else if (data.auto_started && data.auto_started.ok) {
+          showConfirm("Started - " + Object.keys(data.countries || {}).join(", "));
+        } else {
+          showConfirm("File attached - tell me what to do with it.");
+        }
+        if (data.queued_for_otpbot) loadOtpBot();
       })
       .catch(function (e) {
         if (e && e.message !== "unauthorized") {
@@ -2259,6 +2290,9 @@
         qs("#otpbot-max-refills").value = cfg.max_refills != null ? cfg.max_refills : 0;
         qs("#otpbot-run-minutes").value = cfg.run_minutes != null ? cfg.run_minutes : 0;
         qs("#otpbot-stop-at").value = cfg.stop_at || "";
+        qs("#otpbot-start-at").value = cfg.start_at || "";
+        qs("#otpbot-default-run").value =
+          cfg.default_run_minutes != null ? cfg.default_run_minutes : 1200;
         qs("#otpbot-delete-when-done").checked = !!cfg.delete_when_done;
         qs("#otpbot-tidy-stock").checked = cfg.tidy_stock_messages !== false;
         renderOtpBotLimitWarning();
@@ -2449,6 +2483,9 @@
       run_minutes: isNaN(parseInt(qs("#otpbot-run-minutes").value, 10))
         ? 0 : parseInt(qs("#otpbot-run-minutes").value, 10),
       stop_at: qs("#otpbot-stop-at").value || "",
+      start_at: qs("#otpbot-start-at").value || "",
+      default_run_minutes: isNaN(parseInt(qs("#otpbot-default-run").value, 10))
+        ? 1200 : parseInt(qs("#otpbot-default-run").value, 10),
       delete_when_done: qs("#otpbot-delete-when-done").checked,
       tidy_stock_messages: qs("#otpbot-tidy-stock").checked,
       force_delete_before_add: qs("#otpbot-frcd-enabled").checked,
@@ -2521,9 +2558,15 @@
       var when = row.due_in_seconds == null
         ? "not scheduled"
         : (row.due_in_seconds <= 0 ? "due now" : "in " + Math.max(1, Math.floor(row.due_in_seconds / 60)) + "m");
-      label.textContent = (row.paused ? "OFF " : "")
+      if (row.waiting_to_start) {
+        // Saying "due in 5m" for a country that will not touch the bot
+        // until 21:00 is simply false.
+        when = "waiting for " + row.start_at;
+      }
+      label.textContent = (row.paused ? "OFF " : (row.waiting_to_start ? "WAIT " : ""))
         + row.country + " - every " + row.interval_minutes + "m, next " + when
         + (row.stop_at ? ", off at " + row.stop_at : "")
+        + (row.run_minutes ? ", runs " + row.run_minutes + "m" : "")
         + (row.customised && row.customised.length ? " *" : "");
       if (row.paused) label.style.opacity = "0.6";
       box.appendChild(label);
@@ -2573,11 +2616,27 @@
       stopAt.style.width = "110px";
       box.appendChild(stopAt);
 
+      var startAt = document.createElement("input");
+      startAt.type = "time";
+      startAt.value = row.start_at || "";
+      startAt.title = "Start this country at this time (Dubai). Blank = right away.";
+      startAt.style.width = "110px";
+      box.appendChild(startAt);
+
+      var runFor = document.createElement("input");
+      runFor.type = "number";
+      runFor.min = "0";
+      runFor.value = row.run_minutes || 0;
+      runFor.title = "Run for this many minutes, then stop (0 = no limit).";
+      runFor.style.width = "80px";
+      box.appendChild(runFor);
+
       var saveBtn = document.createElement("button");
       saveBtn.type = "button";
       saveBtn.textContent = "Save";
       saveBtn.addEventListener("click", function () {
         var t = parseInt(thresh.value, 10);
+        var r = parseInt(runFor.value, 10);
         apiFetchJson("/api/otpbot/country/" + encodeURIComponent(row.country) + "/settings", {
           method: "POST",
           body: {
@@ -2585,7 +2644,10 @@
             // 0 is meaningful ("wait until empty"), so NaN is the only fallback.
             quota_threshold: isNaN(t) ? row.quota_threshold : t,
             limit: parseInt(limit.value, 10) || row.limit,
-            stop_at: stopAt.value || ""
+            stop_at: stopAt.value || "",
+            start_at: startAt.value || "",
+            // 0 is meaningful here too ("no limit").
+            run_minutes: isNaN(r) ? (row.run_minutes || 0) : r
           }
         }).then(function () { showConfirm(row.country + " updated."); loadOtpBot(); })
           .catch(function () { showConfirm("Failed to save " + row.country + "."); });

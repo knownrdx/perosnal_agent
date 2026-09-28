@@ -893,6 +893,257 @@ class AgentBot:
                     )
                 return
 
+            if action == "ask_startall":
+                cfg = await otp_bot.get_config()
+                clock = otp_schedule.clock_now()
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        f"\u25B6\uFE0F Task kokhon SHURU hobe?\n"
+                        f"Ekhon {clock['dubai']} Dubai ({clock['utc']} UTC)\n"
+                        "Ei time na ashle bot e kichu pathabo na.",
+                        reply_markup=otp_panel.start_time_keyboard(
+                            -1, str(cfg.get("start_at") or "")
+                        ),
+                    )
+                return
+
+            if action == "cstart":
+                index_raw, value_raw = rest.split(":", 1)
+                index = int(index_raw)
+                start_at = "" if value_raw == "now" else value_raw
+                clock = otp_schedule.clock_now()
+
+                if index < 0:
+                    await otp_bot.save_config({"start_at": start_at})
+                    await query.answer(f"All: {start_at or 'ekhoni'}")
+                    await refresh_panel(
+                        f"\u25B6\uFE0F Shob country Dubai time {start_at} e shuru hobe "
+                        f"(ekhon {clock['dubai']})."
+                        if start_at
+                        else "\u25B6\uFE0F Kono start time nai - shathe shathe shuru hobe."
+                    )
+                    return
+
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                country = names[index]
+                await otp_schedule.set_country_settings(country, {"start_at": start_at})
+                await query.answer(f"{country}: {start_at or 'ekhoni'}")
+                await refresh_panel(
+                    f"\u25B6\uFE0F {country} Dubai time {start_at} e shuru hobe "
+                    f"(ekhon {clock['dubai']})."
+                    if start_at
+                    else f"\u25B6\uFE0F {country}: shathe shathe shuru hobe."
+                )
+                return
+
+            if action == "cstartc":
+                index = int(rest)
+                clock = otp_schedule.clock_now()
+                if index < 0:
+                    await otp_bot.set_pending_input("start_at", None)
+                    await query.answer()
+                    with contextlib.suppress(Exception):
+                        await query.message.answer(
+                            "\u25B6\uFE0F Shob country kon time e shuru hobe? HH:MM likho "
+                            f"(Dubai).\nEkhon {clock['dubai']} Dubai\n\n(Bad dite 'bad' likho.)"
+                        )
+                    return
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                country = names[index]
+                await otp_bot.set_pending_input("start_at", country)
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        f"\u25B6\uFE0F {country}: kon time e shuru hobe? HH:MM likho "
+                        f"(Dubai time).\nEkhon {clock['dubai']} Dubai / "
+                        f"{clock['utc']} UTC\n\n(Bad dite 'bad' likho.)"
+                    )
+                return
+
+            if action == "pickstart":
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                index = int(rest)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                country = names[index]
+                cfg = await otp_bot.get_config()
+                current = await otp_schedule.effective_config(country, cfg)
+                clock = otp_schedule.clock_now()
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        f"\u25B6\uFE0F {country}: kokhon shuru hobe?\n"
+                        f"Ekhon {clock['dubai']} Dubai ({clock['utc']} UTC)",
+                        reply_markup=otp_panel.start_time_keyboard(
+                            index, str(current.get("start_at") or "")
+                        ),
+                    )
+                return
+
+            # --- run length ------------------------------------------------ #
+            if action == "ask_runall":
+                cfg = await otp_bot.get_config()
+                await query.answer()
+                current = int(cfg.get("run_minutes") or 0)
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        "\u23F3 Shob country koto somoy cholbe?\n"
+                        f"Ekhon: {otp_bot.format_run_minutes(current)}\n"
+                        f"Notun upload-er default: "
+                        f"{otp_bot.format_run_minutes(int(cfg.get('default_run_minutes') or 0))}",
+                        reply_markup=otp_panel.country_runtime_keyboard(-1, current),
+                    )
+                return
+
+            if action == "crt":
+                index_raw, minutes_raw = rest.split(":", 1)
+                index, minutes = int(index_raw), int(minutes_raw)
+                if index < 0:
+                    await otp_bot.save_config({"run_minutes": minutes})
+                    await query.answer(otp_bot.format_run_minutes(minutes))
+                    await refresh_panel(
+                        f"\u23F3 Shob country {otp_bot.format_run_minutes(minutes)} cholbe."
+                        if minutes
+                        else "\u267E\uFE0F Kono somoy limit nai - 'stop' na bola porjonto cholbe."
+                    )
+                    return
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                country = names[index]
+                await otp_schedule.set_country_settings(country, {"run_minutes": minutes})
+                await query.answer(f"{country}: {otp_bot.format_run_minutes(minutes)}")
+                await refresh_panel(
+                    f"\u23F3 {country}: {otp_bot.format_run_minutes(minutes)} cholbe."
+                    if minutes
+                    else f"\u267E\uFE0F {country}: kono somoy limit nai."
+                )
+                return
+
+            if action == "crtc":
+                index = int(rest)
+                if index < 0:
+                    await otp_bot.set_pending_input("run_minutes", None)
+                    await query.answer()
+                    with contextlib.suppress(Exception):
+                        await query.message.answer(
+                            "\u23F3 Koto somoy cholbe? Minute-e number likho "
+                            "(0 = limit nai).\n\n(Bad dite 'bad' likho.)"
+                        )
+                    return
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                country = names[index]
+                await otp_bot.set_pending_input("run_minutes", country)
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        f"\u23F3 {country}: koto somoy cholbe? Minute-e number likho "
+                        "(0 = limit nai).\n\n(Bad dite 'bad' likho.)"
+                    )
+                return
+
+            if action == "pickrt":
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                names = otp_panel.country_names(entries)
+                index = int(rest)
+                if index >= len(names):
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                country = names[index]
+                cfg = await otp_bot.get_config()
+                current = await otp_schedule.effective_config(country, cfg)
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        f"\u23F3 {country}: koto somoy cholbe?",
+                        reply_markup=otp_panel.country_runtime_keyboard(
+                            index, int(current.get("run_minutes") or 0)
+                        ),
+                    )
+                return
+
+            # Answer to the "how long should this upload run?" question.
+            if action == "rt":
+                pending = await otp_bot.get_awaiting_runtime()
+                countries = list((pending or {}).get("countries") or [])
+                if not countries:
+                    await query.answer("Oi proshno ar khola nai.", show_alert=True)
+                    return
+                minutes = int(rest)
+                note = await otp_bot.apply_runtime_answer(countries, minutes)
+                await query.answer(otp_bot.format_run_minutes(minutes))
+                reply = await otp_bot._continue_after_runtime(note)
+                await self._send_next_prompt(query, reply)
+                return
+
+            if action == "rtc":
+                pending = await otp_bot.get_awaiting_runtime()
+                if not (pending or {}).get("countries"):
+                    await query.answer("Oi proshno ar khola nai.", show_alert=True)
+                    return
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        "\u23F3 Koto somoy cholbe? '20h', '90 min', '2 din', "
+                        "ba 'limit nai' likho."
+                    )
+                return
+
+            # --- delete one entry ------------------------------------------ #
+            if action == "ask_del1":
+                queue = await otp_bot.get_queue()
+                active = await otp_bot.get_active_files()
+                markup = otp_panel.file_delete_keyboard(queue, active)
+                await query.answer()
+                if markup is None:
+                    with contextlib.suppress(Exception):
+                        await query.message.answer("Kono file nai.")
+                    return
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        "\U0001F5D1 Kon ta bad dibo? (shudhu oi ekta entry jabe)\n"
+                        "queue = ekhono shuru hoyni, running = cholche",
+                        reply_markup=markup,
+                    )
+                return
+
+            if action == "rm1":
+                where, entry_id = rest.split(":", 1)
+                if where == "q":
+                    entry = next(
+                        (e for e in await otp_bot.get_queue() if e["id"] == entry_id), None
+                    )
+                    removed = await otp_bot.remove_from_queue(entry_id)
+                else:
+                    entry = await otp_bot.remove_active_file(entry_id)
+                    removed = entry is not None
+                if not removed:
+                    await query.answer("Already gone.", show_alert=True)
+                    return
+                label = (entry or {}).get("country") or (entry or {}).get("name") or "File"
+                await query.answer(f"{label} removed")
+                await refresh_panel(
+                    f"\U0001F5D1 {label} ({(entry or {}).get('count') or 0} number) bad deoa holo."
+                )
+                return
+
             if action == "ask_onoff":
                 entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
                 names = otp_panel.country_names(entries)
@@ -1431,9 +1682,15 @@ class AgentBot:
             from app.automation import otp_bot
 
             if await otp_bot.is_otp_thread(message.chat.id):
-                analysis = await otp_bot.enqueue_file(rel, safe_name)
+                # The caption is the owner already answering half the
+                # questions - country, service, when to start/stop. Read it
+                # and only ask for what is genuinely missing.
+                caption = (message.caption or "").strip()
+                analysis = await otp_bot.enqueue_file(rel, safe_name, caption)
                 countries = analysis["countries"]
                 lines = [f"\U0001F4C1 Saved: {safe_name}", ""]
+                if analysis.get("caption_note"):
+                    lines += [analysis["caption_note"], ""]
                 lines.append(f"Detected {len(countries)} country/countries:")
                 for country, count in countries.items():
                     lines.append(f"  \u2022 {country}: {count} numbers")
@@ -1449,6 +1706,7 @@ class AgentBot:
                 # Untagged entries ask their question first and auto-start
                 # from the tag answer instead.
                 started = await otp_bot.maybe_auto_start()
+                markup = None
                 if started is not None:
                     if started["ok"]:
                         lines += ["", otp_bot.format_start_result(started)]
@@ -1460,12 +1718,30 @@ class AgentBot:
                     if pending is not None:
                         await otp_bot.set_awaiting_tag_entry(pending["id"])
                         lines += ["", otp_bot.tag_question(pending)]
+                        markup = otp_panel.service_keyboard(pending["id"])
                 else:
-                    lines.append("Send more files, then tap Start when you're finished.")
+                    # Tags are all known; the one thing left to settle is how
+                    # long this should run. Asked with the default stated, so
+                    # a run can never become immortal just by not answering.
+                    needing = await otp_bot.countries_needing_runtime(queue)
+                    if needing:
+                        await otp_bot.set_awaiting_runtime(needing)
+                        lines += [
+                            "",
+                            otp_bot.runtime_question(
+                                needing, int(cfg.get("default_run_minutes") or 0)
+                            ),
+                        ]
+                        markup = otp_panel.runtime_keyboard()
+                    else:
+                        lines.append(
+                            "Send more files, then tap Start when you're finished."
+                        )
 
                 await message.answer(
                     "\n".join(lines),
-                    reply_markup=otp_panel.control_keyboard(bool(cfg["enabled"])),
+                    reply_markup=markup
+                    or otp_panel.control_keyboard(bool(cfg["enabled"])),
                 )
             else:
                 await message.answer(

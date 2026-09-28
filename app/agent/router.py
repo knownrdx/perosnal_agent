@@ -54,6 +54,18 @@ _TASK_PATTERNS = [
     r"\b(run|execute|start)\s+(the|this|a|my)\b",
     r"\b(convert|compress|resize|rename|move|copy|delete)\b",
     r"\b(find|search)\s+.{0,30}\b(and|then)\b",
+    # Banglish imperatives. The owner writes in Banglish most of the time and
+    # none of the English verb patterns fire on "amar jonno ekta file banao",
+    # so every such instruction fell through to the LLM - and when the LLM was
+    # rate-limited it became a coin flip.
+    r"\b(banao|banai\s*dao|banaye\s*dao|toiri\s*koro|tairi\s*koro)\b",
+    r"\b(pathao|pathai\s*dao|pathiye\s*dao|send\s*koro)\b",
+    r"\b(namao|download\s*koro|niye\s*asho|niye\s*esho|ene\s*dao)\b",
+    r"\b(khujo|khuje\s*dekho|khuje\s*ber\s*koro|search\s*koro|dekho\s*to)\b",
+    r"\b(mucho|muche\s*dao|delete\s*koro|bad\s*dao|sorao|soriye\s*dao)\b",
+    r"\b(cholao|chalu\s*koro|run\s*koro|start\s*koro|shuru\s*koro)\b",
+    r"\b(likhe\s*dao|likho|update\s*koro|thik\s*koro|fix\s*koro|change\s*koro)\b",
+    r"\b(set\s*koro|boshao|bosai\s*dao|add\s*koro|jog\s*koro)\b",
 ]
 
 # Small talk / questions about the agent itself.
@@ -62,6 +74,11 @@ _CHAT_PATTERNS = [
     r"^\s*(who|what|why|how|when|where|which)\s+(are|is|do|does|can|should|would|did)\b",
     r"\b(what can you do|who are you|how do you work|are you (there|ok|alive))\b",
     r"^\s*(kemon|kemon acho|ki khobor|ki koro|acho|thanks a lot)\b",
+    # Banglish question openers. Without these "tumi ki korte paro?" was an
+    # LLM round-trip for something answerable from knowledge alone.
+    r"^\s*(ki|kn|keno|kano|kivabe|kibhabe|kokhon|kothay|kon|kar|koto)\b.*\?",
+    r"\b(tumi ki|tomar ki|ki kore|ki hoyeche|ki obostha|bujhle|bujhcho)\b",
+    r"^\s*(dhonnobad|thik ache|accha|hmm|hm|ok re|bujhlam|valo)\b",
 ]
 
 # Asking about existing work.
@@ -69,6 +86,8 @@ _CONTROL_PATTERNS = [
     r"\b(status|progress|how('?s| is) it going|are you done|finished yet|any update)\b",
     r"\b(cancel|stop|abort|kill)\s+(it|that|the task|this)\b",
     r"\b(what are you (doing|working on)|current task)\b",
+    r"\b(ki obostha|koto dur|kotodur|hoyeche ki|sesh hoyeche|shesh hoyeche)\b",
+    r"\b(bondho koro|bondho kore dao|cancel koro|thamao|thamiye dao)\b",
 ]
 
 # Continuations of a previous instruction.
@@ -77,11 +96,30 @@ _FOLLOW_UP_PATTERNS = [
     r"\b(that one|the same|like before|as well|too)\b",
     r"^\s*(do it|go ahead|yes|yeah|yep|sure|continue|proceed|ok do it)\s*[.!]?\s*$",
     r"\b(change it|make it|use|try)\s+.{0,40}\b(instead|rather)\b",
+    r"^\s*(ar|aro|arek|r|tarpor|abar|ei\s*tao|oita|oitao)\b",
+    r"^\s*(haa|ha|hae|hmm haa|koro|kore dao|thik ache koro)\s*[.!]?\s*$",
+    r"\b(oitar|oi ta|same ta|ager ta|agerta)\b",
 ]
 
 
-def _matches(patterns: list[str], text: str) -> bool:
-    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+def _matches(patterns: list[re.Pattern[str]], text: str) -> bool:
+    return any(pattern.search(text) for pattern in patterns)
+
+
+def _compile(patterns: list[str]) -> list[re.Pattern[str]]:
+    """Compile once at import instead of on every message.
+
+    The lists grew a lot when Banglish was added, and these run on the hot
+    path for every single message - including the deterministic OTP triggers
+    that exist precisely so the bot stays responsive when the LLM is down.
+    """
+    return [re.compile(p, re.IGNORECASE) for p in patterns]
+
+
+_TASK_RE = _compile(_TASK_PATTERNS)
+_CHAT_RE = _compile(_CHAT_PATTERNS)
+_CONTROL_RE = _compile(_CONTROL_PATTERNS)
+_FOLLOW_UP_RE = _compile(_FOLLOW_UP_PATTERNS)
 
 
 ROUTER_PROMPT = """You classify one message sent to a personal AI agent.
@@ -98,6 +136,13 @@ Definitions:
 - FOLLOW_UP: it modifies, corrects, or continues the work described in the
   RECENT CONTEXT, rather than starting something new.
 - CONTROL: asking about status/progress of existing work, or to stop it.
+
+The owner writes in Banglish (Bengali in Latin script), often mixed with
+English. Read it as ordinary speech, not as noise:
+  "banao", "toiri koro", "pathao", "namao", "koro"   -> an instruction (TASK)
+  "ki obostha", "koto dur", "hoyeche?"               -> CONTROL
+  "ar ekta", "oitao", "tarpor"                       -> FOLLOW_UP
+  "kemon acho", "eta ki", "bujhlam"                  -> CHAT
 
 If the message could be answered in one sentence, prefer CHAT.
 If unsure between TASK and FOLLOW_UP and there is active work, choose FOLLOW_UP.
@@ -126,28 +171,28 @@ async def classify(
         return Decision(Intent.CHAT, "empty message")
 
     # --- cheap, high-confidence rules ---------------------------------- #
-    if _matches(_CONTROL_PATTERNS, stripped):
+    if _matches(_CONTROL_RE, stripped):
         return Decision(Intent.CONTROL, "asks about existing work",
                         target_task_id=active_task_id)
 
-    if active_task_id and _matches(_FOLLOW_UP_PATTERNS, stripped):
+    if active_task_id and _matches(_FOLLOW_UP_RE, stripped):
         return Decision(Intent.FOLLOW_UP, "continues the active task",
                         target_task_id=active_task_id)
 
     # Very short messages are almost never new jobs.
     words = stripped.split()
-    if len(words) <= 3 and not _matches(_TASK_PATTERNS, stripped):
-        if active_task_id and _matches(_FOLLOW_UP_PATTERNS, stripped):
+    if len(words) <= 3 and not _matches(_TASK_RE, stripped):
+        if active_task_id and _matches(_FOLLOW_UP_RE, stripped):
             return Decision(Intent.FOLLOW_UP, "short continuation",
                             target_task_id=active_task_id)
         return Decision(Intent.CHAT, "short remark")
 
-    if _matches(_CHAT_PATTERNS, stripped) and not _matches(_TASK_PATTERNS, stripped):
+    if _matches(_CHAT_RE, stripped) and not _matches(_TASK_RE, stripped):
         return Decision(Intent.CHAT, "greeting or question")
 
-    if _matches(_TASK_PATTERNS, stripped):
+    if _matches(_TASK_RE, stripped):
         # An action phrased against running work is still a follow-up.
-        if active_task_id and _matches(_FOLLOW_UP_PATTERNS, stripped):
+        if active_task_id and _matches(_FOLLOW_UP_RE, stripped):
             return Decision(Intent.FOLLOW_UP, "modifies the active task",
                             target_task_id=active_task_id)
         return Decision(Intent.TASK, "action verb detected")

@@ -84,7 +84,9 @@ def runner(environment):
     return AgentBot()
 
 
-async def _queue_one(name: str = "bd.txt", prefix: str = "+880") -> dict:
+async def _queue_one(
+    name: str = "bd.txt", prefix: str = "+880", caption: str = "20h"
+) -> dict:
     from app.config import get_settings
     from app.security import rel_path
 
@@ -92,7 +94,9 @@ async def _queue_one(name: str = "bd.txt", prefix: str = "+880") -> dict:
     uploads.mkdir(parents=True, exist_ok=True)
     path = uploads / name
     path.write_text("\n".join(f"{prefix}1711{i:06d}" for i in range(4)), encoding="utf-8")
-    analysis = await otp_bot.enqueue_file(rel_path(path), name)
+    # A run length is stated by default so these callback tests exercise the
+    # button under test, not the "how long should this run?" question.
+    analysis = await otp_bot.enqueue_file(rel_path(path), name, caption)
     return analysis["entries"][0]
 
 

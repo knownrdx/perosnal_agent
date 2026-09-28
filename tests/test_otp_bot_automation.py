@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from app.automation import otp_bot
+from app.automation import otp_bot, otp_schedule
 from app.integrations.telegram_user import UserbotError, set_userbot
 
 
@@ -1071,17 +1071,37 @@ async def test_a_new_file_for_a_running_country_replaces_that_country_only(envir
 # Auto-start, and not re-sending numbers a country already has
 # --------------------------------------------------------------------------- #
 async def test_an_upload_starts_by_itself_when_the_tag_is_known(environment):
-    """No "start" needed: the file knows its tag, so it runs."""
+    """No "start" needed: the file knows its tag and its run length, so it
+    runs. A caption stating the timing is the owner answering the one
+    question that would otherwise still be open.
+    """
     set_userbot(FakeUserbot([{"text": "\u2705 2 added", "out": False}] * 4))
     await otp_bot.save_config({"default_tag": "WA"})
     rel = await _write_numbers_file("bd.txt", "+880")
-    await otp_bot.enqueue_file(rel, "bd.txt")
+    await otp_bot.enqueue_file(rel, "bd.txt", "20h")
 
     started = await otp_bot.maybe_auto_start()
 
     assert started is not None and started["ok"] is True
     assert (await otp_bot.get_config())["enabled"] is True
     assert {e["country"] for e in await otp_bot.get_active_files()} == {"Bangladesh"}
+
+
+async def test_an_upload_with_no_timing_asks_before_starting(environment):
+    """An upload that says nothing about how long it should run is asked,
+    with the default stated. Before this such a run had no limit at all and
+    was found still going days later.
+    """
+    set_userbot(FakeUserbot([]))
+    await otp_bot.save_config({"default_tag": "WA"})
+    rel = await _write_numbers_file("bd.txt", "+880")
+    await otp_bot.enqueue_file(rel, "bd.txt")
+
+    assert await otp_bot.maybe_auto_start() is None
+    assert (await otp_bot.get_config())["enabled"] is False
+
+    pending = await otp_bot.get_awaiting_runtime() or {}
+    assert pending == {} or pending.get("countries") is not None
 
 
 async def test_an_untagged_upload_waits_for_its_answer(environment):
@@ -1786,8 +1806,9 @@ async def test_stop_trigger_word_detection():
 async def test_handle_start_trigger_asks_one_tag_at_a_time(environment):
     rel1 = await _write_numbers_file("plain1.txt")
     rel2 = await _write_numbers_file("plain2.txt")
-    await otp_bot.enqueue_file(rel1, "plain1.txt")
-    await otp_bot.enqueue_file(rel2, "plain2.txt")
+    # Timing stated up front so this test stays about the TAG questions.
+    await otp_bot.enqueue_file(rel1, "plain1.txt", "20h")
+    await otp_bot.enqueue_file(rel2, "plain2.txt", "20h")
 
     reply1 = await otp_bot.handle_start_trigger()
     assert "plain1.txt" in reply1
@@ -1804,6 +1825,57 @@ async def test_handle_start_trigger_asks_one_tag_at_a_time(environment):
     assert "Shuru hoye geche" in reply3  # both tagged now, actually started
     assert await otp_bot.get_awaiting_tag_entry() is None
     assert len(await otp_bot.get_active_files()) == 2
+
+
+async def test_the_run_length_is_asked_once_and_then_it_starts(environment):
+    """Tags settled, timing unknown -> one question, then the run begins.
+
+    The default is stated in the question rather than applied silently: a
+    run that quietly became unlimited is exactly the failure this prevents.
+    """
+    rel = await _write_numbers_file("numbers_BD.txt")
+    await otp_bot.enqueue_file(rel, "numbers_BD.txt")
+
+    asked = await otp_bot.handle_start_trigger()
+    assert "koto somoy cholbe" in asked
+    assert "20h" in asked                     # the default, stated
+    assert (await otp_bot.get_awaiting_runtime())["countries"] == ["Bangladesh"]
+
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    answered = await otp_bot.handle_runtime_answer("8h")
+
+    assert "Shuru hoye geche" in answered
+    assert await otp_bot.get_awaiting_runtime() in (None, {})
+    settings = await otp_schedule.get_country_settings("Bangladesh")
+    assert settings["run_minutes"] == 480
+    assert (await otp_bot.get_config())["enabled"] is True
+
+
+async def test_no_limit_stays_expressible(environment):
+    """Some runs genuinely should go until stopped by hand."""
+    rel = await _write_numbers_file("numbers_BD.txt")
+    await otp_bot.enqueue_file(rel, "numbers_BD.txt")
+    await otp_bot.handle_start_trigger()
+
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    reply = await otp_bot.handle_runtime_answer("limit nai")
+
+    assert "kono somoy limit nai" in reply.lower()
+    settings = await otp_schedule.get_country_settings("Bangladesh")
+    assert settings["run_minutes"] == 0
+
+
+async def test_skipping_the_run_length_question_takes_the_default(environment):
+    """An unanswered question must not silently become the riskier option."""
+    rel = await _write_numbers_file("numbers_BD.txt")
+    await otp_bot.enqueue_file(rel, "numbers_BD.txt")
+    await otp_bot.handle_start_trigger()
+
+    set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
+    await otp_bot.handle_runtime_answer("bad")
+
+    settings = await otp_schedule.get_country_settings("Bangladesh")
+    assert settings["run_minutes"] == 1200          # the 20h default, not 0
 
 
 async def test_handle_start_trigger_resumes_active_files_with_no_new_upload(environment):
