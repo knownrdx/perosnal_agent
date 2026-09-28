@@ -134,3 +134,28 @@ def test_health_summary_reports_what_is_usable():
     assert rows["a"]["available"] is False
     assert rows["a"]["cooldown_s"] > 0
     assert rows["b"]["available"] is True
+
+
+async def test_a_bad_key_is_not_retried_every_two_minutes():
+    """An auth failure cannot fix itself, unlike a rate limit or an outage.
+
+    A dead OmniRoute key cost 83s on the first message of every cooldown
+    window; backing off for an hour removes that entirely without making it
+    permanent - the owner can paste a new key and /provider clears it.
+    """
+    from app.llm.manager import LLMManager
+
+    manager = LLMManager()
+    manager._mark_failed("omniroute", Exception("omniroute: authentication failed (401)"))
+    auth_until = manager._cooldowns["omniroute"]
+
+    manager._mark_failed("openai", Exception("rate limited (retry after 30s)"))
+    rate_until = manager._cooldowns["openai"]
+
+    manager._mark_failed("ollama", Exception("connection refused"))
+    plain_until = manager._cooldowns["ollama"]
+
+    assert auth_until > rate_until > plain_until
+    # And a working key still clears it immediately.
+    manager._clear_cooldown("omniroute")
+    assert manager._in_cooldown("omniroute") is False

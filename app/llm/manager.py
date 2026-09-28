@@ -471,6 +471,14 @@ class LLMManager(LLMClient):
     # ------------------------------------------------------------------ #
     _COOLDOWN_S = 120.0
     _RATE_LIMIT_COOLDOWN_S = 300.0
+    # An auth failure is PERMANENT until the owner changes the key: the
+    # provider cannot start working on its own the way a rate limit or an
+    # outage can. Retrying it every two minutes just re-pays its timeout -
+    # a dead OmniRoute key cost 83s on the first message of every window,
+    # and that is the whole of what "the bot is slow sometimes" was after
+    # the earlier fixes. Still not permanent here: the owner can paste a new
+    # key at any moment, so it is a long cooldown, not a blacklist.
+    _AUTH_COOLDOWN_S = 3600.0
 
     def _in_cooldown(self, key: str) -> bool:
         until = self._cooldowns.get(key)
@@ -483,10 +491,21 @@ class LLMManager(LLMClient):
 
     def _mark_failed(self, key: str, exc: Exception) -> None:
         # Rate limits state their own window; back off longer for those than
-        # for a transient error.
+        # for a transient error, and longer still for a key that is simply
+        # wrong.
         text = str(exc).lower()
-        rate_limited = "429" in text or "rate limit" in text or "quota" in text
-        cooldown = self._RATE_LIMIT_COOLDOWN_S if rate_limited else self._COOLDOWN_S
+        if (
+            "authentication failed" in text
+            or "invalid api key" in text
+            or "unauthorized" in text
+            or "401" in text
+            or "403" in text
+        ):
+            cooldown = self._AUTH_COOLDOWN_S
+        elif "429" in text or "rate limit" in text or "quota" in text:
+            cooldown = self._RATE_LIMIT_COOLDOWN_S
+        else:
+            cooldown = self._COOLDOWN_S
         self._cooldowns[key] = time.monotonic() + cooldown
 
     def _clear_cooldown(self, key: str) -> None:
