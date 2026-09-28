@@ -65,7 +65,17 @@ class Settings(BaseSettings):
 
     # local (Ollama)
     ollama_base_url: str = "http://ollama:11434"
-    llm_model: str = "qwen2.5-coder:7b-instruct-q4_K_M"
+    # A CODE model was the fallback here, which is half of why the local
+    # fallback answered badly: it is poor at intent routing and at Banglish
+    # chat, neither of which is code. Measured on this CPU-only VPS with
+    # scripts/compare_local_models.py (router accuracy / avg latency):
+    #   qwen2.5:3b        4/4   17.9s   <- this
+    #   qwen2.5:7b        3/4   35.0s
+    #   qwen2.5-coder:7b  3/4   28.6s
+    #   qwen2.5:1.5b      3/4    8.6s
+    # 3b is both the most accurate and twice as fast as 7b here, because
+    # without a GPU the bigger model buys nothing it can afford.
+    llm_model: str = "qwen2.5:3b-instruct-q4_K_M"
 
     # ChatGPT / OpenAI-compatible
     openai_api_key: str = ""
