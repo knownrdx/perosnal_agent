@@ -55,6 +55,19 @@ _CLOCK_COMPACT_RE = re.compile(r"\b([01]\d|2[0-3])([0-5]\d)\b")
 # "9pm", "9 pm", "11:30pm"
 _AMPM_RE = re.compile(r"\b(1[0-2]|0?\d)(?:\s*[:.]\s*([0-5]\d))?\s*(am|pm)\b", re.IGNORECASE)
 
+# "rat 9ta", "shokal 6 ta", "bikal 5টা" - how a time of day is normally said
+# in Bengali, with the part of the day carrying the am/pm. Without this the
+# hour was read as a bare number and dropped, so "rat 9 ta porjonto" set no
+# stop time at all and the owner was asked for one he had already given.
+_BN_TOD_RE = re.compile(
+    r"\b(rat|raat|sondha|shondha|sokal|shokal|bikal|bikel|dupur)\s*"
+    r"(1[0-2]|0?\d)\s*(?:ta|tay|tar)?\b",
+    re.IGNORECASE,
+)
+# Which half of the clock each part of the day means. "rat 9" is 21:00 but
+# "rat 3" is 03:00, so night wraps rather than adding a flat twelve hours.
+_BN_PM_WORDS = {"rat", "raat", "sondha", "shondha", "bikal", "bikel", "dupur"}
+
 # "20h", "20 hours", "20 ghonta", "2 din", "90 min"
 _DURATION_RE = re.compile(
     r"\b(\d{1,4})\s*"
@@ -77,6 +90,10 @@ _STOP_WORDS = (
     "stop", "off", "bondho", "bondo", "end", "shesh", "ses", "porjonto",
     "until", "till", "porjonto",
 )
+# Bengali postpositions: they FOLLOW the time they label ("9 ta theke",
+# "11 ta porjonto"), unlike English labels which precede it. _nearest()
+# reverses its tie-break bias for these.
+_POSTPOSITIONS = frozenset({"theke", "thekei", "porjonto", "porjonto"})
 # "no stop time at all"
 _NEVER_PHRASES = (
     "kono stop nai", "kono stop time nai", "stop nai", "kono time nai",
@@ -102,9 +119,20 @@ def _nearest(text: str, words: tuple[str, ...], start: int, end: int) -> float |
     for word in words:
         for match in re.finditer(rf"(?<![a-z0-9]){re.escape(word)}(?![a-z0-9])", lowered):
             if match.end() <= start:
-                distance = float(start - match.end()) - 0.5
+                distance = float(start - match.end())
+                # English labels lead their value ("start 21:00"), so a word
+                # in front is marginally the better candidate - EXCEPT for
+                # the Bengali postpositions, which only ever FOLLOW the time
+                # they label ("6 ta theke", "11 ta porjonto"). Giving those a
+                # lead bonus handed "sokal 6 ta theke rat 11 ta porjonto" to
+                # the wrong keyword: "theke" sat one character before the
+                # second time and stole it from the "porjonto" right after.
+                if word not in _POSTPOSITIONS:
+                    distance -= 0.5
             elif match.start() >= end:
                 distance = float(match.start() - end)
+                if word in _POSTPOSITIONS:
+                    distance -= 0.5
             else:
                 distance = 0.0
             if distance > 24:  # too far away to be talking about this time
@@ -141,6 +169,21 @@ def _clock_matches(text: str) -> list[tuple[str, int, int]]:
         if match.group(3).lower() == "pm":
             hour += 12
         found.append((f"{hour:02d}:{minute:02d}", match.start(), match.end()))
+        taken.append(match.span())
+
+    # "rat 9 ta" / "shokal 6 ta": the part of the day supplies the am/pm.
+    # Runs after _AMPM_RE so an explicit "9pm" always wins, and the span
+    # covers the day-word too, so the hour cannot also be read as a bare
+    # number by the patterns below.
+    for match in _BN_TOD_RE.finditer(text):
+        if overlaps(match.span()):
+            continue
+        hour = int(match.group(2)) % 12
+        if match.group(1).lower() in _BN_PM_WORDS:
+            # Night wraps instead of adding twelve: "rat 9" is 21:00, but
+            # "rat 2" is 02:00 - nobody means 14:00 by it.
+            hour = hour + 12 if hour >= 4 else hour
+        found.append((f"{hour:02d}:00", match.start(), match.end()))
         taken.append(match.span())
 
     for match in _CLOCK_RE.finditer(text):
@@ -225,7 +268,13 @@ def parse_caption(text: str) -> dict[str, Any]:
     if not text or not text.strip():
         return out
 
-    text = text.strip()
+    # The patterns below are Latin text and the times/durations are ASCII
+    # digits, so a caption typed in Bengali ("বাংলাদেশ হোয়াটসঅ্যাপ ২০ ঘন্টা")
+    # matched nothing and every field was asked for again. Transliterating
+    # first lets one set of patterns serve both scripts.
+    from app.agent import language
+
+    text = language.normalise(text).strip()
     lowered = " ".join(text.casefold().split())
 
     service = _find_service(text)

@@ -19,6 +19,7 @@ from typing import Any
 
 from app.agent.router import Decision, Intent, classify
 from app.config import get_settings
+from app.agent import language
 from app.db import repo
 from app.db.base import session_scope
 from app.db.models import ACTIVE_STATUSES, TERMINAL_STATUSES, TaskStatus
@@ -38,8 +39,13 @@ You have tools and can run background jobs, but this particular message did not
 require any. If the owner is actually asking you to DO something, say what you
 will do and that they should confirm.
 
-Never invent facts about files, tasks or messages you have not seen. If you do
-not know, say so.
+Never invent facts about files, tasks or messages you have not seen. You can
+see only what is written in this conversation: you do NOT know what is
+running, what finished, or where their files are unless it is stated above.
+If asked about something you cannot see, say so and point at /status - never
+guess a number, a country or a state. Admitting you do not know is always
+better than a confident wrong answer.
+
 Keep it under 6 sentences unless the owner asked for detail."""
 
 
@@ -104,6 +110,12 @@ async def chat_reply(
         turns = await repo.recent_messages(session, chat_id, limit=MAX_TURNS, thread_id=thread_id)
 
     messages = [Message("system", CHAT_PROMPT)]
+    # Answer in the language the owner used. Told explicitly rather than left
+    # to the model: asked, they match it reliably; unasked, they drift - a
+    # Bengali question comes back in Hindi, an English one in Bengali.
+    directive = language.directive(text)
+    if directive:
+        messages.append(Message("system", directive))
     if memories:
         messages.append(
             Message("system", "What you know about the owner:\n" + "\n".join(memories))
@@ -117,6 +129,16 @@ async def chat_reply(
         response = await client.chat(messages)
     except LLMError as exc:
         log.warning("chat_reply_failed", extra={"error": str(exc)[:200]})
+        # Said in the owner's own language: this is the one reply guaranteed
+        # to arrive when the model is down, so it is the worst one to send in
+        # a language he has to translate.
+        detected = language.detect(text)
+        if detected.startswith("Banglish"):
+            return "Model-e pouchate parlam na. Abar try koro, ba /status dekho."
+        if detected == "Bengali":
+            return (
+                "\u09ae\u09a1\u09c7\u09b2\u09c7 \u09aa\u09cc\u0981\u099b\u09be\u09a4\u09c7 \u09aa\u09be\u09b0\u09b2\u09be\u09ae \u09a8\u09be\u0964 \u0986\u09ac\u09be\u09b0 \u099a\u09c7\u09b7\u09cd\u099f\u09be \u0995\u09b0\u09cb, \u09ac\u09be /status \u09a6\u09c7\u0996\u09cb\u0964"
+            )
         return (
             "I could not reach the model just now. Try again, or check /status."
         )

@@ -1856,6 +1856,12 @@ def help_text() -> str:
         "  shuru 21:00 bondho 06:00     - kokhon on, kokhon off (Dubai)\n"
         "  telegram, kono stop nai      - service, somoy limit chara\n"
         "  nigeria 2 din                - country + koto din cholbe\n"
+        "  rat 9 ta porjonto            - shomoy bhabe likhleo bujhbo\n"
+        "\n"
+        "Bangla-teo likhte paro - shob ek bhabe kaj kore:\n"
+        "  \u09ac\u09be\u0982\u09b2\u09be\u09a6\u09c7\u09b6 \u09b9\u09cb\u09df\u09be\u099f\u09b8\u0985\u09cd\u09af\u09be\u09aa \u09e8\u09e6 \u0998\u09a8\u09cd\u099f\u09be\n"
+        "  \u09b6\u09c1\u09b0\u09c1 \u09e8\u09e7:\u09e6\u09e6 \u09ac\u09a8\u09cd\u09a7 \u09e6\u09ec:\u09e6\u09e6\n"
+        "  \u09b8\u0995\u09be\u09b2 \u09ec\u099f\u09be \u09a5\u09c7\u0995\u09c7 \u09b0\u09be\u09a4 \u09e7\u09e7\u099f\u09be \u09aa\u09b0\u09cd\u09af\u09a8\u09cd\u09a4\n"
         "\n"
         "Lekha:\n"
         "  start / shuru    - shuru koro\n"
@@ -1919,7 +1925,22 @@ _REMOVE_SUFFIXES = (" bad dao", " bad koro", " bad", " remove koro", " remove",
 
 
 def _normalize(text: str) -> str:
-    return " ".join(text.strip().lower().split())
+    """Lower-cased, whitespace-collapsed text for trigger matching.
+
+    Also transliterates Bengali script into the Banglish the trigger word
+    lists are written in, and folds Bengali digits to ASCII. Every trigger in
+    this module funnels through here, so "বন্ধ করো" stops the run exactly like
+    "bondho koro" does - without duplicating a Bengali spelling into each of
+    the dozen word lists below.
+
+    This matters more here than anywhere else in the codebase: these triggers
+    exist so the OTP thread keeps working when the LLM is down, and a message
+    the patterns cannot read would be handed to the very model they are meant
+    to bypass.
+    """
+    from app.agent import language
+
+    return " ".join(language.normalise(text).strip().lower().split())
 
 
 def is_skip_trigger(text: str) -> bool:

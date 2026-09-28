@@ -65,3 +65,41 @@ async def main() -> None:
 
 
 asyncio.run(main())
+
+
+def check_languages() -> None:
+    """The owner's own language reaches the deterministic paths."""
+    import asyncio
+
+    from app.agent import language
+    from app.agent.router import classify
+    from app.automation import otp_bot
+    from app.automation.otp_caption import parse_caption
+
+    print("\n--- language ---")
+    for text in ("বট টা কি চলছে", "bot ta ki cholche", "قم بإنشاء ملف",
+                 "是否在运行", "is it running"):
+        print(f"  detect {text[:22]:24} -> {language.detect(text)}")
+
+    print("  triggers:",
+          "stop=", otp_bot.is_stop_trigger("বন্ধ করো"),
+          "start=", otp_bot.is_start_trigger("শুরু করো"),
+          "status=", otp_bot.is_status_trigger("স্ট্যাটাস"))
+
+    print("  caption:", parse_caption("বাংলাদেশ হোয়াটসঅ্যাপ ২০ ঘন্টা"))
+    print("  caption:", parse_caption("সকাল ৬টা থেকে রাত ১১টা পর্যন্ত"))
+
+    async def routes() -> None:
+        for text, want in (("বট টা কি এখন চলছে?", "control"),
+                           ("একটা রিপোর্ট বানাও", "task"),
+                           ("কেমন আছো", "chat")):
+            started = time.time()
+            decision = await classify(text)
+            mark = "OK  " if decision.intent.value == want else "DIFF"
+            print(f"  {mark} {text[:20]:22} -> {decision.intent.value:9}"
+                  f" {time.time() - started:5.3f}s ({decision.reason})")
+
+    asyncio.run(routes())
+
+
+check_languages()

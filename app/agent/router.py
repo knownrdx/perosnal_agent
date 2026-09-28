@@ -88,6 +88,12 @@ _CONTROL_PATTERNS = [
     r"\b(what are you (doing|working on)|current task)\b",
     r"\b(ki obostha|koto dur|kotodur|hoyeche ki|sesh hoyeche|shesh hoyeche)\b",
     r"\b(bondho koro|bondho kore dao|cancel koro|thamao|thamiye dao)\b",
+    # "is it still running?" - asked constantly, and it is a question ABOUT
+    # existing work, not a request to start any. Requires the interrogative:
+    # a bare "cholche" is a statement ("it's running"), and "chalu koro" is an
+    # instruction that must stay a TASK.
+    r"\b(ki|koto|kemon)\b.{0,20}\b(cholche|cholchhe|chalu ache|on ache)\b",
+    r"\b(cholche|cholchhe|chalu ache|on ache)\b.{0,12}\?",
 ]
 
 # Continuations of a previous instruction.
@@ -137,8 +143,10 @@ Definitions:
   RECENT CONTEXT, rather than starting something new.
 - CONTROL: asking about status/progress of existing work, or to stop it.
 
-The owner writes in Banglish (Bengali in Latin script), often mixed with
-English. Read it as ordinary speech, not as noise:
+The owner writes in whatever language suits them - often Banglish (Bengali
+speech in Latin letters), sometimes Bengali script, sometimes English, and
+occasionally something else. Classify the INTENT; the language is irrelevant
+to which of the four it is. Some common Bengali markers:
   "banao", "toiri koro", "pathao", "namao", "koro"   -> an instruction (TASK)
   "ki obostha", "koto dur", "hoyeche?"               -> CONTROL
   "ar ekta", "oitao", "tarpor"                       -> FOLLOW_UP
@@ -170,29 +178,41 @@ async def classify(
     if not stripped:
         return Decision(Intent.CHAT, "empty message")
 
+    # The patterns below are Latin text. A message in another script matched
+    # none of them and fell through to the model - backwards, since these
+    # rules exist so routing keeps working when the model is down or slow.
+    # normalise() folds native digits to ASCII and transliterates Bengali
+    # script into the Banglish the patterns already cover; Latin input is
+    # returned unchanged.
+    from app.agent import language
+
+    probe = language.normalise(stripped)
+
     # --- cheap, high-confidence rules ---------------------------------- #
-    if _matches(_CONTROL_RE, stripped):
+    if _matches(_CONTROL_RE, probe):
         return Decision(Intent.CONTROL, "asks about existing work",
                         target_task_id=active_task_id)
 
-    if active_task_id and _matches(_FOLLOW_UP_RE, stripped):
+    if active_task_id and _matches(_FOLLOW_UP_RE, probe):
         return Decision(Intent.FOLLOW_UP, "continues the active task",
                         target_task_id=active_task_id)
 
-    # Very short messages are almost never new jobs.
+    # Very short messages are almost never new jobs. Counted on the ORIGINAL
+    # text: normalise() can append a transliteration, which would double the
+    # word count and stop "চালু করো" from reading as the short remark it is.
     words = stripped.split()
-    if len(words) <= 3 and not _matches(_TASK_RE, stripped):
-        if active_task_id and _matches(_FOLLOW_UP_RE, stripped):
+    if len(words) <= 3 and not _matches(_TASK_RE, probe):
+        if active_task_id and _matches(_FOLLOW_UP_RE, probe):
             return Decision(Intent.FOLLOW_UP, "short continuation",
                             target_task_id=active_task_id)
         return Decision(Intent.CHAT, "short remark")
 
-    if _matches(_CHAT_RE, stripped) and not _matches(_TASK_RE, stripped):
+    if _matches(_CHAT_RE, probe) and not _matches(_TASK_RE, probe):
         return Decision(Intent.CHAT, "greeting or question")
 
-    if _matches(_TASK_RE, stripped):
+    if _matches(_TASK_RE, probe):
         # An action phrased against running work is still a follow-up.
-        if active_task_id and _matches(_FOLLOW_UP_RE, stripped):
+        if active_task_id and _matches(_FOLLOW_UP_RE, probe):
             return Decision(Intent.FOLLOW_UP, "modifies the active task",
                             target_task_id=active_task_id)
         return Decision(Intent.TASK, "action verb detected")
