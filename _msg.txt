@@ -1,0 +1,18 @@
+Probe a dead provider less often the longer it stays dead
+
+The live gateway does not have a bad key, it returns 502 - every time.
+Each attempt costs ~30s (its client retries three times) before the
+working provider is tried, and a fixed cooldown meant paying that once
+per window, forever.
+
+A provider that fails AGAIN after its cooldown expired is not blipping,
+it is down: the cooldown now doubles per consecutive failure, capped at
+two hours. One success resets it completely, so a provider that comes
+back is trusted again immediately rather than being punished for its
+outage.
+
+Auth failures start from an hour rather than two minutes for the same
+reason - a wrong key cannot fix itself the way a rate limit can. Neither
+is a blacklist: pasting a working key takes effect on the next message.
+
+Mutation-verified: removing the escalation fails the test.

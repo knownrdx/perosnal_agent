@@ -91,6 +91,8 @@ class LLMManager(LLMClient):
         self._custom: dict[str, dict[str, str]] = {}
         # provider key -> monotonic deadline; see _in_cooldown.
         self._cooldowns: dict[str, float] = {}
+        # provider key -> consecutive failures, for escalating the cooldown.
+        self._failures: dict[str, int] = {}
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ #
@@ -473,12 +475,15 @@ class LLMManager(LLMClient):
     _RATE_LIMIT_COOLDOWN_S = 300.0
     # An auth failure is PERMANENT until the owner changes the key: the
     # provider cannot start working on its own the way a rate limit or an
-    # outage can. Retrying it every two minutes just re-pays its timeout -
-    # a dead OmniRoute key cost 83s on the first message of every window,
-    # and that is the whole of what "the bot is slow sometimes" was after
-    # the earlier fixes. Still not permanent here: the owner can paste a new
-    # key at any moment, so it is a long cooldown, not a blacklist.
+    # outage can. Still not a blacklist - a new key clears it immediately.
     _AUTH_COOLDOWN_S = 3600.0
+    # A provider that fails AGAIN after its cooldown expired is not having a
+    # blip, it is down. Measured live: OmniRoute returns 502 every time and
+    # each attempt costs ~30s (the client's own 3 retries) before the working
+    # provider is even tried - paid once per cooldown window, forever.
+    # Doubling per consecutive failure turns that into a handful of probes a
+    # day instead of one every two minutes, and ONE success resets it fully.
+    _MAX_COOLDOWN_S = 7200.0
 
     def _in_cooldown(self, key: str) -> bool:
         until = self._cooldowns.get(key)
@@ -491,8 +496,7 @@ class LLMManager(LLMClient):
 
     def _mark_failed(self, key: str, exc: Exception) -> None:
         # Rate limits state their own window; back off longer for those than
-        # for a transient error, and longer still for a key that is simply
-        # wrong.
+        # for a transient error, and longer still for a key that is wrong.
         text = str(exc).lower()
         if (
             "authentication failed" in text
@@ -501,15 +505,23 @@ class LLMManager(LLMClient):
             or "401" in text
             or "403" in text
         ):
-            cooldown = self._AUTH_COOLDOWN_S
+            base = self._AUTH_COOLDOWN_S
         elif "429" in text or "rate limit" in text or "quota" in text:
-            cooldown = self._RATE_LIMIT_COOLDOWN_S
+            base = self._RATE_LIMIT_COOLDOWN_S
         else:
-            cooldown = self._COOLDOWN_S
+            base = self._COOLDOWN_S
+
+        strikes = self._failures.get(key, 0) + 1
+        self._failures[key] = strikes
+        cooldown = min(base * (2 ** (strikes - 1)), self._MAX_COOLDOWN_S)
         self._cooldowns[key] = time.monotonic() + cooldown
 
     def _clear_cooldown(self, key: str) -> None:
         self._cooldowns.pop(key, None)
+        # One success means the provider is healthy again, so the next
+        # failure starts from the short cooldown rather than the long one it
+        # had escalated to.
+        self._failures.pop(key, None)
 
     def provider_health_summary(self) -> list[dict[str, Any]]:
         """Which providers are usable right now, for the dashboard."""

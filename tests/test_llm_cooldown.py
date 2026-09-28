@@ -7,6 +7,8 @@ was even attempted, so the bot felt slow no matter how fast the fallback was.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from app.llm.base import LLMError, LLMResponse, Message
@@ -159,3 +161,30 @@ async def test_a_bad_key_is_not_retried_every_two_minutes():
     # And a working key still clears it immediately.
     manager._clear_cooldown("omniroute")
     assert manager._in_cooldown("omniroute") is False
+
+
+async def test_a_provider_that_keeps_failing_is_probed_less_often():
+    """A provider failing again after its cooldown is down, not blipping.
+
+    Measured live: a dead gateway costs ~30s per attempt (its client retries
+    three times) before the working provider is tried, and that was paid once
+    per cooldown window forever. Escalating turns it into a few probes a day.
+    """
+    from app.llm.manager import LLMManager
+
+    manager = LLMManager()
+    waits = []
+    for _ in range(4):
+        manager._mark_failed("omniroute", Exception("omniroute: server error 502"))
+        waits.append(manager._cooldowns["omniroute"] - time.monotonic())
+
+    assert waits[0] < waits[1] < waits[2] < waits[3]
+    assert waits[-1] <= LLMManager._MAX_COOLDOWN_S + 1
+
+    # One success and it is fully trusted again - the next failure starts
+    # from the short cooldown, not from the escalated one.
+    manager._clear_cooldown("omniroute")
+    manager._mark_failed("omniroute", Exception("omniroute: server error 502"))
+    assert (manager._cooldowns["omniroute"] - time.monotonic()) == pytest.approx(
+        waits[0], rel=0.1
+    )
