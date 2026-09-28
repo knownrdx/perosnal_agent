@@ -75,7 +75,13 @@ async def test_primary_success_test_end_to_end(environment, echo_llm, fake_teleg
     worker.poll_interval = 0.05
     await worker.start()
     try:
-        for _ in range(150):
+        # 60s, not 15s. The work itself takes well under a second - this is
+        # only guarding against a hang - but the old budget was tight enough
+        # that ordinary load on a loaded CI/dev box could expire it, and a
+        # timeout here is indistinguishable from a real failure (it surfaces
+        # as "status is RUNNING" plus a notify_interrupted in the log).
+        # Completion is polled, so a healthy run still finishes in ~1s.
+        for _ in range(600):
             async with session_scope() as session:
                 current = await repo.get_task(session, task_id)
             if current.status in {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value}:
