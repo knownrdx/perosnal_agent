@@ -80,6 +80,17 @@ def clock_now() -> dict[str, str]:
     }
 
 
+# "begin immediately", distinct from "" so an empty string left behind by an
+# older version can be told apart from a deliberate choice. Treated as no
+# start time wherever one is read.
+_START_NOW_WORDS = frozenset({"now", "ekhoni", "ekhuni"})
+
+
+def _is_now(value: str) -> bool:
+    text = str(value or "").strip()
+    return not text or text.casefold() in _START_NOW_WORDS
+
+
 def parse_stop_time(text: str) -> str:
     """Validate a "HH:MM" stop time given in Dubai time.
 
@@ -90,6 +101,10 @@ def parse_stop_time(text: str) -> str:
     raw = text.strip().replace(".", ":").replace(" ", "")
     if not raw:
         return ""
+    if raw.casefold() in _START_NOW_WORDS:
+        # "now" is a valid start time, meaning no wait. Stored as a word
+        # rather than "" so it is distinguishable from never having chosen.
+        return raw.casefold()
     if ":" not in raw and raw.isdigit() and len(raw) in (3, 4):
         raw = f"{raw[:-2]}:{raw[-2:]}"          # "2330" -> "23:30"
     try:
@@ -161,7 +176,7 @@ def _start_time_reached(start_at: str, armed_at: str | None) -> bool:
     opposite of what a start time is for.
     """
     clock = str(start_at or "").strip()
-    if not clock:
+    if not clock or clock.casefold() in _START_NOW_WORDS:
         return True
 
     anchor: datetime | None = None
@@ -434,12 +449,20 @@ async def _save_run_state(state: dict[str, dict[str, Any]]) -> None:
         await repo.set_setting(session, RUN_STATE_KEY, state)
 
 
-async def begin_run(country: str, *, armed_at: str | None = None) -> None:
+async def begin_run(country: str, *, armed_at: str | None = None,
+                    start_at: str | None = None) -> None:
     """Mark a country as freshly started: zero refills, clock from now.
 
     ``armed_at`` anchors a wall-clock start time. It defaults to now, which
     is what an ordinary start means; callers pass it explicitly only to keep
     an existing anchor across a re-arm.
+
+    ``start_at`` records the gate THIS run is waiting on, decided once when
+    the run was armed. has_started() reads it from here rather than from the
+    live config, because otherwise changing the global default start time
+    retroactively pauses every country already running: a country that began
+    at 01:00 would suddenly be "waiting" for the new 04:00 default and stop
+    refilling until then, with nothing in the log to say why.
     """
     state = await _get_run_state()
     now_iso = _now().isoformat()
@@ -448,6 +471,7 @@ async def begin_run(country: str, *, armed_at: str | None = None) -> None:
         "armed_at": armed_at or now_iso,
         "refills": 0,
         "display_name": country.strip(),
+        "gate": str(start_at or "").strip(),
     }
     await _save_run_state(state)
 
@@ -458,12 +482,23 @@ async def has_started(country: str, base: dict[str, Any]) -> bool:
     A country with no start_at (the common case) is always started, so this
     is a no-op for everything that never asked to be scheduled.
     """
+    state = await get_run_state(country)
+    if state:
+        # The gate this run was armed with. Recorded at arm time so a later
+        # config change cannot pause work that is already going.
+        gate = str(state.get("gate") or "").strip()
+        if _is_now(gate):
+            # Either no start time applied, or this run predates the field.
+            # An existing run with no recorded gate has already started by
+            # definition - it would not have a run state otherwise.
+            return True
+        return _start_time_reached(gate, state.get("armed_at") or state.get("started_at"))
+
     cfg = await effective_config(country, base)
     start_at = str(cfg.get("start_at") or "").strip()
-    if not start_at:
+    if _is_now(start_at):
         return True
-    state = await get_run_state(country)
-    return _start_time_reached(start_at, state.get("armed_at") or state.get("started_at"))
+    return _start_time_reached(start_at, None)
 
 
 async def pending_start_at(country: str, base: dict[str, Any]) -> datetime | None:
@@ -551,10 +586,15 @@ def _effective_start(cfg: dict[str, Any], state: dict[str, Any]) -> str | None:
     time arrived, NOT when the file was uploaded - "20h run, starts 21:00"
     means twenty hours of running, not twenty hours minus however long it
     waited. Everything else keeps using started_at unchanged.
+
+    The start time comes from the run's own recorded gate, for the same
+    reason has_started() reads it there: a country that began immediately
+    must not have its clock re-based onto a default start time introduced
+    afterwards, which would push its finish hours into the future.
     """
-    start_at = str(cfg.get("start_at") or "").strip()
+    start_at = str(state.get("gate") or "").strip()
     fallback = state.get("started_at")
-    if not start_at:
+    if _is_now(start_at):
         return fallback
 
     anchor = state.get("armed_at") or fallback

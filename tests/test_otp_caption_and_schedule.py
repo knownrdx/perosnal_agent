@@ -184,8 +184,16 @@ def test_a_start_time_already_past_today_means_tomorrow():
 
     Anchoring on "today at 00:00" instead would make the run begin instantly,
     which is the opposite of what a start time is for.
+
+    The anchor is relative to now, not a fixed date: written with a literal
+    "2026-09-28" this passed until that day went by, then started failing
+    because the computed start had genuinely passed in real time.
     """
-    armed = datetime(2026, 9, 28, 18, 0, tzinfo=timezone.utc)   # 22:00 Dubai
+    now = datetime.now(timezone.utc)
+    armed = now.replace(hour=18, minute=0, second=0, microsecond=0)  # 22:00 Dubai
+    if armed < now:
+        armed += timedelta(days=1)
+
     begins = otp_schedule.next_occurrence("21:00", after=armed)
     assert begins is not None
     assert begins > armed
@@ -236,7 +244,7 @@ async def test_a_scheduled_country_is_not_added_until_its_time(environment):
 
     set_userbot(_FakeUserbot())
     try:
-        result = await otp_bot.start_automation()
+        result = await otp_bot.start_automation(respect_schedule=True)
     finally:
         set_userbot(None)
 
@@ -258,7 +266,7 @@ async def test_a_waiting_country_is_never_declared_finished(environment):
     await otp_schedule.set_country_settings(
         "Bangladesh", {"start_at": future, "run_minutes": 30}
     )
-    await otp_schedule.begin_run("Bangladesh")
+    await otp_schedule.begin_run("Bangladesh", start_at=future)
 
     # 30 minutes of "run time" have notionally passed, but the run has not
     # begun, so there is nothing to finish.
@@ -274,7 +282,9 @@ async def test_the_run_clock_starts_when_the_start_time_arrives(environment):
     await otp_schedule.set_country_settings(
         "Bangladesh", {"start_at": soon, "run_minutes": 90}
     )
-    await otp_schedule.begin_run("Bangladesh", armed_at=armed.isoformat())
+    await otp_schedule.begin_run(
+        "Bangladesh", armed_at=armed.isoformat(), start_at=soon
+    )
 
     state = await otp_schedule.get_run_state("Bangladesh")
     effective = otp_schedule._effective_start(
@@ -289,7 +299,7 @@ async def test_a_scheduled_country_is_skipped_by_the_due_check(environment):
     cfg = await otp_bot.get_config()
     future = (datetime.now(otp_schedule.DUBAI_TZ) + timedelta(hours=4)).strftime("%H:%M")
     await otp_schedule.set_country_settings("Bangladesh", {"start_at": future})
-    await otp_schedule.begin_run("Bangladesh")
+    await otp_schedule.begin_run("Bangladesh", start_at=future)
     # Due immediately, were it not waiting to start.
     await otp_schedule.arm_country("Bangladesh", 1)
 
@@ -301,7 +311,7 @@ async def test_the_overview_says_a_country_is_waiting(environment):
     cfg = await otp_bot.get_config()
     future = (datetime.now(otp_schedule.DUBAI_TZ) + timedelta(hours=4)).strftime("%H:%M")
     await otp_schedule.set_country_settings("Bangladesh", {"start_at": future})
-    await otp_schedule.begin_run("Bangladesh")
+    await otp_schedule.begin_run("Bangladesh", start_at=future)
 
     row = (await otp_schedule.schedule_overview(["Bangladesh"], cfg))[0]
     assert row["waiting_to_start"] is True
@@ -329,12 +339,18 @@ async def test_the_numbers_are_sent_when_the_start_time_arrives(environment, mon
 
     set_userbot(_FakeUserbot())
     try:
-        await otp_bot.start_automation()
+        await otp_bot.start_automation(respect_schedule=True)
         active = await otp_bot.get_active_files()
         assert active[0].get("waiting_start") == future
 
-        # The start time arrives: clear it and let a forced cycle run.
+        # The start time arrives. In production the gate simply passes when
+        # the clock reaches it (_start_time_reached) and _add_after_wait
+        # then re-bases the run with no gate; here the clock cannot be moved,
+        # so the same end state is written directly.
         await otp_schedule.set_country_settings("Bangladesh", {"start_at": ""})
+        state = await otp_schedule._get_run_state()
+        state[otp_schedule._key("Bangladesh")]["gate"] = ""
+        await otp_schedule._save_run_state(state)
         result = await otp_bot.run_cycle(force=True)
     finally:
         set_userbot(None)

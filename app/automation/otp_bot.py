@@ -39,7 +39,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from app.automation import otp_schedule
+from app.automation import country_names, otp_schedule
 from app.db import repo
 from app.db.base import session_scope
 from app.integrations.telegram_user import UserbotError, get_userbot
@@ -54,6 +54,10 @@ ACTIVE_KEY = f"{SETTING_KEY}_active"
 LAST_RESULT_KEY = f"{SETTING_KEY}_last_result"
 LAST_START_KEY = f"{SETTING_KEY}_last_start"
 LAST_TAG_KEY = f"{SETTING_KEY}_last_tag"
+
+# "start immediately", stored so it can be told apart from an empty string
+# left behind by an older version that wrote start_at on every save.
+START_NOW = "now"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": False,            # periodic quota-monitor/refill loop on/off
@@ -94,8 +98,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # unless it sets its own. "" = never.
     "stop_at": "",
     # Wall-clock START time (Dubai, "HH:MM"), same inheritance. "" = begin
-    # immediately, which is what every run did before this existed.
-    "start_at": "",
+    # immediately. 04:00 is the owner's default: the target bot is quietest
+    # then, so a file uploaded during the day waits for the small hours
+    # instead of competing with the evening traffic. A caption that names a
+    # time overrides it, and "ekhoni" / the Now button clears it.
+    "start_at": "04:00",
     # How long a fresh upload runs for when the owner says nothing about it.
     # 20h covers "upload tonight, still going tomorrow evening" without the
     # run being immortal; 0 would mean forever, which is what silently
@@ -191,28 +198,14 @@ def _parse_country_stock(text: str) -> dict[str, int]:
 def _stock_for(stock: dict[str, int], country: str) -> int | None:
     """Look up one country in a /st reply.
 
-    Matched case-insensitively, and by prefix as a fallback, because the
-    name we stored came from the phone-prefix table while the one in the
-    reply came from the bot - they agree today but need not agree exactly
-    ("Congo (DRC)" vs "Congo"), and a missed match reads as zero stock and
-    triggers a pointless re-add.
+    The name we hold came from the phone-prefix table; the one in the reply
+    came from the bot, and they do not always agree ("Congo (DRC)" vs "DR
+    Congo"). A missed match reads as ZERO stock and triggers a re-add of the
+    whole file on every cycle - the observed symptom was 16,499 duplicates
+    skipped every five minutes, forever. See app/automation/country_names.py
+    for why this is not a prefix comparison.
     """
-    wanted = " ".join(country.strip().casefold().split())
-    lowered = {" ".join(k.strip().casefold().split()): v for k, v in stock.items()}
-    if wanted in lowered:
-        return lowered[wanted]
-
-    def letters(value: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", value.casefold())
-
-    target = letters(wanted)
-    if not target:
-        return None
-    for name, value in lowered.items():
-        stored = letters(name)
-        if stored and (stored.startswith(target) or target.startswith(stored)):
-            return value
-    return None
+    return country_names.find(stock, country)
 
 
 _FAILURE_PHRASES = ("no valid", "error", "failed", "invalid", "not found", "denied")
@@ -638,8 +631,7 @@ async def canonical_country(name: str) -> str:
     if not target:
         return name.strip()
     for stored_key, entry in known.items():
-        stored = letters(stored_key)
-        if stored and (stored.startswith(target) or target.startswith(stored)):
+        if country_names.same_country(stored_key, key):
             return entry["name"]
     return name.strip()
 
@@ -700,6 +692,14 @@ async def get_config() -> dict[str, Any]:
     merged = dict(DEFAULT_CONFIG)
     if stored:
         merged.update(stored)
+        # A stored "" for start_at predates this setting existing: the field
+        # was written on every save, so an install that never chose a start
+        # time still holds an empty string, and that empty string would mask
+        # the 04:00 default forever. An owner who genuinely wants uploads to
+        # begin at once says so per upload ("ekhoni shuru") or clears it from
+        # the panel, which writes START_NOW rather than "".
+        if stored.get("start_at", START_NOW) == "":
+            merged["start_at"] = DEFAULT_CONFIG["start_at"]
     return merged
 
 
@@ -971,15 +971,23 @@ async def enqueue_file(
 
         # Timing the caption stated is a per-country setting, so it survives
         # into the run exactly like one set from a button.
-        timing: dict[str, Any] = {}
-        if "start_at" in stated:
-            timing["start_at"] = stated["start_at"]
+        #
+        # A field the caption did NOT state is CLEARED rather than left
+        # alone. A start time is a one-off instruction about one upload
+        # ("tonight, start at 21:00"), not a standing property of the
+        # country, and leaving it set meant the next file for that country
+        # silently inherited it - uploaded at noon, it sat there until 21:00
+        # for no reason the owner could see. Clearing falls back to the
+        # global default (start_at below), which is what a plain upload
+        # should follow.
+        timing: dict[str, Any] = {
+            "start_at": stated.get("start_at"),
+        }
         if "stop_at" in stated:
             timing["stop_at"] = stated["stop_at"]
         if "run_minutes" in stated:
             timing["run_minutes"] = int(stated["run_minutes"])
-        if timing:
-            await otp_schedule.set_country_settings(country, timing)
+        await otp_schedule.set_country_settings(country, timing)
         if stated.get("tag"):
             await _set_last_tag(stated["tag"], country)
 
@@ -1469,6 +1477,9 @@ async def _add_after_wait(
         if outcome["added"]:
             # The run clock starts NOW, not when the file was uploaded: a
             # "20h" run scheduled for 21:00 means twenty hours from 21:00.
+            # No gate is recorded because the wait is over - passing the
+            # start time again here would make the country wait a second
+            # time, tomorrow, having just begun.
             await otp_schedule.begin_run(country)
             stored = by_id.get(entry["id"])
             if stored is not None:
@@ -1587,11 +1598,17 @@ async def _stock_snapshot(target: str, cfg: dict[str, Any]) -> dict[str, int]:
         return {}
 
 
-async def start_automation() -> dict[str, Any]:
+async def start_automation(*, respect_schedule: bool = False) -> dict[str, Any]:
     """Consume every queued (and tagged) file: cleanup once, then add each
     file as its own reply-based command. On success the queue becomes the
     new active_files set (replacing whatever was active before) and the
     periodic monitor (enabled) turns on.
+
+    Starts NOW by default, which is what the name says and what pressing
+    Start means. ``respect_schedule`` is for the one caller that is not an
+    instruction - maybe_auto_start(), reacting to an upload nobody said
+    anything about. That is where a default start time belongs; answering
+    an explicit "shuru" with "sure, in six hours" is not.
     """
     cfg = await get_config()
     queue = await get_queue()
@@ -1637,7 +1654,9 @@ async def start_automation() -> dict[str, Any]:
             # A country with a wall-clock start time must not touch the
             # target bot yet. Arm it, show it, add nothing - the whole point
             # of "start at 21:00" is that nothing happens before 21:00.
-            start_at = str(entry_cfg.get("start_at") or "").strip()
+            start_at = str(entry_cfg.get("start_at") or "").strip() if respect_schedule else ""
+            if otp_schedule._is_now(start_at):
+                start_at = ""
             if start_at:
                 entry["waiting_start"] = start_at
                 waiting.append(entry)
@@ -1711,8 +1730,13 @@ async def start_automation() -> dict[str, Any]:
             # not from whenever this country last ran. For a country waiting
             # on a start time the clock is re-based when that time actually
             # arrives (see _add_after_wait) - what begin_run records here is
-            # the anchor the start time is measured from.
-            await otp_schedule.begin_run(country)
+            # the anchor the start time is measured from, and the gate this
+            # particular run must wait for.
+            await otp_schedule.begin_run(
+                country,
+                start_at=(str(entry_cfg.get("start_at") or "").strip()
+                          if respect_schedule else ""),
+            )
 
         await save_config({"enabled": True, "awaiting_tag_entry_id": None})
         # MERGE into the active set, never replace it. A second upload used to
@@ -1777,7 +1801,7 @@ async def maybe_auto_start() -> dict[str, Any] | None:
     if await countries_needing_runtime(queue):
         return None
 
-    result = await start_automation()
+    result = await start_automation(respect_schedule=True)
     result["auto"] = True
     return result
 
@@ -1870,6 +1894,9 @@ def help_text() -> str:
         "  20h / 90 min / limit nai - koto somoy cholbe (jiggesh korle)\n"
         "  <country> bad dao - oi country bad\n"
         "  sob bad dao      - queue khali koro\n"
+        "\n"
+        "Notun file default 04:00 (Dubai) e shuru hobe. Ekhoni chalate\n"
+        "caption-e 'ekhoni shuru' likho, ba panel-e On at > Ekhoni.\n"
         "\n"
         "Command:\n"
         "  /otpbot    - button panel (sob ekhane)\n"

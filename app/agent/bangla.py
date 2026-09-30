@@ -62,7 +62,8 @@ _WORDS: dict[str, str] = {
     # time
     "ঘণ্টা": "ghonta", "ঘন্টা": "ghonta", "মিনিট": "min", "দিন": "din",
     "সময়": "somoy", "থেকে": "theke", "পর্যন্ত": "porjonto", "পরে": "pore",
-    "এখন": "ekhon", "আজ": "aj", "কাল": "kal", "রাত": "rat", "সারারাত": "sararat",
+    "এখন": "ekhon", "এখনই": "ekhoni", "এখুনি": "ekhoni",
+    "আজ": "aj", "কাল": "kal", "রাত": "rat", "সারারাত": "sararat",
     "সারাদিন": "sara din", "লিমিট": "limit", "ডিফল্ট": "default",
     "টা": "ta", "স্টপ": "stop", "কোন": "kono", "কোনো": "kono",
     "সকাল": "sokal", "দুপুর": "dupur", "বিকাল": "bikal", "সন্ধ্যা": "sondha",

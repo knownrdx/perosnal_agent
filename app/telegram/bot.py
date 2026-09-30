@@ -911,16 +911,21 @@ class AgentBot:
             if action == "cstart":
                 index_raw, value_raw = rest.split(":", 1)
                 index = int(index_raw)
-                start_at = "" if value_raw == "now" else value_raw
+                # START_NOW, not "": an empty string is what an older
+                # version wrote on every save, so get_config() reads it as
+                # "nobody chose" and applies the default. Pressing Ekhoni is
+                # a choice and has to survive that.
+                start_at = otp_bot.START_NOW if value_raw == "now" else value_raw
+                waits = not otp_schedule._is_now(start_at)
                 clock = otp_schedule.clock_now()
 
                 if index < 0:
                     await otp_bot.save_config({"start_at": start_at})
-                    await query.answer(f"All: {start_at or 'ekhoni'}")
+                    await query.answer(f"All: {start_at if waits else 'ekhoni'}")
                     await refresh_panel(
                         f"\u25B6\uFE0F Shob country Dubai time {start_at} e shuru hobe "
                         f"(ekhon {clock['dubai']})."
-                        if start_at
+                        if waits
                         else "\u25B6\uFE0F Kono start time nai - shathe shathe shuru hobe."
                     )
                     return
@@ -932,11 +937,11 @@ class AgentBot:
                     return
                 country = names[index]
                 await otp_schedule.set_country_settings(country, {"start_at": start_at})
-                await query.answer(f"{country}: {start_at or 'ekhoni'}")
+                await query.answer(f"{country}: {start_at if waits else 'ekhoni'}")
                 await refresh_panel(
                     f"\u25B6\uFE0F {country} Dubai time {start_at} e shuru hobe "
                     f"(ekhon {clock['dubai']})."
-                    if start_at
+                    if waits
                     else f"\u25B6\uFE0F {country}: shathe shathe shuru hobe."
                 )
                 return

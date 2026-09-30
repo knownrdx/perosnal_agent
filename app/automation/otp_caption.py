@@ -102,6 +102,21 @@ _NEVER_PHRASES = (
     "kokhono na", "bondho korbe na", "cholte thakbe",
 )
 
+# "start straight away" - the way out of the 04:00 default without opening
+# the panel. Sets start_at to "" explicitly, which is different from not
+# mentioning it at all (that inherits the default).
+# Mirrors otp_bot.START_NOW. Defined here rather than imported because
+# otp_bot imports this module, and "" would be read by get_config() as an
+# old empty value and replaced with the default start time.
+START_NOW = "now"
+
+_NOW_PHRASES = (
+    "ekhoni shuru", "ekhuni shuru", "ekhoni start", "ekhuni start",
+    "shuru ekhoni", "start ekhoni", "ekhoni chalu", "chalu ekhoni",
+    "start now", "now start", "right now", "immediately", "ekhoni",
+    "ekhuni", "sathe sathe", "shonge shonge",
+)
+
 
 def _nearest(text: str, words: tuple[str, ...], start: int, end: int) -> float | None:
     """Distance from the match to the closest of ``words``, or None.
@@ -290,10 +305,20 @@ def parse_caption(text: str) -> dict[str, Any]:
         out["stop_at"] = ""
         out["run_minutes"] = 0
 
+    # "ekhoni shuru" - begin immediately, overriding the default start time.
+    # Recorded as START_NOW so enqueue_file can tell it apart from a
+    # caption that simply never mentioned starting (which inherits the
+    # default) and from an empty string left by an older version.
+    if any(phrase in lowered for phrase in _NOW_PHRASES):
+        out["start_at"] = START_NOW
+
     for value, start, end in _clock_matches(text):
         kind = _classify(text, start, end)
         if kind == "start":
-            out.setdefault("start_at", value)
+            # A stated clock time beats "ekhoni" if the caption somehow says
+            # both; the specific instruction wins over the general one.
+            if not out.get("start_at"):
+                out["start_at"] = value
         elif kind == "stop":
             out.pop("no_stop", None)
             out["stop_at"] = value

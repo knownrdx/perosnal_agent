@@ -630,10 +630,23 @@ async def test_our_guessed_name_is_replaced_by_the_bots_spelling(environment):
     """Our prefix table is a guess; /frcd and /setlimit key on the bot's own
     name, so a mismatch would silently never match its stock line.
     """
-    await otp_bot.learn_countries({"Congo (DRC)": 12})
+    await otp_bot.learn_countries({"DR Congo": 12})
 
-    assert await otp_bot.canonical_country("Congo") == "Congo (DRC)"
-    assert await otp_bot.canonical_country("congo (drc)") == "Congo (DRC)"
+    # The pair from the owner's screenshot: our table says "Congo (DRC)",
+    # the bot says "DR Congo". Failing to connect them read as zero stock
+    # and re-added the whole file every cycle.
+    assert await otp_bot.canonical_country("Congo (DRC)") == "DR Congo"
+    assert await otp_bot.canonical_country("dr congo") == "DR Congo"
+
+
+async def test_the_two_congos_are_not_merged(environment):
+    """"Congo" alone is the Republic of the Congo - a different country
+    with different stock. Adopting the DRC's name for it would file its
+    numbers under the wrong stock, which is worse than not matching.
+    """
+    await otp_bot.learn_countries({"DR Congo": 12})
+
+    assert await otp_bot.canonical_country("Congo") == "Congo"
 
 
 async def test_an_unknown_country_keeps_our_guess(environment):
