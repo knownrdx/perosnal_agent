@@ -28,6 +28,13 @@ from app.tools.base import ToolContext
 
 log = get_logger(__name__)
 
+# Post-task learning (reflection + failure rules + skill synthesis) gets its
+# own deadline, separate from the task's. Reflection is one model call and
+# synthesis at most MAX_CLUSTERS_PER_RUN more, only for changed topics; three
+# minutes covers that on a slow local model, and a hung provider costs the
+# worker this long at most instead of holding it indefinitely.
+LEARNING_TIMEOUT_S = 180
+
 
 @dataclass(slots=True)
 class StepOutcome:
@@ -44,10 +51,28 @@ class AgentEngine:
         self.llm = llm or get_llm()
         self.notifier = notifier
         self.executor = executor or Executor(notifier=notifier)
+        # Tasks whose outcome this engine has persisted and not yet learned
+        # from. Keyed by task id, so one engine shared by several worker loops
+        # is fine.
+        self._learning_due: set[str] = set()
 
     # ------------------------------------------------------------------ #
-    async def run_task(self, task_id: str) -> str:
-        """Drive a task to a terminal (or waiting) state. Returns final status."""
+    async def run_task(self, task_id: str, *, learn: bool = True) -> str:
+        """Drive a task to a terminal (or waiting) state. Returns final status.
+
+        ``learn=False`` leaves the post-task learning to the caller, via
+        ``learn_after``. The worker does that so its task timeout covers the
+        task only: learning used to run in here, inside the deadline, and a
+        slow reflection after a SUCCESSFUL task could run the clock out and
+        have the worker overwrite the finished result as FAILED.
+        """
+        status = await self._drive(task_id)
+        if learn:
+            await self.learn_after(task_id)
+        return status
+
+    async def _drive(self, task_id: str) -> str:
+        """The step loop proper: run until terminal, waiting, or a limit."""
         settings = get_settings()
 
         async with session_scope() as session:
@@ -319,8 +344,10 @@ class AgentEngine:
                                  data={"answer": answer[:500]})
             await self._release_session(session, task_id)
         log.info("task_completed", extra={"task_id": task_id})
+        # Marked before notifying: if the deadline hits mid-send, the outcome
+        # is already committed and the lesson is still owed.
+        self._learning_due.add(task_id)
         await self._notify(task_id, "task_completed")
-        await self._learn(task_id)
 
     async def _fail(self, task_id: str, error: str, kind: FailureKind) -> None:
         settings = get_settings()
@@ -359,8 +386,8 @@ class AgentEngine:
                                  level="ERROR", data={"error": error[:500], "kind": kind.value})
             await self._release_session(session, task_id)
         log.error("task_failed", extra={"task_id": task_id, "error": error[:300]})
+        self._learning_due.add(task_id)
         await self._notify(task_id, "task_failed")
-        await self._learn(task_id)
 
     async def _notify(self, task_id: str, event: str) -> None:
         """Tell the owner a task reached a terminal state.
@@ -402,19 +429,52 @@ class AgentEngine:
                 session, task.chat_id, active_task_id=None, last_task_id=task_id
             )
 
+    async def learn_after(self, task_id: str) -> None:
+        """Learn from a task whose outcome is already persisted.
+
+        A no-op unless this engine finished the task (completed, or failed
+        for good - a retry is not an outcome yet), so callers can invoke it
+        unconditionally. Bounded by LEARNING_TIMEOUT_S and swallowing every
+        error: by now the result is committed and announced, and nothing
+        learning does - slow, broken or hung - may change it. Cancellation is
+        deliberately NOT swallowed, so shutdown still works.
+        """
+        if task_id not in self._learning_due:
+            return
+        self._learning_due.discard(task_id)
+        try:
+            await asyncio.wait_for(self._learn(task_id), timeout=LEARNING_TIMEOUT_S)
+        except TimeoutError:
+            log.warning("learning_timeout", extra={"task_id": task_id,
+                                                   "timeout_s": LEARNING_TIMEOUT_S})
+        except Exception as exc:  # noqa: BLE001 - learning must never break a task
+            log.warning("learning_failed", extra={"task_id": task_id, "error": str(exc)[:200]})
+
     async def _learn(self, task_id: str) -> None:
-        """Reflect on a finished task. Never allowed to break the task itself."""
+        """Reflect on a finished task. Never allowed to break the task itself.
+
+        Each stage is isolated so one failing does not skip the others. The
+        deterministic, model-free failure rules go first: they take
+        milliseconds and must not be starved by a slow model eating the
+        shared LEARNING_TIMEOUT_S. Skills go last because they consolidate
+        whatever reflection just stored.
+        """
         if not get_settings().learning_enabled:
             return
         from app.agent.learning import learn_from_failures, reflect_on_task
         from app.agent.skills import synthesize_skills
 
-        try:
-            await reflect_on_task(task_id, llm=self.llm)
-            await learn_from_failures()
-            await synthesize_skills(llm=self.llm)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("learning_failed", extra={"task_id": task_id, "error": str(exc)[:200]})
+        stages = (
+            ("failure_rules", learn_from_failures),
+            ("reflection", lambda: reflect_on_task(task_id, llm=self.llm)),
+            ("skills", lambda: synthesize_skills(llm=self.llm)),
+        )
+        for stage, run in stages:
+            try:
+                await run()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("learning_failed", extra={"task_id": task_id, "stage": stage,
+                                                      "error": str(exc)[:200]})
 
     async def _wait_for_user(self, task_id: str, question: str) -> None:
         async with session_scope() as session:

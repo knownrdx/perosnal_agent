@@ -60,8 +60,13 @@ You are given the facts already collected from the agent's database. Write 2-4
 short sentences that a busy person can read in ten seconds.
 
 Rules:
+- Write in English, always - even when task titles or details are in Bengali
+  or Banglish (Bengali typed in Latin letters). Understand them and describe
+  them in English; keep names and file names as they are.
+- Friendly and clear, like a helpful assistant catching the owner up.
 - Lead with anything blocked on the owner or anything that failed.
-- Plain text only. No markdown, no bullet points, no headings, no emoji.
+- Plain text only. No markdown, no bullet points, no headings, no emoji - the
+  structured list with bullets follows your text.
 - State only what is in the facts. Never invent a task, number or outcome.
 - No greeting, no sign-off, no "here is your briefing".
 """

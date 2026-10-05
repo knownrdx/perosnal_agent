@@ -26,6 +26,8 @@ in plaintext.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -49,6 +51,7 @@ try:
         PhoneCodeInvalidError,
         SessionPasswordNeededError,
     )
+    from telethon.errors import RPCError as TelethonRPCError
     from telethon.sessions import StringSession
 
     TELETHON_AVAILABLE = True
@@ -59,19 +62,61 @@ except ImportError:  # pragma: no cover - optional dependency
     SessionPasswordNeededError = Exception  # type: ignore[assignment,misc]
     PhoneCodeInvalidError = Exception  # type: ignore[assignment,misc]
     PhoneCodeExpiredError = Exception  # type: ignore[assignment,misc]
+    TelethonRPCError = None  # type: ignore[assignment,misc]
     TELETHON_AVAILABLE = False
 
 try:
     from pyrogram import Client as PyrogramClient
+    from pyrogram.errors import RPCError as PyrogramRPCError
 
     PYROGRAM_AVAILABLE = True
 except ImportError:  # pragma: no cover - optional dependency
     PyrogramClient = None  # type: ignore[assignment]
+    PyrogramRPCError = None  # type: ignore[assignment,misc]
     PYROGRAM_AVAILABLE = False
+
+_RPC_ERRORS: tuple[type[BaseException], ...] = tuple(
+    t for t in (TelethonRPCError, PyrogramRPCError) if t is not None
+)
 
 
 class UserbotError(Exception):
     """Any failure in the Telegram user account integration."""
+
+
+# Owner-facing: shown in Telegram as-is, so plain and friendly English. Keep
+# the phrases "no longer valid" / "not linked": app/tools/telegram_user_tools
+# keys on them to fail permanently instead of retrying a dead session.
+REVOKED_MESSAGE = (
+    "Your Telegram login is no longer valid - the session was ended, expired, "
+    "or used somewhere else. Please run /tglogin to link it again."
+)
+NOT_LINKED_MESSAGE = "Telegram account is not linked. Use /tglogin first."
+UNREADABLE_MESSAGE = (
+    "Your Telegram account is not linked right now: I can't open the saved "
+    "login because the secret key it was locked with has changed or gone "
+    "missing. Put back /data/.secret_key or set AGENT_SECRET_KEY to its "
+    "original value and restart - or just run /tglogin to link it again."
+)
+
+
+def _is_auth_revoked(exc: BaseException) -> bool:
+    """True when Telegram has invalidated the session itself.
+
+    Both libraries surface every "this authorisation is gone" case (revoked,
+    expired, unregistered key, deactivated account) as a 401 RPC error. 406
+    AUTH_KEY_DUPLICATED also kills the session, but other 406s (e.g.
+    CHANNEL_PRIVATE) are ordinary per-request refusals, so it is matched by
+    name. Network errors and flood waits are not RPC 401s and never match:
+    the client is still good for those.
+    """
+    if not _RPC_ERRORS or not isinstance(exc, _RPC_ERRORS):
+        return False
+    # Telethon's RPCError carries ``code``; Pyrogram's carries ``CODE``.
+    code = getattr(exc, "code", None)
+    if code is None:
+        code = getattr(exc, "CODE", None)
+    return code == 401 or "AuthKeyDuplicated" in type(exc).__name__
 
 
 class TwoFactorRequired(UserbotError):
@@ -89,6 +134,13 @@ class PendingLogin:
     client: Any = None
     awaiting_password: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+# Telegram caps a message at 4096 characters, so reading up to that never
+# truncates. The old 2000 cut silently dropped the tail of a long /st stock
+# report, and every country past the cut read as ZERO stock - with "wipe
+# before add" on, that meant /frcd on a country that still had numbers.
+_MAX_TEXT = 4096
 
 
 class TelegramUserbot:
@@ -126,18 +178,65 @@ class TelegramUserbot:
         """Which library authenticated the stored session (defaults to telethon)."""
         return get_vault().get(TELEGRAM_USER_BACKEND_KEY) or BACKEND_TELETHON
 
+    @staticmethod
+    def _not_linked_error() -> UserbotError:
+        # A session that is stored but undecryptable is not the same as none:
+        # sending the owner to /tglogin alone would hide a lost secret key.
+        if get_vault().unreadable(SESSION_KEY):
+            return UserbotError(UNREADABLE_MESSAGE)
+        return UserbotError(NOT_LINKED_MESSAGE)
+
     # ------------------------------------------------------------------ #
     # Connection
     # ------------------------------------------------------------------ #
     async def client(self) -> Any:
         """Return a connected, authorised client using the backend the stored
         session was linked with (Telethon or Pyrogram)."""
+        # The boot-time vault load may have failed (database not ready yet);
+        # without this the session would look missing until a restart.
+        await get_vault().ensure_loaded()
         async with self._lock:
             backend = self._stored_backend()
 
             if backend == BACKEND_PYROGRAM:
                 return await self._client_pyrogram()
             return await self._client_telethon()
+
+    @contextlib.asynccontextmanager
+    async def _session(self) -> AsyncIterator[Any]:
+        """Yield the client; forget it if Telegram has revoked the session.
+
+        Telethon keeps the socket open after an authorisation is revoked, so
+        ``is_connected()`` stays true and ``client()`` would hand the dead
+        client out on every call until a restart. Dropping it makes the next
+        call rebuild, which re-checks ``is_user_authorized`` and either works
+        (the owner relinked) or says to /tglogin. Anything else - network
+        errors, flood waits - passes through untouched with the client kept.
+        """
+        client = await self.client()
+        backend = self._backend
+        try:
+            yield client
+        except Exception as exc:
+            if not _is_auth_revoked(exc):
+                raise
+            await self._forget_client(client, backend)
+            log.warning("userbot_session_revoked", extra={"error": type(exc).__name__})
+            raise UserbotError(REVOKED_MESSAGE) from exc
+
+    async def _forget_client(self, client: Any, backend: str) -> None:
+        async with self._lock:
+            # Only if it is still the cached one: a concurrent call may already
+            # have dropped it and built a fresh client we must not throw away.
+            if self._client is client:
+                self._client = None
+        try:
+            if backend == BACKEND_PYROGRAM:
+                await client.stop()
+            else:
+                await client.disconnect()
+        except Exception:  # noqa: BLE001 - cleanup must not mask the real error
+            pass
 
     async def _client_telethon(self) -> Any:
         self._require_telethon()
@@ -153,7 +252,7 @@ class TelegramUserbot:
         api_id = vault.get(API_ID_KEY)
         api_hash = vault.get(API_HASH_KEY)
         if not (session and api_id and api_hash):
-            raise UserbotError("Telegram account is not linked. Use /tglogin first.")
+            raise self._not_linked_error()
 
         client = TelegramClient(StringSession(session), int(api_id), api_hash)
         await client.connect()
@@ -174,7 +273,7 @@ class TelegramUserbot:
         api_id = vault.get(API_ID_KEY)
         api_hash = vault.get(API_HASH_KEY)
         if not (session and api_id and api_hash):
-            raise UserbotError("Telegram account is not linked. Use /tglogin first.")
+            raise self._not_linked_error()
 
         app = PyrogramClient(
             name=":memory:",
@@ -202,11 +301,14 @@ class TelegramUserbot:
     async def status(self) -> dict[str, Any]:
         if not self.available():
             return {"available": False, "linked": False, "error": "telethon not installed"}
+        await get_vault().ensure_loaded()
         if not self.has_session():
+            if get_vault().unreadable(SESSION_KEY):
+                return {"available": True, "linked": False, "error": UNREADABLE_MESSAGE}
             return {"available": True, "linked": False}
         try:
-            client = await self.client()
-            me = await client.get_me()
+            async with self._session() as client:
+                me = await client.get_me()
             phone_number = getattr(me, "phone", None) or getattr(me, "phone_number", None)
             return {
                 "available": True,
@@ -500,28 +602,30 @@ class TelegramUserbot:
     async def send_message(
         self, target: str, text: str, *, reply_to: int | None = None
     ) -> dict[str, Any]:
-        client = await self.client()
-        if self._backend == BACKEND_PYROGRAM:
-            peer = self._resolve_pyrogram(target)
-            sent = await client.send_message(peer, text, reply_to_message_id=reply_to)
+        async with self._session() as client:
+            if self._backend == BACKEND_PYROGRAM:
+                peer = self._resolve_pyrogram(target)
+                sent = await client.send_message(peer, text, reply_to_message_id=reply_to)
+                return {"sent": True, "message_id": sent.id, "to": str(target)}
+            entity = await self._resolve(client, target)
+            sent = await client.send_message(entity, text, reply_to=reply_to)
             return {"sent": True, "message_id": sent.id, "to": str(target)}
-        entity = await self._resolve(client, target)
-        sent = await client.send_message(entity, text, reply_to=reply_to)
-        return {"sent": True, "message_id": sent.id, "to": str(target)}
 
     async def send_file(
         self, target: str, path: str, caption: str = "", *, reply_to: int | None = None
     ) -> dict[str, Any]:
-        client = await self.client()
-        if self._backend == BACKEND_PYROGRAM:
-            peer = self._resolve_pyrogram(target)
-            sent = await client.send_document(
-                peer, path, caption=caption or "", reply_to_message_id=reply_to
+        async with self._session() as client:
+            if self._backend == BACKEND_PYROGRAM:
+                peer = self._resolve_pyrogram(target)
+                sent = await client.send_document(
+                    peer, path, caption=caption or "", reply_to_message_id=reply_to
+                )
+                return {"sent": True, "message_id": sent.id, "to": str(target)}
+            entity = await self._resolve(client, target)
+            sent = await client.send_file(
+                entity, path, caption=caption or None, reply_to=reply_to
             )
             return {"sent": True, "message_id": sent.id, "to": str(target)}
-        entity = await self._resolve(client, target)
-        sent = await client.send_file(entity, path, caption=caption or None, reply_to=reply_to)
-        return {"sent": True, "message_id": sent.id, "to": str(target)}
 
     async def delete_messages(self, target: str, message_ids: list[int]) -> dict[str, Any]:
         """Delete messages in a chat, for everyone where the API allows it.
@@ -533,114 +637,121 @@ class TelegramUserbot:
         if not message_ids:
             return {"deleted": 0}
         client = await self.client()
+        backend = self._backend
         try:
-            if self._backend == BACKEND_PYROGRAM:
+            if backend == BACKEND_PYROGRAM:
                 peer = self._resolve_pyrogram(target)
                 await client.delete_messages(peer, message_ids, revoke=True)
             else:
                 entity = await self._resolve(client, target)
                 await client.delete_messages(entity, message_ids, revoke=True)
         except Exception as exc:  # noqa: BLE001 - tidying up must never break a run
+            if _is_auth_revoked(exc):
+                # Still never raises, but the dead client must not be reused.
+                await self._forget_client(client, backend)
             log.warning("userbot_delete_failed", extra={"error": str(exc)[:200]})
             return {"deleted": 0, "error": str(exc)[:200]}
         return {"deleted": len(message_ids)}
 
     async def read_messages(self, target: str, limit: int = 20) -> list[dict[str, Any]]:
-        client = await self.client()
         out: list[dict[str, Any]] = []
-        if self._backend == BACKEND_PYROGRAM:
-            peer = self._resolve_pyrogram(target)
-            async for message in client.get_chat_history(peer, limit=limit):
-                message_date = getattr(message, "date", None)
+        async with self._session() as client:
+            if self._backend == BACKEND_PYROGRAM:
+                peer = self._resolve_pyrogram(target)
+                async for message in client.get_chat_history(peer, limit=limit):
+                    message_date = getattr(message, "date", None)
+                    out.append(
+                        {
+                            "id": message.id,
+                            "text": (message.text or message.caption or "")[:_MAX_TEXT],
+                            "out": bool(getattr(message, "outgoing", False)),
+                            "date": message_date.isoformat() if message_date else None,
+                            "sender_id": getattr(message.from_user, "id", None)
+                            if message.from_user
+                            else None,
+                        }
+                    )
+                return out
+            entity = await self._resolve(client, target)
+            async for message in client.iter_messages(entity, limit=limit):
                 out.append(
                     {
                         "id": message.id,
-                        "text": (message.text or message.caption or "")[:2000],
-                        "out": bool(getattr(message, "outgoing", False)),
-                        "date": message_date.isoformat() if message_date else None,
-                        "sender_id": getattr(message.from_user, "id", None)
-                        if message.from_user
-                        else None,
+                        "text": (message.message or "")[:_MAX_TEXT],
+                        "out": bool(message.out),
+                        "date": message.date.isoformat() if message.date else None,
+                        "sender_id": getattr(message, "sender_id", None),
                     }
                 )
-            return out
-        entity = await self._resolve(client, target)
-        async for message in client.iter_messages(entity, limit=limit):
-            out.append(
-                {
-                    "id": message.id,
-                    "text": (message.message or "")[:2000],
-                    "out": bool(message.out),
-                    "date": message.date.isoformat() if message.date else None,
-                    "sender_id": getattr(message, "sender_id", None),
-                }
-            )
         return out
 
     async def list_dialogs(self, limit: int = 30) -> list[dict[str, Any]]:
-        client = await self.client()
         out: list[dict[str, Any]] = []
-        if self._backend == BACKEND_PYROGRAM:
-            async for dialog in client.get_dialogs(limit=limit):
-                chat = dialog.chat
-                chat_type = str(getattr(chat, "type", "")).lower()
-                is_group = "group" in chat_type
-                is_channel = "channel" in chat_type
-                is_user = "private" in chat_type or "bot" in chat_type
-                name = chat.title or " ".join(
-                    filter(None, [getattr(chat, "first_name", None), getattr(chat, "last_name", None)])
-                )
+        async with self._session() as client:
+            if self._backend == BACKEND_PYROGRAM:
+                async for dialog in client.get_dialogs(limit=limit):
+                    chat = dialog.chat
+                    chat_type = str(getattr(chat, "type", "")).lower()
+                    is_group = "group" in chat_type
+                    is_channel = "channel" in chat_type
+                    is_user = "private" in chat_type or "bot" in chat_type
+                    name = chat.title or " ".join(
+                        filter(
+                            None,
+                            [getattr(chat, "first_name", None), getattr(chat, "last_name", None)],
+                        )
+                    )
+                    out.append(
+                        {
+                            "id": chat.id,
+                            "name": name or "",
+                            "username": getattr(chat, "username", "") or "",
+                            "unread": dialog.unread_messages_count,
+                            "is_group": is_group,
+                            "is_channel": is_channel,
+                            "is_user": is_user,
+                        }
+                    )
+                return out
+            async for dialog in client.iter_dialogs(limit=limit):
                 out.append(
                     {
-                        "id": chat.id,
-                        "name": name or "",
-                        "username": getattr(chat, "username", "") or "",
-                        "unread": dialog.unread_messages_count,
-                        "is_group": is_group,
-                        "is_channel": is_channel,
-                        "is_user": is_user,
+                        "id": dialog.id,
+                        "name": dialog.name or "",
+                        "username": getattr(dialog.entity, "username", "") or "",
+                        "unread": dialog.unread_count,
+                        "is_group": bool(dialog.is_group),
+                        "is_channel": bool(dialog.is_channel),
+                        "is_user": bool(dialog.is_user),
                     }
                 )
-            return out
-        async for dialog in client.iter_dialogs(limit=limit):
-            out.append(
-                {
-                    "id": dialog.id,
-                    "name": dialog.name or "",
-                    "username": getattr(dialog.entity, "username", "") or "",
-                    "unread": dialog.unread_count,
-                    "is_group": bool(dialog.is_group),
-                    "is_channel": bool(dialog.is_channel),
-                    "is_user": bool(dialog.is_user),
-                }
-            )
         return out
 
     async def search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
-        client = await self.client()
         out: list[dict[str, Any]] = []
-        if self._backend == BACKEND_PYROGRAM:
-            async for message in client.search_global(query, limit=limit):
-                message_date = getattr(message, "date", None)
-                chat_id = getattr(message.chat, "id", None) if message.chat else None
+        async with self._session() as client:
+            if self._backend == BACKEND_PYROGRAM:
+                async for message in client.search_global(query, limit=limit):
+                    message_date = getattr(message, "date", None)
+                    chat_id = getattr(message.chat, "id", None) if message.chat else None
+                    out.append(
+                        {
+                            "id": message.id,
+                            "chat_id": chat_id,
+                            "text": (message.text or message.caption or "")[:500],
+                            "date": message_date.isoformat() if message_date else None,
+                        }
+                    )
+                return out
+            async for message in client.iter_messages(None, search=query, limit=limit):
                 out.append(
                     {
                         "id": message.id,
-                        "chat_id": chat_id,
-                        "text": (message.text or message.caption or "")[:500],
-                        "date": message_date.isoformat() if message_date else None,
+                        "chat_id": getattr(message, "chat_id", None),
+                        "text": (message.message or "")[:500],
+                        "date": message.date.isoformat() if message.date else None,
                     }
                 )
-            return out
-        async for message in client.iter_messages(None, search=query, limit=limit):
-            out.append(
-                {
-                    "id": message.id,
-                    "chat_id": getattr(message, "chat_id", None),
-                    "text": (message.message or "")[:500],
-                    "date": message.date.isoformat() if message.date else None,
-                }
-            )
         return out
 
     # ------------------------------------------------------------------ #
@@ -656,23 +767,23 @@ class TelegramUserbot:
         Only supported on a Telethon-linked session: Pyrogram has no
         equivalent of Telethon's ``client.conversation()`` context manager.
         """
-        client = await self.client()
-        if self._backend == BACKEND_PYROGRAM:
-            raise UserbotError(
-                "bot management via BotFather requires a Telethon-linked session; "
-                "use /tglogin or paste a Telethon session string for this feature"
-            )
         conversation_replies: list[str] = []
-
-        async with client.conversation("BotFather", timeout=max(10.0, wait_s * (len(replies) + 2))) as conv:
-            await conv.send_message(command)
-            response = await conv.get_response()
-            conversation_replies.append(response.message or "")
-
-            for reply in replies:
-                await conv.send_message(reply)
+        async with self._session() as client:
+            if self._backend == BACKEND_PYROGRAM:
+                raise UserbotError(
+                    "bot management via BotFather requires a Telethon-linked session; "
+                    "use /tglogin or paste a Telethon session string for this feature"
+                )
+            timeout = max(10.0, wait_s * (len(replies) + 2))
+            async with client.conversation("BotFather", timeout=timeout) as conv:
+                await conv.send_message(command)
                 response = await conv.get_response()
                 conversation_replies.append(response.message or "")
+
+                for reply in replies:
+                    await conv.send_message(reply)
+                    response = await conv.get_response()
+                    conversation_replies.append(response.message or "")
 
         return conversation_replies
 

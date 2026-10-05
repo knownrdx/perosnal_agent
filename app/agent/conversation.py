@@ -24,6 +24,7 @@ from app.db import repo
 from app.db.base import session_scope
 from app.db.models import ACTIVE_STATUSES, TERMINAL_STATUSES, TaskStatus
 from app.llm import LLMError, Message, get_llm
+from app.llm.prompts import REPLY_STYLE
 from app.logging_conf import get_logger
 
 log = get_logger(__name__)
@@ -33,7 +34,8 @@ MAX_TURNS = 10
 CHAT_PROMPT = """You are the owner's private AI agent, talking to them on Telegram.
 
 You are mid-conversation. Answer directly and briefly - this is chat, not a
-report. Plain text only, no markdown headings, no bullet spam.
+report. Understand whatever language the owner writes in (English, Banglish
+or Bengali script), and always answer in English.
 
 You have tools and can run background jobs, but this particular message did not
 require any. If the owner is actually asking you to DO something, say what you
@@ -46,7 +48,16 @@ If asked about something you cannot see, say so and point at /status - never
 guess a number, a country or a state. Admitting you do not know is always
 better than a confident wrong answer.
 
-Keep it under 6 sentences unless the owner asked for detail."""
+Keep it under 6 sentences unless the owner asked for detail.
+
+""" + REPLY_STYLE
+
+# The one reply guaranteed to arrive when every model is down. English like
+# every other reply, and it says what to do next rather than just "error".
+MODEL_DOWN_REPLY = (
+    "\u26a0\ufe0f Sorry, I couldn't reach the model just now.\n\n"
+    "Please try again in a moment, or check /status."
+)
 
 
 @dataclass(slots=True)
@@ -57,6 +68,9 @@ class Reply:
     intent: Intent
     task_id: str | None = None
     created_task: bool = False
+    # Telegram-HTML rendering of ``text``, when there is one (the OTP status
+    # table). ``text`` stays plain for the web chat and the stored history.
+    html: str | None = None
 
 
 async def _session_snapshot(chat_id: int) -> dict[str, Any]:
@@ -110,9 +124,10 @@ async def chat_reply(
         turns = await repo.recent_messages(session, chat_id, limit=MAX_TURNS, thread_id=thread_id)
 
     messages = [Message("system", CHAT_PROMPT)]
-    # Answer in the language the owner used. Told explicitly rather than left
-    # to the model: asked, they match it reliably; unasked, they drift - a
-    # Bengali question comes back in Hindi, an English one in Bengali.
+    # Always answer in English, whatever the owner wrote in. CHAT_PROMPT says
+    # so once; for a Bengali or Banglish message this repeats it next to the
+    # message, because models mirror the language in front of them and a rule
+    # stated only at the top loses to a Bengali question at the bottom.
     directive = language.directive(text)
     if directive:
         messages.append(Message("system", directive))
@@ -129,19 +144,7 @@ async def chat_reply(
         response = await client.chat(messages)
     except LLMError as exc:
         log.warning("chat_reply_failed", extra={"error": str(exc)[:200]})
-        # Said in the owner's own language: this is the one reply guaranteed
-        # to arrive when the model is down, so it is the worst one to send in
-        # a language he has to translate.
-        detected = language.detect(text)
-        if detected.startswith("Banglish"):
-            return "Model-e pouchate parlam na. Abar try koro, ba /status dekho."
-        if detected == "Bengali":
-            return (
-                "\u09ae\u09a1\u09c7\u09b2\u09c7 \u09aa\u09cc\u0981\u099b\u09be\u09a4\u09c7 \u09aa\u09be\u09b0\u09b2\u09be\u09ae \u09a8\u09be\u0964 \u0986\u09ac\u09be\u09b0 \u099a\u09c7\u09b7\u09cd\u099f\u09be \u0995\u09b0\u09cb, \u09ac\u09be /status \u09a6\u09c7\u0996\u09cb\u0964"
-            )
-        return (
-            "I could not reach the model just now. Try again, or check /status."
-        )
+        return MODEL_DOWN_REPLY
 
     answer = (response.content or "").strip()
     # The task engine speaks JSON; if a model slips into that here, unwrap it.
@@ -229,20 +232,13 @@ async def handle_message(
             await _record_reply(chat_id, pending, thread_id=thread_id)
             return Reply(pending, Intent.CONTROL)
 
-        if await otp_bot.get_awaiting_tag_entry() is not None:
-            answer = await otp_bot.handle_tag_answer(text)
-            await _record_reply(chat_id, answer, thread_id=thread_id)
-            return Reply(answer, Intent.CONTROL)
-
-        # "How long should this run?" is answered by the next message too.
-        # Checked after the tag question (that one is asked first) but before
-        # every other trigger, so a bare "20h" is read as the answer it is
-        # rather than as small talk.
-        if await otp_bot.get_awaiting_runtime():
-            answer = await otp_bot.handle_runtime_answer(text)
-            await _record_reply(chat_id, answer, thread_id=thread_id)
-            return Reply(answer, Intent.CONTROL)
-
+        # The command words below are checked BEFORE the open service / run
+        # length questions. Those questions take free text, and used to take
+        # these words too: "stop" while the service question was open was
+        # stored as the service name - and, being the last answer needed,
+        # STARTED the run under a tag called "stop". No service or run
+        # length is spelled "stop", "status" or "sob bad dao"; "bad"/"skip"
+        # stay answers (they mean "not this one") and still reach them.
         if otp_bot.is_clear_trigger(text):
             answer = await otp_bot.handle_clear_queue()
             await _record_reply(chat_id, answer, thread_id=thread_id)
@@ -259,15 +255,15 @@ async def handle_message(
             await _record_reply(chat_id, answer, thread_id=thread_id)
             return Reply(answer, Intent.CONTROL)
 
-        if otp_bot.is_resume_trigger(text):
-            answer = await otp_bot.handle_resume_trigger()
-            await _record_reply(chat_id, answer, thread_id=thread_id)
-            return Reply(answer, Intent.CONTROL)
-
         if otp_bot.is_status_trigger(text):
-            answer = await otp_bot.handle_status_trigger()
+            from app.telegram import otp_panel
+
+            # The status is a Telegram-HTML table; the web chat and the
+            # stored history show text as-is, so they get it without tags.
+            rich = await otp_bot.handle_status_trigger()
+            answer = otp_panel.html_to_plain(rich)
             await _record_reply(chat_id, answer, thread_id=thread_id)
-            return Reply(answer, Intent.CONTROL)
+            return Reply(answer, Intent.CONTROL, html=rich)
 
         if otp_bot.is_help_trigger(text):
             answer = otp_bot.help_text()
@@ -275,7 +271,46 @@ async def handle_message(
             return Reply(answer, Intent.CONTROL)
 
         if otp_bot.is_start_trigger(text):
+            # With a question still open this re-asks it rather than
+            # starting, which is what handle_start_trigger does anyway.
             answer = await otp_bot.handle_start_trigger()
+            await _record_reply(chat_id, answer, thread_id=thread_id)
+            return Reply(answer, Intent.CONTROL)
+
+        if await otp_bot.get_awaiting_tag_entry() is not None:
+            answer = await otp_bot.handle_tag_answer(text)
+            await _record_reply(chat_id, answer, thread_id=thread_id)
+            return Reply(answer, Intent.CONTROL)
+
+        # "How long should this run?" is answered by the next message too.
+        # Checked after the tag question (that one is asked first), so a bare
+        # "20h" is read as the answer it is rather than as small talk.
+        if await otp_bot.get_awaiting_runtime():
+            answer = await otp_bot.handle_runtime_answer(text)
+            await _record_reply(chat_id, answer, thread_id=thread_id)
+            return Reply(answer, Intent.CONTROL)
+
+        if otp_bot.is_resume_trigger(text):
+            answer = await otp_bot.handle_resume_trigger()
+            await _record_reply(chat_id, answer, thread_id=thread_id)
+            return Reply(answer, Intent.CONTROL)
+
+        if otp_bot.is_skip_trigger(text) and (
+            " ".join(language.normalise(text).lower().split()) not in {"no", "na", "eta na"}
+        ):
+            # "bad dao" with no question open has nothing to apply to. Passed
+            # on, the router filed it as a background JOB - an agent told
+            # just "remove", with no idea what - or, with the model down,
+            # answered "could not reach the model". Say what does work.
+            # (A plain "no"/"na" is left alone: it is as likely to be a reply
+            # to the chat model's own question.)
+            answer = (
+                "\U0001F5D1 Nothing is waiting for an answer right now.\n"
+                "\n"
+                "\u2022 To drop one country: type '<country> bad dao' (e.g. 'Nigeria bad dao')\n"
+                "\u2022 To empty the queue: type 'sob bad dao'\n"
+                "\u2022 To stop everything: type 'stop'"
+            )
             await _record_reply(chat_id, answer, thread_id=thread_id)
             return Reply(answer, Intent.CONTROL)
 

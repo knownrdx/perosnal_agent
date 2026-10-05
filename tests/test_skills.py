@@ -87,6 +87,8 @@ async def test_synthesize_skills_upserts_not_duplicates(environment):
     llm = EchoingLLM(summary="first summary")
     await synthesize_skills(llm=llm)
 
+    # A new lesson on the topic: unchanged topics are (deliberately) skipped.
+    await _seed_lessons("report", 4)
     llm2 = EchoingLLM(summary="second, refined summary")
     await synthesize_skills(llm=llm2)
 

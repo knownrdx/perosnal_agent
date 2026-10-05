@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import time
 from typing import Any
 
@@ -25,6 +26,30 @@ from app.telegram import otp_panel
 from app.telegram.notifier import Notifier
 
 log = get_logger(__name__)
+
+# Closing bullet for every "type a value" prompt. "skip" is one of the words
+# otp_bot.handle_pending_input already treats as "never mind" (as are "bad",
+# "bad dao" and "cancel"), so the owner can keep typing whichever they like.
+_SKIP_HINT = "• Type \"skip\" to cancel"
+
+
+def _thousands(value: Any) -> str:
+    """12345 -> '12,345'; anything that is not a number is shown as-is."""
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _no_countries_text() -> str:
+    return (
+        "\U0001F30D No countries yet\n"
+        "\n"
+        "• Nothing is queued or running\n"
+        "\n"
+        "Send a numbers file here first."
+    )
+
 
 HELP_TEXT = """\U0001F916 Personal AI Agent
 
@@ -133,7 +158,22 @@ class AgentBot:
         pending = await otp_bot.get_awaiting_tag_entry()
         markup = otp_panel.service_keyboard(pending["id"]) if pending else None
         with contextlib.suppress(Exception):
-            await query.message.answer(reply, reply_markup=markup)
+            # The reply can be a whole start report - one line per country
+            # plus the bot's own replies - which outgrows a single message.
+            await self._answer_long(query.message, reply, reply_markup=markup)
+
+    async def _answer_long(self, message: Any, text: str, reply_markup: Any = None) -> None:
+        """Send text that may exceed Telegram's per-message cap, in pieces.
+
+        Telegram rejects an over-long message outright, so a long start
+        report or status never arrived at all. The keyboard goes on the last
+        piece, under the text it belongs to.
+        """
+        chunks = otp_panel.split_text(text)
+        for number, chunk in enumerate(chunks, start=1):
+            await message.answer(
+                chunk, reply_markup=reply_markup if number == len(chunks) else None
+            )
 
     async def _guard(self, message: Message) -> bool:
         if not self._authorized(message):
@@ -592,13 +632,40 @@ class AgentBot:
                 return
 
             cfg = await otp_bot.get_config()
+            # HTML table, capped to one message by status_text itself - a
+            # split would cut the <pre> block in half.
             await message.answer(
                 await otp_panel.status_text(),
+                parse_mode="HTML",
                 reply_markup=otp_panel.control_keyboard(bool(cfg["enabled"])),
             )
 
         @dp.callback_query(F.data.startswith(f"{otp_panel.PREFIX}:"))
         async def _otp_callback(query: CallbackQuery) -> None:
+            """Run one button press, and never leave it unanswered.
+
+            An exception escaping a callback handler goes to aiogram's log,
+            not the chat: the button spins until Telegram gives up and the
+            owner is told nothing. A stale or corrupted payload ("otp:int:abc")
+            was enough to do it.
+            """
+            try:
+                await _handle_otp_callback(query)
+            except Exception as exc:  # noqa: BLE001 - the owner must hear about it
+                log.exception("otp_callback_failed", extra={"data": getattr(query, "data", "")})
+                # Already answered on most paths - a second answer is refused,
+                # which is fine; the message below is what matters.
+                with contextlib.suppress(Exception):
+                    await query.answer("\u274C That did not work", show_alert=False)
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        "\u274C That button did not work.\n"
+                        "\n"
+                        f"\u2022 Reason: {str(exc)[:300] or type(exc).__name__}\n"
+                        "\u2022 Open /otpbot and try again"
+                    )
+
+        async def _handle_otp_callback(query: CallbackQuery) -> None:
             """Every OTP panel button lands here.
 
             Buttons are shared state: the owner can tap one on an old message
@@ -622,16 +689,34 @@ class AgentBot:
 
             async def refresh_panel(note: str = "") -> None:
                 cfg = await otp_bot.get_config()
+                # HTML, and always within one message (status_text caps it).
                 text = await otp_panel.status_text()
                 if note:
-                    text = f"{note}\n\n{text}"
+                    # Notes are plain text that can quote a country or a bot
+                    # reply, so they are escaped before joining the HTML.
+                    escaped = html.escape(note)
+                    if len(escaped) + len(text) + 2 <= otp_panel.MESSAGE_LIMIT:
+                        text = f"{escaped}\n\n{text}"
+                    else:
+                        # The note is the result of what was just tapped (a
+                        # whole start report, say). Folded into an edit that
+                        # is then too long, Telegram refused it and the
+                        # suppress below swallowed it - so it goes on its own.
+                        with contextlib.suppress(Exception):
+                            await self._answer_long(query.message, note)
                 with contextlib.suppress(Exception):
                     # Telegram rejects an edit that changes nothing; that is
                     # a no-op for us, not an error worth surfacing.
                     await query.message.edit_text(
                         text,
+                        parse_mode="HTML",
                         reply_markup=otp_panel.control_keyboard(bool(cfg["enabled"])),
                     )
+
+            async def pick_country(token: str) -> str | None:
+                """The country a button names, or None once it is gone."""
+                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
+                return otp_panel.resolve_country(token, otp_panel.country_names(entries))
 
             if action == "svc":
                 entry_id, service = rest.split(":", 1)
@@ -652,7 +737,7 @@ class AgentBot:
                 await otp_bot.remove_from_queue(rest)
                 await query.answer("Removed")
                 label = (entry or {}).get("country") or "File"
-                reply = await otp_bot._continue_after_tagging(f"\U0001F5D1 {label} bad deoa holo.")
+                reply = await otp_bot._continue_after_tagging(f"\U0001F5D1 {label} removed.")
                 await self._send_next_prompt(query, reply)
                 return
 
@@ -670,9 +755,11 @@ class AgentBot:
                     await query.answer()
                     with contextlib.suppress(Exception):
                         await query.message.answer(
-                            "\u26A0\uFE0F Wipe mode needs your bot user id for /frcd.\n"
-                            "Set it in the web UI (OTP Bot -> Your user id), "
-                            "otherwise I'll fall back to /useddelete."
+                            "\u26A0\uFE0F Wipe mode needs your bot user id\n"
+                            "\n"
+                            "\u2022 /frcd cannot run without it\n"
+                            "\u2022 Until it is set, numbers are only added - nothing is wiped\n"
+                            "\u2022 Set it in the web UI: OTP Bot \u2192 Your user id"
                         )
                     return
                 await query.answer("Saved")
@@ -684,7 +771,11 @@ class AgentBot:
                 await query.answer()
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        "\u23F1 Koto min por por check korbo?",
+                        "\u23F1 How often should I check the stock?\n"
+                        "\n"
+                        "\u2022 Applies to every country without its own setting\n"
+                        "\n"
+                        "Pick an interval below.",
                         reply_markup=otp_panel.interval_keyboard(cfg["interval_minutes"]),
                     )
                 return
@@ -694,8 +785,12 @@ class AgentBot:
                 await query.answer()
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        "\U0001F4E6 Koto number baki thakle restock korbo? "
-                        "(Country-r nijer setting thakle oita age)",
+                        "\U0001F4E6 When should I restock?\n"
+                        "\n"
+                        "\u2022 Refill once this many numbers are left\n"
+                        "\u2022 A country's own setting wins over this default\n"
+                        "\n"
+                        "Pick a level below.",
                         reply_markup=otp_panel.threshold_keyboard(cfg["quota_threshold"]),
                     )
                 return
@@ -703,11 +798,11 @@ class AgentBot:
             if action == "thr":
                 threshold = int(rest)
                 await otp_bot.save_config({"quota_threshold": threshold})
-                await query.answer(f"Restock at {threshold}")
+                await query.answer(f"Restock at {threshold:,}")
                 await refresh_panel(
-                    "\U0001F4E6 Default: khali hole restock hobe."
+                    "\U0001F4E6 Default: restock when empty."
                     if threshold == 0
-                    else f"\U0001F4E6 Default: {threshold} baki thakle restock hobe."
+                    else f"\U0001F4E6 Default: restock when {threshold:,} are left."
                 )
                 return
 
@@ -716,13 +811,16 @@ class AgentBot:
                 await otp_bot.set_pending_input(field, None)
                 await query.answer()
                 prompt = (
-                    "\u23F1 Koto min por por check korbo? Number likho (1-1440)."
+                    "\u23F1 How often should I check?\n"
+                    "\n"
+                    "\u2022 Type the minutes (1-1440)\n"
                     if field == "interval_minutes"
-                    else "\U0001F4E6 Koto number baki thakle restock korbo? "
-                    "Number likho (0 = khali hole)."
+                    else "\U0001F4E6 Restock when how many numbers are left?\n"
+                    "\n"
+                    "\u2022 Type a number (0 = when empty)\n"
                 )
                 with contextlib.suppress(Exception):
-                    await query.message.answer(f"{prompt}\n\n(Bad dite 'bad' likho.)")
+                    await query.message.answer(prompt + _SKIP_HINT)
                 return
 
             if action == "ask_clean":
@@ -730,7 +828,7 @@ class AgentBot:
                 await query.answer()
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        "\U0001F9F9 Add korar age ki korbo?",
+                        "\U0001F9F9 What should I clean up before adding numbers?",
                         reply_markup=otp_panel.cleanup_keyboard(
                             bool(cfg.get("force_delete_before_add"))
                         ),
@@ -749,10 +847,10 @@ class AgentBot:
                 if not outcome["ok"]:
                     await refresh_panel(f"\u274C {outcome['error']}")
                     return
-                names = ", ".join(outcome["countries"]) or "(kichu nai)"
-                note = f"\U0001F30D Bot theke country list update kora holo: {names}"
+                names = ", ".join(outcome["countries"]) or "(none)"
+                note = f"\U0001F30D Country list updated from the bot: {names}"
                 if outcome.get("new"):
-                    note += f"\nNotun: {', '.join(outcome['new'])}"
+                    note += f"\nNew: {', '.join(outcome['new'])}"
                 await refresh_panel(note)
                 return
 
@@ -763,118 +861,125 @@ class AgentBot:
                 await query.answer()
                 if markup is None:
                     with contextlib.suppress(Exception):
-                        await query.message.answer("Kono country nai - age file dao.")
+                        await query.message.answer(_no_countries_text())
                     return
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        "\U0001F30D Kon country-r setting bodlabo?", reply_markup=markup
+                        "\U0001F30D Which country do you want to change?", reply_markup=markup
                     )
                 return
 
             if action == "cpause":
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                index = int(rest)
-                if index >= len(names):
+                country = await pick_country(rest)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                country = names[index]
                 now_paused = not await otp_schedule.is_paused(country)
                 await otp_schedule.set_paused(country, now_paused)
                 await query.answer(f"{country}: {'off' if now_paused else 'on'}")
                 await refresh_panel(
-                    f"\u23F8 {country} off kora holo (file ar setting thakbe)."
+                    f"\u23F8 {country} paused \u2014 its file and settings are kept."
                     if now_paused
-                    else f"\u25B6\uFE0F {country} abar chalu kora holo."
+                    else f"\u25B6\uFE0F {country} resumed."
                 )
                 return
 
             if action == "rmc2":
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                index = int(rest)
-                if index >= len(names):
+                country = await pick_country(rest)
+                if country is None:
                     await query.answer("Already gone.", show_alert=True)
                     return
-                country = names[index]
                 removed = await otp_bot.remove_by_country(country)
                 await query.answer(f"{len(removed)} removed")
-                await refresh_panel(f"\U0001F5D1 {country} bad deoa holo.")
+                await refresh_panel(f"\U0001F5D1 {country} removed.")
                 return
 
             if action == "pickst":
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                index = int(rest)
-                if index >= len(names):
+                country = await pick_country(rest)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                country = names[index]
                 cfg = await otp_bot.get_config()
                 current = await otp_schedule.effective_config(country, cfg)
                 clock = otp_schedule.clock_now()
                 await query.answer()
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        f"\u23F0 {country}: kokhon off hobe?\n"
-                        f"Ekhon {clock['dubai']} Dubai ({clock['utc']} UTC)",
+                        f"\u23F0 When should {country} stop?\n"
+                        "\n"
+                        f"\u2022 Now: {clock['dubai']} Dubai ({clock['utc']} UTC)\n"
+                        "\n"
+                        "Pick a Dubai time below.",
                         reply_markup=otp_panel.stop_time_keyboard(
-                            index, str(current.get("stop_at") or "")
+                            otp_panel.country_key(country), str(current.get("stop_at") or "")
                         ),
                     )
                 return
 
             if action == "cstop":
                 index_raw, value_raw = rest.split(":", 1)
-                index = int(index_raw)
                 stop_at = "" if value_raw == "never" else value_raw
                 clock = otp_schedule.clock_now()
 
                 # -1 is the global picker: set the default every country
                 # inherits, rather than one country's override.
-                if index < 0:
+                if otp_panel.is_all_countries(index_raw):
                     await otp_bot.save_config({"stop_at": stop_at})
                     await query.answer(f"All: {stop_at or 'no stop time'}")
                     await refresh_panel(
-                        f"\u23F0 Shob country Dubai time {stop_at} e off hobe "
-                        f"(ekhon {clock['dubai']})."
+                        f"\u23F0 Every country stops at {stop_at} Dubai time "
+                        f"(now {clock['dubai']})."
                         if stop_at
-                        else "\u267E\uFE0F Kono stop time nai - 'stop' na bola porjonto cholbe."
+                        else "\u267E\uFE0F No stop time \u2014 runs until you say \"stop\"."
                     )
                     return
 
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                if index >= len(names):
+                country = await pick_country(index_raw)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                country = names[index]
                 await otp_schedule.set_country_settings(country, {"stop_at": stop_at})
                 await query.answer(f"{country}: {stop_at or 'no stop time'}")
                 await refresh_panel(
-                    f"\u23F0 {country} Dubai time {stop_at} e off hobe "
-                    f"(ekhon {clock['dubai']})."
+                    f"\u23F0 {country} stops at {stop_at} Dubai time "
+                    f"(now {clock['dubai']})."
                     if stop_at
-                    else f"\u267E\uFE0F {country}: kono stop time nai."
+                    else f"\u267E\uFE0F {country}: no stop time."
                 )
                 return
 
             if action == "cstopc":
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                index = int(rest)
-                if index >= len(names):
+                clock = otp_schedule.clock_now()
+                # "Off at" -> "Other time" carries -1, the ALL-countries
+                # target, exactly like the start and run-length pickers. It
+                # used to be read as a list position: names[-1], so the typed
+                # time went to whichever country was last (and with nothing
+                # queued the button crashed).
+                if otp_panel.is_all_countries(rest):
+                    await otp_bot.set_pending_input("stop_at", None)
+                    await query.answer()
+                    with contextlib.suppress(Exception):
+                        await query.message.answer(
+                            "\u23F0 When should every country stop?\n"
+                            "\n"
+                            "\u2022 Type a time as HH:MM (Dubai time)\n"
+                            f"\u2022 Now: {clock['dubai']} Dubai / {clock['utc']} UTC\n"
+                            + _SKIP_HINT
+                        )
+                    return
+                country = await pick_country(rest)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                country = names[index]
                 await otp_bot.set_pending_input("stop_at", country)
-                clock = otp_schedule.clock_now()
                 await query.answer()
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        f"\u23F0 {country}: kon time e off hobe? HH:MM likho "
-                        f"(Dubai time).\nEkhon {clock['dubai']} Dubai / "
-                        f"{clock['utc']} UTC\n\n(Bad dite 'bad' likho.)"
+                        f"\u23F0 When should {country} stop?\n"
+                        "\n"
+                        "\u2022 Type a time as HH:MM (Dubai time)\n"
+                        f"\u2022 Now: {clock['dubai']} Dubai / {clock['utc']} UTC\n"
+                        + _SKIP_HINT
                     )
                 return
 
@@ -884,9 +989,12 @@ class AgentBot:
                 await query.answer()
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        f"\u23F0 Puro task kokhon off hobe?\n"
-                        f"Ekhon {clock['dubai']} Dubai ({clock['utc']} UTC)\n"
-                        f"Ei time ta shob country-r jonno default hobe.",
+                        "\u23F0 When should everything stop?\n"
+                        "\n"
+                        f"\u2022 Now: {clock['dubai']} Dubai ({clock['utc']} UTC)\n"
+                        "\u2022 This becomes the default for every country\n"
+                        "\n"
+                        "Pick a Dubai time below.",
                         reply_markup=otp_panel.stop_time_keyboard(
                             -1, str(cfg.get("stop_at") or "")
                         ),
@@ -899,9 +1007,12 @@ class AgentBot:
                 await query.answer()
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        f"\u25B6\uFE0F Task kokhon SHURU hobe?\n"
-                        f"Ekhon {clock['dubai']} Dubai ({clock['utc']} UTC)\n"
-                        "Ei time na ashle bot e kichu pathabo na.",
+                        "\u25B6\uFE0F When should everything start?\n"
+                        "\n"
+                        f"\u2022 Now: {clock['dubai']} Dubai ({clock['utc']} UTC)\n"
+                        "\u2022 Nothing is sent to the bot before this time\n"
+                        "\n"
+                        "Pick a Dubai time below.",
                         reply_markup=otp_panel.start_time_keyboard(
                             -1, str(cfg.get("start_at") or "")
                         ),
@@ -910,88 +1021,87 @@ class AgentBot:
 
             if action == "cstart":
                 index_raw, value_raw = rest.split(":", 1)
-                index = int(index_raw)
                 # START_NOW, not "": an empty string is what an older
                 # version wrote on every save, so get_config() reads it as
-                # "nobody chose" and applies the default. Pressing Ekhoni is
+                # "nobody chose" and applies the default. Pressing Now is
                 # a choice and has to survive that.
                 start_at = otp_bot.START_NOW if value_raw == "now" else value_raw
                 waits = not otp_schedule._is_now(start_at)
                 clock = otp_schedule.clock_now()
 
-                if index < 0:
+                if otp_panel.is_all_countries(index_raw):
                     await otp_bot.save_config({"start_at": start_at})
-                    await query.answer(f"All: {start_at if waits else 'ekhoni'}")
+                    await query.answer(f"All: {start_at if waits else 'now'}")
                     await refresh_panel(
-                        f"\u25B6\uFE0F Shob country Dubai time {start_at} e shuru hobe "
-                        f"(ekhon {clock['dubai']})."
+                        f"\u25B6\uFE0F Every country starts at {start_at} Dubai time "
+                        f"(now {clock['dubai']})."
                         if waits
-                        else "\u25B6\uFE0F Kono start time nai - shathe shathe shuru hobe."
+                        else "\u25B6\uFE0F No start time \u2014 countries start right away."
                     )
                     return
 
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                if index >= len(names):
+                country = await pick_country(index_raw)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                country = names[index]
                 await otp_schedule.set_country_settings(country, {"start_at": start_at})
-                await query.answer(f"{country}: {start_at if waits else 'ekhoni'}")
+                await query.answer(f"{country}: {start_at if waits else 'now'}")
                 await refresh_panel(
-                    f"\u25B6\uFE0F {country} Dubai time {start_at} e shuru hobe "
-                    f"(ekhon {clock['dubai']})."
+                    f"\u25B6\uFE0F {country} starts at {start_at} Dubai time "
+                    f"(now {clock['dubai']})."
                     if waits
-                    else f"\u25B6\uFE0F {country}: shathe shathe shuru hobe."
+                    else f"\u25B6\uFE0F {country} starts right away."
                 )
                 return
 
             if action == "cstartc":
-                index = int(rest)
                 clock = otp_schedule.clock_now()
-                if index < 0:
+                if otp_panel.is_all_countries(rest):
                     await otp_bot.set_pending_input("start_at", None)
                     await query.answer()
                     with contextlib.suppress(Exception):
                         await query.message.answer(
-                            "\u25B6\uFE0F Shob country kon time e shuru hobe? HH:MM likho "
-                            f"(Dubai).\nEkhon {clock['dubai']} Dubai\n\n(Bad dite 'bad' likho.)"
+                            "\u25B6\uFE0F When should every country start?\n"
+                            "\n"
+                            "\u2022 Type a time as HH:MM (Dubai time)\n"
+                            f"\u2022 Now: {clock['dubai']} Dubai / {clock['utc']} UTC\n"
+                            + _SKIP_HINT
                         )
                     return
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                if index >= len(names):
+                country = await pick_country(rest)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                country = names[index]
                 await otp_bot.set_pending_input("start_at", country)
                 await query.answer()
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        f"\u25B6\uFE0F {country}: kon time e shuru hobe? HH:MM likho "
-                        f"(Dubai time).\nEkhon {clock['dubai']} Dubai / "
-                        f"{clock['utc']} UTC\n\n(Bad dite 'bad' likho.)"
+                        f"\u25B6\uFE0F When should {country} start?\n"
+                        "\n"
+                        "\u2022 Type a time as HH:MM (Dubai time)\n"
+                        f"\u2022 Now: {clock['dubai']} Dubai / {clock['utc']} UTC\n"
+                        + _SKIP_HINT
                     )
                 return
 
             if action == "pickstart":
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                index = int(rest)
-                if index >= len(names):
+                country = await pick_country(rest)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                country = names[index]
                 cfg = await otp_bot.get_config()
                 current = await otp_schedule.effective_config(country, cfg)
                 clock = otp_schedule.clock_now()
                 await query.answer()
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        f"\u25B6\uFE0F {country}: kokhon shuru hobe?\n"
-                        f"Ekhon {clock['dubai']} Dubai ({clock['utc']} UTC)",
+                        f"\u25B6\uFE0F When should {country} start?\n"
+                        "\n"
+                        f"\u2022 Now: {clock['dubai']} Dubai ({clock['utc']} UTC)\n"
+                        "\n"
+                        "Pick a Dubai time below.",
                         reply_markup=otp_panel.start_time_keyboard(
-                            index, str(current.get("start_at") or "")
+                            otp_panel.country_key(country), str(current.get("start_at") or "")
                         ),
                     )
                 return
@@ -1003,83 +1113,82 @@ class AgentBot:
                 current = int(cfg.get("run_minutes") or 0)
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        "\u23F3 Shob country koto somoy cholbe?\n"
-                        f"Ekhon: {otp_bot.format_run_minutes(current)}\n"
-                        f"Notun upload-er default: "
-                        f"{otp_bot.format_run_minutes(int(cfg.get('default_run_minutes') or 0))}",
+                        "\u23F3 How long should every country run?\n"
+                        "\n"
+                        f"\u2022 Now: {otp_bot.format_run_minutes(current)}\n"
+                        "\u2022 Default for new uploads: "
+                        f"{otp_bot.format_run_minutes(int(cfg.get('default_run_minutes') or 0))}\n"
+                        "\n"
+                        "Pick a run time below.",
                         reply_markup=otp_panel.country_runtime_keyboard(-1, current),
                     )
                 return
 
             if action == "crt":
                 index_raw, minutes_raw = rest.split(":", 1)
-                index, minutes = int(index_raw), int(minutes_raw)
-                if index < 0:
+                minutes = int(minutes_raw)
+                if otp_panel.is_all_countries(index_raw):
                     await otp_bot.save_config({"run_minutes": minutes})
                     await query.answer(otp_bot.format_run_minutes(minutes))
                     await refresh_panel(
-                        f"\u23F3 Shob country {otp_bot.format_run_minutes(minutes)} cholbe."
+                        f"\u23F3 Every country runs for {otp_bot.format_run_minutes(minutes)}."
                         if minutes
-                        else "\u267E\uFE0F Kono somoy limit nai - 'stop' na bola porjonto cholbe."
+                        else "\u267E\uFE0F No time limit \u2014 runs until you say \"stop\"."
                     )
                     return
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                if index >= len(names):
+                country = await pick_country(index_raw)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                country = names[index]
                 await otp_schedule.set_country_settings(country, {"run_minutes": minutes})
                 await query.answer(f"{country}: {otp_bot.format_run_minutes(minutes)}")
                 await refresh_panel(
-                    f"\u23F3 {country}: {otp_bot.format_run_minutes(minutes)} cholbe."
+                    f"\u23F3 {country} runs for {otp_bot.format_run_minutes(minutes)}."
                     if minutes
-                    else f"\u267E\uFE0F {country}: kono somoy limit nai."
+                    else f"\u267E\uFE0F {country}: no time limit."
                 )
                 return
 
             if action == "crtc":
-                index = int(rest)
-                if index < 0:
+                if otp_panel.is_all_countries(rest):
                     await otp_bot.set_pending_input("run_minutes", None)
                     await query.answer()
                     with contextlib.suppress(Exception):
                         await query.message.answer(
-                            "\u23F3 Koto somoy cholbe? Minute-e number likho "
-                            "(0 = limit nai).\n\n(Bad dite 'bad' likho.)"
+                            "\u23F3 How long should every country run?\n"
+                            "\n"
+                            "\u2022 Type the minutes (0 = no limit)\n"
+                            + _SKIP_HINT
                         )
                     return
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                if index >= len(names):
+                country = await pick_country(rest)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                country = names[index]
                 await otp_bot.set_pending_input("run_minutes", country)
                 await query.answer()
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        f"\u23F3 {country}: koto somoy cholbe? Minute-e number likho "
-                        "(0 = limit nai).\n\n(Bad dite 'bad' likho.)"
+                        f"\u23F3 How long should {country} run?\n"
+                        "\n"
+                        "\u2022 Type the minutes (0 = no limit)\n"
+                        + _SKIP_HINT
                     )
                 return
 
             if action == "pickrt":
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                index = int(rest)
-                if index >= len(names):
+                country = await pick_country(rest)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                country = names[index]
                 cfg = await otp_bot.get_config()
                 current = await otp_schedule.effective_config(country, cfg)
                 await query.answer()
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        f"\u23F3 {country}: koto somoy cholbe?",
+                        f"\u23F3 How long should {country} run?",
                         reply_markup=otp_panel.country_runtime_keyboard(
-                            index, int(current.get("run_minutes") or 0)
+                            otp_panel.country_key(country), int(current.get("run_minutes") or 0)
                         ),
                     )
                 return
@@ -1089,7 +1198,7 @@ class AgentBot:
                 pending = await otp_bot.get_awaiting_runtime()
                 countries = list((pending or {}).get("countries") or [])
                 if not countries:
-                    await query.answer("Oi proshno ar khola nai.", show_alert=True)
+                    await query.answer("That question is already closed.", show_alert=True)
                     return
                 minutes = int(rest)
                 note = await otp_bot.apply_runtime_answer(countries, minutes)
@@ -1101,13 +1210,15 @@ class AgentBot:
             if action == "rtc":
                 pending = await otp_bot.get_awaiting_runtime()
                 if not (pending or {}).get("countries"):
-                    await query.answer("Oi proshno ar khola nai.", show_alert=True)
+                    await query.answer("That question is already closed.", show_alert=True)
                     return
                 await query.answer()
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        "\u23F3 Koto somoy cholbe? '20h', '90 min', '2 din', "
-                        "ba 'limit nai' likho."
+                        "\u23F3 How long should it run?\n"
+                        "\n"
+                        "\u2022 Type a length like 20h, 90 min or 2 days\n"
+                        "\u2022 Or type \"no limit\" to run until you say \"stop\""
                     )
                 return
 
@@ -1119,12 +1230,20 @@ class AgentBot:
                 await query.answer()
                 if markup is None:
                     with contextlib.suppress(Exception):
-                        await query.message.answer("Kono file nai.")
+                        await query.message.answer(
+                            "\U0001F5C2 No files yet\n"
+                            "\n"
+                            "\u2022 Nothing is queued or running\n"
+                            "\n"
+                            "Send a numbers file here to get started."
+                        )
                     return
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        "\U0001F5D1 Kon ta bad dibo? (shudhu oi ekta entry jabe)\n"
-                        "queue = ekhono shuru hoyni, running = cholche",
+                        "\U0001F5D1 Which file should I remove?\n"
+                        "\n"
+                        "\u2022 Only that one entry is removed\n"
+                        "\u2022 queue = not started yet, running = in progress",
                         reply_markup=markup,
                     )
                 return
@@ -1143,9 +1262,10 @@ class AgentBot:
                     await query.answer("Already gone.", show_alert=True)
                     return
                 label = (entry or {}).get("country") or (entry or {}).get("name") or "File"
+                count = int((entry or {}).get("count") or 0)
                 await query.answer(f"{label} removed")
                 await refresh_panel(
-                    f"\U0001F5D1 {label} ({(entry or {}).get('count') or 0} number) bad deoa holo."
+                    f"\U0001F5D1 {label} removed ({count:,} number{'' if count == 1 else 's'})."
                 )
                 return
 
@@ -1157,105 +1277,101 @@ class AgentBot:
                 await query.answer()
                 if markup is None:
                     with contextlib.suppress(Exception):
-                        await query.message.answer("Kono country nai - age file dao.")
+                        await query.message.answer(_no_countries_text())
                     return
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        "\u23FB Kon country on/off korbo?\n"
-                        "\u23F8 = ekhon cholche (chaple off hobe), "
-                        "\u25B6\uFE0F = ekhon off (chaple chalu hobe)",
+                        "\u23FB Which country should I turn on or off?\n"
+                        "\n"
+                        "\u2022 \u23F8 = running now (tap to pause)\n"
+                        "\u2022 \u25B6\uFE0F = paused (tap to resume)",
                         reply_markup=markup,
                     )
                 return
 
             if action == "fields":
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                index = int(rest)
-                if index >= len(names):
+                country = await pick_country(rest)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                country = names[index]
                 cfg = await otp_bot.get_config()
                 current = await otp_schedule.effective_config(country, cfg)
                 threshold = current.get("quota_threshold")
                 await query.answer()
-                summary = (
-                    f"\U0001F30D {country}\n"
-                    f"Ekhon: {current.get('interval_minutes')} min por por check, "
-                    + ("khali hole restock" if not threshold else f"{threshold} baki thakle restock")
-                )
+                lines = [
+                    f"\U0001F30D {country}",
+                    "",
+                    f"\u2022 Checks every {current.get('interval_minutes')} min",
+                    "\u2022 Restocks when empty"
+                    if not threshold
+                    else f"\u2022 Restocks when {int(threshold):,} are left",
+                ]
                 if current.get("stop_at"):
-                    summary += f", {current['stop_at']} (Dubai) e off"
+                    lines.append(f"\u2022 Stops at {current['stop_at']} (Dubai)")
                 if current.get("paused"):
-                    summary += "\n\u23F8 Ekhon OFF ache."
+                    lines.append("\u2022 \u23F8 Paused right now")
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        f"{summary}\n\nKi bodlate chao?",
+                        "\n".join(lines) + "\n\nWhat would you like to change?",
                         reply_markup=otp_panel.country_field_keyboard(
-                            index, country, bool(current.get("paused"))
+                            otp_panel.country_key(country), country, bool(current.get("paused"))
                         ),
                     )
                 return
 
             if action == "pickc":
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                index = int(rest)
-                if index >= len(names):
+                country = await pick_country(rest)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                country = names[index]
                 cfg = await otp_bot.get_config()
                 current = await otp_schedule.effective_config(country, cfg)
                 await query.answer()
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        f"\u23F1 {country}: koto min por por check korbo?",
+                        f"\u23F1 How often should I check {country}?",
                         reply_markup=otp_panel.country_interval_keyboard(
-                            index, current.get("interval_minutes")
+                            otp_panel.country_key(country), current.get("interval_minutes")
                         ),
                     )
                 return
 
             if action == "pickt":
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                index = int(rest)
-                if index >= len(names):
+                country = await pick_country(rest)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                country = names[index]
                 cfg = await otp_bot.get_config()
                 current = await otp_schedule.effective_config(country, cfg)
                 await query.answer()
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        f"\U0001F4E6 {country}: koto number baki thakle restock korbo?",
+                        f"\U0001F4E6 When should I restock {country}?\n"
+                        "\n"
+                        "• Refill once this many numbers are left\n"
+                        "\n"
+                        "Pick a level below.",
                         reply_markup=otp_panel.country_threshold_keyboard(
-                            index, current.get("quota_threshold")
+                            otp_panel.country_key(country), current.get("quota_threshold")
                         ),
                     )
                 return
 
             if action == "cthr":
                 index_raw, value_raw = rest.split(":", 1)
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                index = int(index_raw)
-                if index >= len(names):
+                country = await pick_country(index_raw)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                country = names[index]
                 threshold = int(value_raw)
                 await otp_schedule.set_country_settings(
                     country, {"quota_threshold": threshold}
                 )
-                await query.answer(f"{country}: restock at {threshold}")
+                await query.answer(f"{country}: restock at {threshold:,}")
                 note = (
-                    f"\U0001F4E6 {country}: khali hole restock hobe."
+                    f"\U0001F4E6 {country}: restock when empty."
                     if threshold == 0
-                    else f"\U0001F4E6 {country}: {threshold} baki thakle restock hobe."
+                    else f"\U0001F4E6 {country}: restock when {threshold:,} are left."
                 )
                 await refresh_panel(note)
                 return
@@ -1264,42 +1380,39 @@ class AgentBot:
                 # Custom value: ask for it and consume the owner's next
                 # message (handled in conversation.py, so it works from the
                 # web chat too).
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                index = int(rest)
-                if index >= len(names):
+                country = await pick_country(rest)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                country = names[index]
                 field = "interval_minutes" if action == "cintc" else "quota_threshold"
                 await otp_bot.set_pending_input(field, country)
                 await query.answer()
                 prompt = (
-                    f"\u23F1 {country}: koto min por por check korbo? Number likho (1-1440)."
+                    f"\u23F1 How often should I check {country}?\n"
+                    "\n"
+                    "\u2022 Type the minutes (1-1440)\n"
                     if field == "interval_minutes"
-                    else f"\U0001F4E6 {country}: koto number baki thakle restock korbo? "
-                    "Number likho (0 = khali hole)."
+                    else f"\U0001F4E6 Restock {country} when how many numbers are left?\n"
+                    "\n"
+                    "\u2022 Type a number (0 = when empty)\n"
                 )
                 with contextlib.suppress(Exception):
-                    await query.message.answer(f"{prompt}\n\n(Bad dite 'bad' likho.)")
+                    await query.message.answer(prompt + _SKIP_HINT)
                 return
 
             if action == "cint":
                 index_raw, minutes_raw = rest.split(":", 1)
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                index = int(index_raw)
-                if index >= len(names):
+                country = await pick_country(index_raw)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                country = names[index]
                 minutes = int(minutes_raw)
                 await otp_schedule.set_country_settings(
                     country, {"interval_minutes": minutes}
                 )
                 await otp_schedule.arm_country(country, minutes)
                 await query.answer(f"{country}: every {minutes} min")
-                await refresh_panel(f"\u23F1 {country} ekhon {minutes} min por por check hobe.")
+                await refresh_panel(f"\u23F1 {country} is now checked every {minutes} min.")
                 return
 
             if action == "ask_preset":
@@ -1308,25 +1421,23 @@ class AgentBot:
                 await query.answer()
                 if markup is None:
                     with contextlib.suppress(Exception):
-                        await query.message.answer("Kono country nai - age file dao.")
+                        await query.message.answer(_no_countries_text())
                     return
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        "\U0001F4D0 Kon country-te preset apply korbo?", reply_markup=markup
+                        "\U0001F4D0 Which country should get a preset?", reply_markup=markup
                     )
                 return
 
             if action == "prec":
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                index = int(rest)
-                if index >= len(names):
+                country = await pick_country(rest)
+                if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
                 presets = await otp_schedule.get_presets()
                 preset_names = sorted(presets)
                 await query.answer()
-                lines = [f"\U0001F4D0 {names[index]} - kon preset?", ""]
+                lines = [f"\U0001F4D0 Pick a preset for {country}", ""]
                 for name in preset_names:
                     note = presets[name].get("_note", "")
                     every = presets[name].get("interval_minutes")
@@ -1334,27 +1445,27 @@ class AgentBot:
                 with contextlib.suppress(Exception):
                     await query.message.answer(
                         "\n".join(lines),
-                        reply_markup=otp_panel.preset_keyboard(preset_names, index),
+                        reply_markup=otp_panel.preset_keyboard(
+                            preset_names, otp_panel.country_key(country)
+                        ),
                     )
                 return
 
             if action == "usepre":
                 index_raw, preset_raw = rest.split(":", 1)
-                entries = await otp_bot.get_active_files() + await otp_bot.get_queue()
-                names = otp_panel.country_names(entries)
-                index = int(index_raw)
+                country = await pick_country(index_raw)
                 preset_names = sorted(await otp_schedule.get_presets())
                 preset_index = int(preset_raw)
-                if index >= len(names) or preset_index >= len(preset_names):
+                if country is None or not 0 <= preset_index < len(preset_names):
                     await query.answer("Gone already.", show_alert=True)
                     return
-                country, preset = names[index], preset_names[preset_index]
+                preset = preset_names[preset_index]
                 applied = await otp_schedule.apply_preset(preset, country)
                 if applied is None:
                     await query.answer("Preset not found.", show_alert=True)
                     return
                 await query.answer(f"{preset} applied")
-                await refresh_panel(f"\U0001F4D0 {country} -> '{preset}' preset apply kora holo.")
+                await refresh_panel(f"\U0001F4D0 Preset '{preset}' applied to {country}.")
                 return
 
             if action == "start":
@@ -1377,7 +1488,7 @@ class AgentBot:
             if action == "stop":
                 await otp_bot.stop_automation()
                 await query.answer("Stopped")
-                await refresh_panel("\u23F8 Bondho kora holo.")
+                await refresh_panel("\u23F8 Automation stopped \u2014 tap \u25B6\uFE0F Start to run it again.")
                 return
 
             if action == "run":
@@ -1407,7 +1518,7 @@ class AgentBot:
                     return
                 removed = await otp_bot.remove_by_country(entry.get("country") or "")
                 await query.answer(f"{len(removed)} removed")
-                await refresh_panel(f"\U0001F5D1 {entry.get('country')} bad deoa holo.")
+                await refresh_panel(f"\U0001F5D1 {entry.get('country')} removed.")
                 return
 
             if action == "status":
@@ -1443,8 +1554,9 @@ class AgentBot:
                     if len(parts) < 2:
                         spec = otp_bot.SETTABLE_FIELDS[parts[0]]
                         await message.answer(
-                            f"{parts[0]}: {spec['label']}\n"
-                            f"Jemon: /otpset {parts[0]} {spec['example']}"
+                            f"⚙️ {parts[0]}: {spec['label']}\n"
+                            "\n"
+                            f"Example: /otpset {parts[0]} {spec['example']}"
                         )
                         return
                     reply = await otp_bot.set_setting_from_chat(parts[0], " ".join(parts[1:]))
@@ -1455,9 +1567,12 @@ class AgentBot:
                     )
                     if key_index is None or key_index == 0 or key_index == len(parts) - 1:
                         await message.answer(
-                            "Bujhte parlam na. Likho: /otpset <key> <value>\n"
-                            "othoba /otpset <country> <key> <value>\n\n"
-                            "Sob key dekhte: /otpset"
+                            "\U0001F914 I didn't catch that\n"
+                            "\n"
+                            "• Every country: /otpset <key> <value>\n"
+                            "• One country: /otpset <country> <key> <value>\n"
+                            "\n"
+                            "Send /otpset to see every key."
                         )
                         return
                     country = " ".join(parts[:key_index])
@@ -1506,9 +1621,9 @@ class AgentBot:
                         lines.append(f"    {preset['_note']}")
                 lines += [
                     "",
-                    "Notun banate: /otppreset save <name> quota_threshold=200 interval_minutes=10",
-                    "Apply korte:  /otppreset use <name> for <country>",
-                    "Muchte:       /otppreset delete <name>",
+                    "Create: /otppreset save <name> quota_threshold=200 interval_minutes=10",
+                    "Apply:  /otppreset use <name> for <country>",
+                    "Delete: /otppreset delete <name>",
                 ]
                 await message.answer("\n".join(lines))
                 return
@@ -1520,33 +1635,38 @@ class AgentBot:
                 # "use <name...> for <country...>" - both sides can be several
                 # words, so split on the "for" keyword rather than on spaces.
                 if "for" not in [p.lower() for p in parts]:
-                    await message.answer("Likho: /otppreset use <name> for <country>")
+                    await message.answer("Usage: /otppreset use <name> for <country>")
                     return
                 idx = [p.lower() for p in parts].index("for")
                 name = " ".join(parts[1:idx])
                 country = " ".join(parts[idx + 1:])
                 if not name or not country:
-                    await message.answer("Likho: /otppreset use <name> for <country>")
+                    await message.answer("Usage: /otppreset use <name> for <country>")
                     return
                 canonical = await otp_bot.canonical_country(country)
                 applied = await otp_schedule.apply_preset(name, canonical)
                 if applied is None:
-                    await message.answer(f"\u274C '{name}' preset nai. /otppreset e list ache.")
+                    await message.answer(
+                        f"\u274C There is no preset called '{name}'.\n\nSee the list with /otppreset"
+                    )
                     return
-                await message.answer(f"\u2705 {canonical} -> '{name}' preset apply kora holo.")
+                await message.answer(f"\u2705 Preset '{name}' applied to {canonical}.")
                 return
 
             if verb == "delete":
                 name = " ".join(parts[1:])
                 if not name:
-                    await message.answer("Kon preset muchbo? /otppreset delete <name>")
+                    await message.answer(
+                        "Which preset should I delete?\n\nUsage: /otppreset delete <name>"
+                    )
                     return
                 if await otp_schedule.delete_preset(name):
-                    await message.answer(f"\U0001F5D1 '{name}' mucha holo.")
+                    await message.answer(f"\U0001F5D1 Preset '{name}' deleted.")
                 else:
                     await message.answer(
-                        f"\u274C '{name}' tomar banano preset na. "
-                        "Built-in preset overwrite kora jay (save diye), mucha jay na."
+                        f"\u274C '{name}' is not one of your own presets.\n"
+                        "\n"
+                        "\u2022 Built-in presets can be overwritten (with save), not deleted"
                     )
                 return
 
@@ -1557,8 +1677,9 @@ class AgentBot:
                 first_pair = next((i for i, p in enumerate(rest) if "=" in p), None)
                 if first_pair is None or first_pair == 0:
                     await message.answer(
-                        "Likho: /otppreset save <name> quota_threshold=200 interval_minutes=10\n"
-                        f"Je field gula dewa jay: {', '.join(otp_schedule.OVERRIDABLE)}"
+                        "Usage: /otppreset save <name> quota_threshold=200 interval_minutes=10\n"
+                        "\n"
+                        f"Fields you can set: {', '.join(otp_schedule.OVERRIDABLE)}"
                     )
                     return
                 name = " ".join(rest[:first_pair])
@@ -1568,8 +1689,8 @@ class AgentBot:
                         key, _, raw = pair.partition("=")
                         if key not in otp_schedule.OVERRIDABLE:
                             raise ValueError(
-                                f"'{key}' preset e deya jay na. "
-                                f"Jegula jay: {', '.join(otp_schedule.OVERRIDABLE)}"
+                                f"'{key}' can't be part of a preset. "
+                                f"Fields you can set: {', '.join(otp_schedule.OVERRIDABLE)}"
                             )
                         values[key] = otp_bot.coerce_setting(key, raw)
                     saved = await otp_schedule.save_preset(name, values)
@@ -1577,11 +1698,11 @@ class AgentBot:
                     await message.answer(f"\u274C {exc}")
                     return
                 shown = ", ".join(f"{k}={v}" for k, v in saved.items() if k != "_note")
-                await message.answer(f"\u2705 Preset '{name}' save kora holo: {shown}")
+                await message.answer(f"\u2705 Preset '{name}' saved: {shown}")
                 return
 
             await message.answer(
-                "Bujhte parlam na. /otppreset likhe option gula dekho."
+                "\U0001F914 I didn't catch that. Send /otppreset to see the options."
             )
 
         @dp.message(Command("mode"))
@@ -1670,11 +1791,19 @@ class AgentBot:
             from app.security import rel_path
 
             rel = rel_path(target)
+            from app.automation import otp_bot
+
+            in_otp_thread = await otp_bot.is_otp_thread(message.chat.id)
             async with session_scope() as db_session:
                 row = await repo.ensure_session(db_session, message.chat.id)
-                ctx = dict(row.context or {})
-                ctx["pending_upload"] = {"path": rel, "name": safe_name}
-                await repo.update_session(db_session, message.chat.id, context=ctx)
+                if not in_otp_thread:
+                    # Only an ordinary upload waits to be attached to the
+                    # next instruction. One sent to the OTP thread is already
+                    # queued for the bot; left pending as well, it rode along
+                    # on the owner's next unrelated job, in any thread.
+                    ctx = dict(row.context or {})
+                    ctx["pending_upload"] = {"path": rel, "name": safe_name}
+                    await repo.update_session(db_session, message.chat.id, context=ctx)
                 # Record it as a visible chat turn too - otherwise it only
                 # lived in invisible session context and the web dashboard's
                 # Chat panel (same shared conversation) never showed it.
@@ -1684,70 +1813,21 @@ class AgentBot:
                     thread_id=row.current_thread_id,
                 )
 
-            from app.automation import otp_bot
-
-            if await otp_bot.is_otp_thread(message.chat.id):
-                # The caption is the owner already answering half the
-                # questions - country, service, when to start/stop. Read it
-                # and only ask for what is genuinely missing.
-                caption = (message.caption or "").strip()
-                analysis = await otp_bot.enqueue_file(rel, safe_name, caption)
-                countries = analysis["countries"]
-                lines = [f"\U0001F4C1 Saved: {safe_name}", ""]
-                if analysis.get("caption_note"):
-                    lines += [analysis["caption_note"], ""]
-                lines.append(f"Detected {len(countries)} country/countries:")
-                for country, count in countries.items():
-                    lines.append(f"  \u2022 {country}: {count} numbers")
-                queue = await otp_bot.get_queue()
-                lines += [
-                    "",
-                    f"Queued ({len(queue)} entr{'y' if len(queue) == 1 else 'ies'} total).",
-                ]
-                cfg = await otp_bot.get_config()
-
-                # A file dropped in this thread is a request to run it, so
-                # run it - but only once nothing is still waiting on a tag.
-                # Untagged entries ask their question first and auto-start
-                # from the tag answer instead.
-                started = await otp_bot.maybe_auto_start()
-                markup = None
-                if started is not None:
-                    if started["ok"]:
-                        lines += ["", otp_bot.format_start_result(started)]
-                    else:
-                        lines += ["", f"\u274C Auto-start failed: {started['error']}"]
-                    cfg = await otp_bot.get_config()
-                elif any(not e.get("tag") for e in queue):
-                    pending = await otp_bot.next_untagged_entry()
-                    if pending is not None:
-                        await otp_bot.set_awaiting_tag_entry(pending["id"])
-                        lines += ["", otp_bot.tag_question(pending)]
-                        markup = otp_panel.service_keyboard(pending["id"])
-                else:
-                    # Tags are all known; the one thing left to settle is how
-                    # long this should run. Asked with the default stated, so
-                    # a run can never become immortal just by not answering.
-                    needing = await otp_bot.countries_needing_runtime(queue)
-                    if needing:
-                        await otp_bot.set_awaiting_runtime(needing)
-                        lines += [
-                            "",
-                            otp_bot.runtime_question(
-                                needing, int(cfg.get("default_run_minutes") or 0)
-                            ),
-                        ]
-                        markup = otp_panel.runtime_keyboard()
-                    else:
-                        lines.append(
-                            "Send more files, then tap Start when you're finished."
-                        )
-
-                await message.answer(
-                    "\n".join(lines),
-                    reply_markup=markup
-                    or otp_panel.control_keyboard(bool(cfg["enabled"])),
-                )
+            if in_otp_thread:
+                try:
+                    await self._queue_otp_upload(message, target, rel, safe_name)
+                except Exception as exc:  # noqa: BLE001 - never leave an upload unanswered
+                    # Without this an error anywhere in queueing or the
+                    # auto-start went to aiogram's log and the owner got no
+                    # reply at all - not even "saved".
+                    log.exception("otp_upload_failed", extra={"file": safe_name})
+                    await message.answer(
+                        f"\u274C I could not queue {safe_name}\n"
+                        "\n"
+                        f"\u2022 Reason: {str(exc)[:300] or type(exc).__name__}\n"
+                        f"\u2022 The file is saved as {rel}\n"
+                        "\u2022 Send it again, or check /otpbot"
+                    )
             else:
                 await message.answer(
                     f"\U0001F4C1 Saved: {rel}\n\n"
@@ -1795,7 +1875,93 @@ class AgentBot:
                 with contextlib.suppress(asyncio.CancelledError):
                     await typing
 
+            if reply.html:
+                # The OTP status table - only readable as Telegram HTML.
+                await message.answer(reply.html, parse_mode="HTML")
+                return
             await message.answer(reply.text[:4000])
+
+    async def _queue_otp_upload(
+        self, message: Message, target: Any, rel: str, safe_name: str
+    ) -> None:
+        """Queue a file sent to the OTP thread, run it if it is ready, reply.
+
+        Lives outside the document handler so the handler can wrap all of it
+        - queueing, auto-start, the reply - in one error reply.
+        """
+        from app.automation import otp_bot
+
+        problem = otp_panel.upload_problem(target.read_bytes())
+        if problem:
+            # Refused BEFORE enqueue_file: a spreadsheet read as text is noise
+            # the splitter files under "Unknown", and an empty file answered
+            # "Detected 0 countries" and then auto-started whatever older
+            # entries were still sitting in the queue.
+            await message.answer(f"{problem}\n\n(saved as {rel})")
+            return
+
+        # The caption is the owner already answering half the questions -
+        # country, service, when to start/stop. Read it and only ask for what
+        # is genuinely missing.
+        caption = (message.caption or "").strip()
+        analysis = await otp_bot.enqueue_file(rel, safe_name, caption)
+        countries = analysis["countries"]
+        lines = [f"\U0001F4C1 Saved: {safe_name}", ""]
+        if analysis.get("caption_note"):
+            lines += [analysis["caption_note"], ""]
+        lines.append(
+            f"Found {len(countries)} countr{'y' if len(countries) == 1 else 'ies'}:"
+        )
+        for country, count in countries.items():
+            lines.append(f"\u2022 {country}: {_thousands(count)} numbers")
+        queue = await otp_bot.get_queue()
+        lines += [
+            "",
+            f"Queued \u2014 {len(queue):,} entr{'y' if len(queue) == 1 else 'ies'} waiting in total.",
+        ]
+        cfg = await otp_bot.get_config()
+
+        # A file dropped in this thread is a request to run it, so run it -
+        # but only once nothing is still waiting on a tag. Untagged entries
+        # ask their question first and auto-start from the tag answer instead.
+        started = await otp_bot.maybe_auto_start()
+        markup = None
+        if started is not None:
+            if started["ok"]:
+                lines += ["", otp_bot.format_start_result(started)]
+            else:
+                lines += ["", f"\u274C Auto-start failed: {started['error']}"]
+            cfg = await otp_bot.get_config()
+        elif any(not e.get("tag") for e in queue):
+            pending = await otp_bot.next_untagged_entry()
+            if pending is not None:
+                await otp_bot.set_awaiting_tag_entry(pending["id"])
+                lines += ["", otp_bot.tag_question(pending)]
+                markup = otp_panel.service_keyboard(pending["id"])
+        else:
+            # Tags are all known; the one thing left to settle is how long
+            # this should run. Asked with the default stated, so a run can
+            # never become immortal just by not answering.
+            needing = await otp_bot.countries_needing_runtime(queue)
+            if needing:
+                await otp_bot.set_awaiting_runtime(needing)
+                lines += [
+                    "",
+                    otp_bot.runtime_question(
+                        needing, int(cfg.get("default_run_minutes") or 0)
+                    ),
+                ]
+                markup = otp_panel.runtime_keyboard()
+            else:
+                lines += ["", "Send more files, or tap ▶️ Start when you're ready."]
+
+        # A multi-country file plus its start report (one line and one bot
+        # reply per country) easily outgrows a single Telegram message.
+        await self._answer_long(
+            message,
+            "\n".join(lines),
+            reply_markup=markup or otp_panel.control_keyboard(bool(cfg["enabled"])),
+        )
 
     async def _decide(self, message: Message, command: CommandObject, *, approved: bool) -> None:
         if not await self._guard(message):

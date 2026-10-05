@@ -214,9 +214,11 @@ class _FakeUserbot:
 
     def __init__(self) -> None:
         self._reply_id = 0
+        self._last_sent = ""
 
     async def send_message(self, target, text, reply_to=None):
         self._reply_id += 1
+        self._last_sent = text
         return {"sent": True, "message_id": self._reply_id}
 
     async def send_file(self, target, path, caption="", reply_to=None):
@@ -225,7 +227,12 @@ class _FakeUserbot:
 
     async def read_messages(self, target, limit=20):
         self._reply_id += 1
-        return [{"text": "Added.", "id": self._reply_id, "out": False}]
+        if self._last_sent == "/st":
+            # A scheduled start is only decided from a real stock reading.
+            text = "\U0001F30D Country Stock (yours):\n  Bangladesh: 0"
+        else:
+            text = "Added."
+        return [{"text": text, "id": self._reply_id, "out": False}]
 
     async def delete_messages(self, target, message_ids):
         return {"deleted": len(message_ids)}
@@ -382,7 +389,8 @@ def test_an_unreadable_run_length_says_so_rather_than_guessing():
 
 @pytest.mark.parametrize(
     "minutes,expected",
-    [(1200, "20h"), (480, "8h"), (2880, "2 din"), (90, "1h 30m"), (0, "kono limit nai")],
+    [(1200, "20h"), (480, "8h"), (2880, "2 days"), (1440, "1 day"), (90, "1h 30m"),
+     (0, "no limit")],
 )
 def test_run_length_is_displayed_readably(minutes, expected):
     assert otp_bot.format_run_minutes(minutes) == expected

@@ -378,7 +378,8 @@ def register_capability_commands(dp: Dispatcher, guard) -> None:
         if args in {"on", "enable"}:
             settings = get_settings()
             async with session_scope() as session:
-                await repo.set_setting(session, "briefing_enabled", "true")
+                # A bare string: read back at boot by get_setting_value.
+                await repo.set_setting_value(session, "briefing_enabled", "true")
             settings.briefing_enabled = True
             await message.answer(
                 f"\u2705 Daily briefing on.\n\n"
@@ -390,7 +391,7 @@ def register_capability_commands(dp: Dispatcher, guard) -> None:
         if args in {"off", "disable"}:
             settings = get_settings()
             async with session_scope() as session:
-                await repo.set_setting(session, "briefing_enabled", "false")
+                await repo.set_setting_value(session, "briefing_enabled", "false")
             settings.briefing_enabled = False
             await message.answer("\U0001F515 Daily briefing off.")
             return
@@ -406,7 +407,7 @@ def register_capability_commands(dp: Dispatcher, guard) -> None:
                 return
             settings = get_settings()
             async with session_scope() as session:
-                await repo.set_setting(session, "briefing_cron", expression)
+                await repo.set_setting_value(session, "briefing_cron", expression)
             settings.briefing_cron = expression
             await message.answer(f"\u2705 Briefing schedule: {expression}")
             return

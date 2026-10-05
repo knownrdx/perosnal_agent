@@ -63,7 +63,7 @@ def test_service_keyboard_offers_every_choice_plus_a_way_out():
     for service in otp_bot.SERVICE_CHOICES:
         assert service in labels
     # Without this the owner has to type to get rid of a wrong country.
-    assert any("Bad dao" in label for label in labels)
+    assert any("Remove" in label for label in labels)
 
 
 def test_interval_keyboard_ticks_the_current_value():
@@ -114,7 +114,9 @@ async def test_status_text_reports_the_settings_the_buttons_change(environment):
     # the global header carries what is still global.
     assert "/st" in text
     assert "Bangladesh" in text
-    assert "used/expired only" in text
+    # No cleanup command by default since config version 2 (the owner
+    # asked for /useddelete to stop), and the panel says so plainly.
+    assert "nothing deleted before adding" in text
 
     await otp_bot.set_cleanup_mode("force")
     assert "/frcd" in await otp_panel.status_text()
@@ -151,7 +153,9 @@ async def test_status_text_shows_each_running_country_on_its_own_schedule(enviro
 
     text = await otp_panel.status_text()
     assert "Bangladesh" in text
-    assert "every 5m" in text
+    # The status is a table now: the "Every" column carries 5m, starred as
+    # a per-country setting.
+    assert "5m*" in text
     assert "*" in text  # marked as customised
 
 

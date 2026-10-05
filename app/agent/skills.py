@@ -10,10 +10,15 @@ agent keeps refining rather than a scattered pile of one-liners.
 Never allowed to break anything else: if the LLM synthesis fails for any
 reason, this degrades to a deterministic bullet-list join of the source
 entries instead of raising.
+
+Runs after every task, so it must be cheap when nothing changed: each skill
+row carries a fingerprint of the lessons it was made from, and a topic is
+only sent to the model again when that fingerprint no longer matches.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import defaultdict
 from typing import Any
@@ -31,6 +36,9 @@ SOURCE_KINDS = ("workflow", "gotcha", "preference")
 MIN_CLUSTER_SIZE = 3
 SCAN_LIMIT = 200
 MAX_CLUSTERS_PER_RUN = 10
+SYNTHESIS_INPUTS = 12          # lessons per topic actually shown to the model
+SKILL_SCAN_LIMIT = 500         # existing skill rows read to compare fingerprints
+_FINGERPRINT_TAG = "fp:"
 
 SYNTHESIS_PROMPT = """You maintain a personal AI agent's durable 'skills' memory.
 
@@ -81,8 +89,13 @@ def _fallback_summary(topic: str, entries: list[MemoryEntry]) -> str:
     return f"[{topic}] {bullets}"[:2000]
 
 
-async def _synthesise_cluster(topic: str, entries: list[MemoryEntry], llm: Any) -> str:
-    source_lines = "\n".join(f"- ({e.kind}) {e.key}: {e.value}" for e in entries[:12])
+async def _synthesise_cluster(
+    topic: str, entries: list[MemoryEntry], llm: Any
+) -> tuple[str, bool]:
+    """Return (summary, came_from_model). False means the fallback was used."""
+    source_lines = "\n".join(
+        f"- ({e.kind}) {e.key}: {e.value}" for e in entries[:SYNTHESIS_INPUTS]
+    )
     try:
         data = await llm.chat_json(
             [Message("system", SYNTHESIS_PROMPT), Message("user", source_lines)]
@@ -90,12 +103,37 @@ async def _synthesise_cluster(topic: str, entries: list[MemoryEntry], llm: Any) 
         summary = str(data.get("summary", "")).strip()
         if not summary or len(summary) > 2000 or looks_like_secret(summary):
             raise ValueError("unusable synthesis output")
-        return summary
+        return summary, True
     except LLMError as exc:
         log.warning("skill_synthesis_llm_failed", extra={"topic": topic, "error": str(exc)[:200]})
     except Exception as exc:  # noqa: BLE001 - learning must never break other things
         log.warning("skill_synthesis_error", extra={"topic": topic, "error": str(exc)[:200]})
-    return _fallback_summary(topic, entries)
+    return _fallback_summary(topic, entries), False
+
+
+def _fingerprint(entries: list[MemoryEntry]) -> str:
+    """Stable hash of the lessons a skill is built from.
+
+    Keys, kinds and values only - not timestamps - so re-learning a lesson
+    word for word (which bumps updated_at) does not count as a change.
+    Sorted by key so the newest-first scan order does not matter either.
+    """
+    digest = hashlib.sha256()
+    for entry in sorted(entries, key=lambda e: e.key):
+        digest.update(f"{entry.key}\x1f{entry.kind}\x1f{entry.value}\x1e".encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
+def _stored_fingerprint(entry: MemoryEntry) -> str:
+    """The fingerprint a skill row was last synthesised from ('' if none).
+
+    Kept in ``tags`` because the memory table has no metadata column and the
+    existing upsert already replaces tags on every write.
+    """
+    for tag in entry.tags or []:
+        if isinstance(tag, str) and tag.startswith(_FINGERPRINT_TAG):
+            return tag[len(_FINGERPRINT_TAG):]
+    return ""
 
 
 def _clean_topic_key(topic: str) -> str:
@@ -110,38 +148,64 @@ async def synthesize_skills(llm: Any | None = None) -> list[dict]:
     and for every cluster with >= MIN_CLUSTER_SIZE entries upserts ONE 'skill'
     memory entry keyed by the topic (so re-running updates rather than
     duplicates). Returns what was written/updated, for logging/inspection.
+
+    Only topics whose lessons changed since their last synthesis are sent to
+    the model. This runs after EVERY task, and without that check it spent
+    up to MAX_CLUSTERS_PER_RUN model calls each time re-deriving summaries of
+    lessons that had not moved - and, because the same first topics always
+    filled the cap, topics past it were never synthesised at all. Skipping
+    unchanged topics first means the cap now rotates through the backlog.
+
+    A fallback (model unavailable) summary is stored WITHOUT a fingerprint,
+    so the next run retries it with the model; it costs one call per such
+    topic and stops as soon as the model answers once.
     """
     async with session_scope() as session:
         entries = await repo.memory_recent(session, limit=SCAN_LIMIT, kinds=SOURCE_KINDS)
+        # Auto-written failure rules expire when the failure stops recurring
+        # (see learning.FAILURE_RULE_TTL_DAYS). Folding them into a skill -
+        # they all share the 'avoid' prefix - would make them permanent.
+        entries = [e for e in entries if "failure" not in (e.tags or [])]
+        if not entries:
+            return []
+        skills = await repo.memory_recent(session, limit=SKILL_SCAN_LIMIT, kinds=("skill",))
 
-    if not entries:
-        return []
-
-    clusters = cluster_entries(entries)
-    eligible = [
-        (topic, items) for topic, items in clusters.items() if len(items) >= MIN_CLUSTER_SIZE
-    ]
-    if not eligible:
+    synthesised_from = {skill.key: _stored_fingerprint(skill) for skill in skills}
+    pending: list[tuple[str, str, list[MemoryEntry], str, int]] = []
+    for topic, items in cluster_entries(entries).items():
+        if len(items) < MIN_CLUSTER_SIZE:
+            continue
+        key = f"skill_{_clean_topic_key(topic)}"
+        members = items[:SYNTHESIS_INPUTS]
+        fingerprint = _fingerprint(members)
+        if synthesised_from.get(key) == fingerprint:
+            continue
+        pending.append((topic, key, members, fingerprint, len(items)))
+    if not pending:
         return []
 
     client = llm or get_llm()
     written: list[dict] = []
     async with session_scope() as session:
-        for topic, items in eligible[:MAX_CLUSTERS_PER_RUN]:
-            summary = await _synthesise_cluster(topic, items, client)
+        for topic, key, members, fingerprint, size in pending[:MAX_CLUSTERS_PER_RUN]:
+            summary, from_model = await _synthesise_cluster(topic, members, client)
             if looks_like_secret(summary):
                 continue
-            key = f"skill_{_clean_topic_key(topic)}"
+            tags = (
+                ["skill", "synthesized", f"{_FINGERPRINT_TAG}{fingerprint}"]
+                if from_model
+                else ["skill", "fallback"]
+            )
             entry = await repo.memory_store(
                 session,
                 key=key,
                 value=summary,
                 kind="skill",
-                tags=["skill", "synthesized"],
+                tags=tags,
                 source_task_id=None,
             )
             written.append({"key": entry.key, "value": entry.value, "topic": topic,
-                             "source_count": len(items)})
+                             "source_count": size})
 
     if written:
         log.info("skills_synthesized", extra={"count": len(written)})

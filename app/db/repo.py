@@ -623,6 +623,26 @@ async def get_setting(session: AsyncSession, key: str) -> dict[str, Any] | None:
     return dict(row.value) if row and isinstance(row.value, dict) else None
 
 
+async def get_setting_value(session: AsyncSession, key: str) -> Any:
+    """Return a setting's stored JSON value whatever its type, or None.
+
+    ``get_setting`` deliberately answers only dicts: the automation modules
+    treat its result as dict-or-None and call ``.get`` on it. Scalar settings
+    (autonomy level, briefing on/off and cron) are stored as bare strings, so
+    reading them back needs this instead - through ``get_setting`` they look
+    absent and silently revert to the .env defaults on every restart.
+    """
+    row = await session.get(AppSetting, key)
+    return row.value if row is not None else None
+
+
+async def set_setting_value(
+    session: AsyncSession, key: str, value: str | int | float | bool | list[Any] | dict[str, Any]
+) -> None:
+    """Store any JSON value; the counterpart of :func:`get_setting_value`."""
+    await set_setting(session, key, value)  # type: ignore[arg-type]
+
+
 async def set_setting(session: AsyncSession, key: str, value: dict[str, Any]) -> None:
     row = await session.get(AppSetting, key)
     if row is None:

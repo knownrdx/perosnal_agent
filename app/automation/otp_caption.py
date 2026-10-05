@@ -359,11 +359,11 @@ def describe(parsed: dict[str, Any]) -> str:
     if parsed.get("run_minutes"):
         minutes = int(parsed["run_minutes"])
         if minutes % 60 == 0:
-            parts.append(f"{minutes // 60}h cholbe")
+            parts.append(f"runs {minutes // 60}h")
         else:
-            parts.append(f"{minutes} min cholbe")
+            parts.append(f"runs {minutes} min")
     if parsed.get("no_stop"):
-        parts.append("kono stop time nai")
+        parts.append("no stop time")
     if not parts:
         return ""
-    return "Caption theke: " + ", ".join(parts)
+    return "\U0001F4DD From your caption: " + ", ".join(parts)

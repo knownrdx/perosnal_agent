@@ -111,9 +111,9 @@ def parse_stop_time(text: str) -> str:
         hour_s, minute_s = raw.split(":", 1)
         hour, minute = int(hour_s), int(minute_s)
     except ValueError:
-        raise ValueError("Time ta HH:MM format e dao (jemon 23:30).") from None
+        raise ValueError("Please give the time as HH:MM (e.g. 23:30).") from None
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        raise ValueError("Time ta 00:00 theke 23:59 er moddhe hote hobe.")
+        raise ValueError("The time must be between 00:00 and 23:59.")
     return f"{hour:02d}:{minute:02d}"
 
 
@@ -318,7 +318,71 @@ async def set_country_settings(country: str, values: dict[str, Any]) -> dict[str
     all_settings[key] = current
     async with session_scope() as session:
         await repo.set_setting(session, COUNTRY_KEY, all_settings)
+
+    if "start_at" in values:
+        await _regate_if_waiting(country, values["start_at"])
     return current
+
+
+async def _regate_if_waiting(country: str, start_at: str | None) -> bool:
+    """Point a run that is still WAITING at its new start time.
+
+    The gate a run waits on is recorded when it is armed (see begin_run), so
+    that changing a default later cannot pause work already going. The flip
+    side was that pressing "On at -> Ekhoni" on a country auto-armed for
+    04:00 changed only the setting: the run kept waiting on its recorded
+    04:00 and was neither checked nor refilled until the next morning - the
+    owner saw "it added once at the timer and then never again".
+
+    A run that has already started is left alone: a new start time is about
+    the next run, never a reason to pause the current one. ``None`` means
+    the country's own value was cleared, so it now follows the global
+    default.
+    """
+    state = await _get_run_state()
+    key = _key(country)
+    entry = state.get(key)
+    if not entry:
+        return False
+    gate = str(entry.get("gate") or "").strip()
+    if _is_now(gate) or _start_time_reached(gate, entry.get("armed_at") or entry.get("started_at")):
+        return False
+
+    if start_at is None:
+        from app.automation import otp_bot
+
+        start_at = str((await otp_bot.get_config()).get("start_at") or "")
+    new_gate = str(start_at or "").strip()
+    now_iso = _now().isoformat()
+    entry["gate"] = "" if _is_now(new_gate) else new_gate
+    # Measured from now: "21:00" chosen at 22:00 means tomorrow's 21:00.
+    entry["armed_at"] = now_iso
+    state[key] = entry
+    await _save_run_state(state)
+
+    if _is_now(new_gate):
+        # Due on the very next pass, not one interval from whenever it was
+        # first armed.
+        due = await _get_due_map()
+        due[key] = now_iso
+        await _save_due_map(due)
+    return True
+
+
+async def regate_waiting_runs(start_at: str) -> list[str]:
+    """The global default start time changed: every run still waiting on the
+    default follows it. A country with its own start time keeps it.
+    """
+    overrides = await get_all_country_settings()
+    moved: list[str] = []
+    for key, entry in (await _get_run_state()).items():
+        own = overrides.get(key, {})
+        if own.get("start_at") is not None:
+            continue
+        name = entry.get("display_name") or key
+        if await _regate_if_waiting(name, start_at):
+            moved.append(name)
+    return moved
 
 
 async def clear_country_settings(country: str) -> bool:
@@ -492,7 +556,16 @@ async def has_started(country: str, base: dict[str, Any]) -> bool:
             # An existing run with no recorded gate has already started by
             # definition - it would not have a run state otherwise.
             return True
-        return _start_time_reached(gate, state.get("armed_at") or state.get("started_at"))
+        if _start_time_reached(gate, state.get("armed_at") or state.get("started_at")):
+            return True
+        # Still gated - unless the owner has since told this country to
+        # start right away. That instruction can only have come AFTER the
+        # run was armed: an immediate start_at present at arm time would
+        # have produced no gate at all. Runs armed before the setting change
+        # re-gated itself (see _regate_if_waiting) were left waiting on a
+        # morning start they had already been told to skip.
+        own = await get_country_settings(country)
+        return "start_at" in own and _is_now(own["start_at"])
 
     cfg = await effective_config(country, base)
     start_at = str(cfg.get("start_at") or "").strip()
@@ -502,16 +575,25 @@ async def has_started(country: str, base: dict[str, Any]) -> bool:
 
 
 async def pending_start_at(country: str, base: dict[str, Any]) -> datetime | None:
-    """When a not-yet-started country will begin, or None if it already has."""
-    cfg = await effective_config(country, base)
-    start_at = str(cfg.get("start_at") or "").strip()
-    if not start_at:
+    """When a not-yet-started country will begin, or None if it already has.
+
+    Decided exactly as has_started() decides it - from the gate the run was
+    armed with. Reading the live start time instead showed "WAIT 04:00" for
+    countries that had started hours earlier, simply because the default
+    start time is 04:00.
+    """
+    if await has_started(country, base):
         return None
     state = await get_run_state(country)
-    anchor = state.get("armed_at") or state.get("started_at")
-    if _start_time_reached(start_at, anchor):
+    if state:
+        gate = str(state.get("gate") or "").strip()
+        anchor = state.get("armed_at") or state.get("started_at")
+    else:
+        gate = str((await effective_config(country, base)).get("start_at") or "").strip()
+        anchor = None
+    if _is_now(gate):
         return None
-    return starts_at(start_at, anchor)
+    return starts_at(gate, anchor)
 
 
 async def record_refill(country: str) -> int:
@@ -559,11 +641,11 @@ async def finished_reason(country: str, base: dict[str, Any]) -> str | None:
 
     max_refills = int(cfg.get("max_refills") or 0)
     if max_refills and int(state.get("refills", 0)) >= max_refills:
-        return f"{max_refills} bar re-add shesh"
+        return f"{max_refills:,} re-add{'' if max_refills == 1 else 's'} done"
 
     stop_at = str(cfg.get("stop_at") or "").strip()
     if stop_at and _stop_time_passed(stop_at, _effective_start(cfg, state)):
-        return f"{stop_at} (Dubai) time hoye geche"
+        return f"{stop_at} (Dubai) stop time reached"
 
     run_minutes = int(cfg.get("run_minutes") or 0)
     if run_minutes:
@@ -575,8 +657,18 @@ async def finished_reason(country: str, base: dict[str, Any]) -> str | None:
         if started is None:
             return None
         if _now() >= started + timedelta(minutes=run_minutes):
-            return f"{run_minutes} min shomoy shesh"
+            return f"{_human_minutes(run_minutes)} run time reached"
     return None
+
+
+def _human_minutes(minutes: int) -> str:
+    """'30 min', '12h', '1h 30m' - the same shape the scheduler's owner
+    notifications use, so a finish reason reads identically everywhere."""
+    minutes = max(0, int(minutes))
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, rest = divmod(minutes, 60)
+    return f"{hours}h {rest}m" if rest else f"{hours}h"
 
 
 def _effective_start(cfg: dict[str, Any], state: dict[str, Any]) -> str | None:
@@ -616,7 +708,35 @@ async def set_paused(country: str, paused: bool) -> dict[str, Any]:
         # instant it comes back just because its old due time went by.
         cfg = await get_country_settings(country)
         await arm_country(country, int(cfg.get("interval_minutes") or 10))
+        from app.automation import otp_bot
+
+        state = await get_run_state(country)
+        base = await otp_bot.get_config()
+        # A run that went past its limit while paused was never marked
+        # finished (the due pass skips paused countries), yet resuming it
+        # as-is would have the next pass finish and re-pause it at once.
+        if state.get("finished_at") or await finished_reason(country, base) is not None:
+            # Resuming a run that ended on its own is a fresh run: a new
+            # clock and refill count, or it would finish again instantly on
+            # the limit it already reached.
+            await begin_run(country)
+            await otp_bot.clear_finished(country)
     return applied
+
+
+async def mark_finished(country: str, reason: str) -> None:
+    """A country's run reached its limit: pause it and remember why.
+
+    Paused rather than forgotten, so its file and settings are held and
+    set_paused(country, False) picks it up again as a fresh run.
+    """
+    await set_country_settings(country, {"paused": True})
+    state = await _get_run_state()
+    entry = state.get(_key(country)) or {"display_name": country.strip()}
+    entry["finished_at"] = _now().isoformat()
+    entry["finished_reason"] = reason
+    state[_key(country)] = entry
+    await _save_run_state(state)
 
 
 async def is_paused(country: str) -> bool:

@@ -440,7 +440,8 @@ def register_setup_handlers(bot: Any) -> None:
             return
 
         async with session_scope() as session:
-            await repo.set_setting(session, "autonomy_level", level)
+            # A bare string: read back at boot by get_setting_value.
+            await repo.set_setting_value(session, "autonomy_level", level)
         get_settings().autonomy_level = level
         explain = {
             "balanced": "I will ask only before irreversible actions you did not request.",

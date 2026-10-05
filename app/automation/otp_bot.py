@@ -73,7 +73,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # interval this traffic otherwise buries the chat the owner reads.
     "tidy_stock_messages": True,
     "quota_threshold": 0,        # refill when active quota <= this
-    "cleanup_command": "/useddelete",
+    # Sent once before adding. Blank = send nothing, which is the default:
+    # the owner does not want /useddelete recycling used numbers back into
+    # stock, so nothing is sent unless a command is configured explicitly.
+    "cleanup_command": "",
     # Force-delete (Owner-level "/frcd <country> <uid>"). /useddelete only
     # clears used/expired numbers; when a country's stock must be wiped
     # outright before re-adding, this is the command that does it.
@@ -117,7 +120,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # moment it actually runs out.
     "skip_add_if_stocked": True,
     "awaiting_tag_entry_id": None,  # set while a "what tag for X" prompt is pending
+    # Bumped when a stored config needs a one-off correction on load; see
+    # get_config(). A fresh install starts at the current version.
+    "config_version": 2,
 }
+
+CONFIG_VERSION = 2
 
 # Seeded as the dedicated thread's first message so it gets a recognisable
 # title in the thread list (list_threads titles a thread from its first user
@@ -148,12 +156,18 @@ _QUOTA_RE = re.compile(r"active\s*[:\-]?\s*([\d,]+)", re.IGNORECASE)
 # Only lines below that header count. The section above it has a global
 # "\u2022 Available: 416036" line that would otherwise be read as a country.
 _STOCK_HEADER_RE = re.compile(r"country\s+stock", re.IGNORECASE)
+#
+# The name is anything from the first letter up to the separator before the
+# count. It used to be ASCII letters, spaces and .'- only, which silently
+# dropped "Congo (DRC)", "Myanmar (Burma)", "C\u00f4te d'Ivoire", "Bosnia &
+# Herzegovina", "T\u00fcrkiye" - and a dropped line reads as ZERO stock, so that
+# country was cleaned up and re-added on every single cycle.
 _STOCK_LINE_RE = re.compile(
     r"^[\s\u2022\-]*"            # bullet / indent
     r"[^\w(]*"                    # flag emoji and other leading symbols
-    r"(?P<country>[A-Za-z][A-Za-z .'\-]*[A-Za-z])"
+    r"(?P<country>[^\W\d_][^:\n]*?)"
     r"\s*[:\-]\s*"
-    r"(?P<count>[\d,]+)"
+    r"(?P<count>\d[\d,]*)"
 )
 
 
@@ -234,6 +248,59 @@ def _parse_added_count(text: str) -> int | None:
         return None
 
 
+# One country's line in an add result:
+#     "Bangladesh: 0 added (5 dup)"
+#     "🇨🇫 Central African Republic: 100000 added"
+# Same name shape as a /st stock line (flag, then anything up to the colon).
+_ADDED_LINE_RE = re.compile(
+    r"^[\s•\-]*"
+    r"[^\w(]*"
+    r"(?P<country>[^\W\d_][^:\n]*?)"
+    r"\s*:\s*"
+    r"(?P<count>\d[\d,]*)\s+added",
+    re.IGNORECASE | re.MULTILINE,
+)
+# "Total: 5 added" and the like are a summary, not a country.
+_ADDED_LINE_LABELS = frozenset({
+    "total", "totals", "done", "result", "results", "summary", "status",
+    "added", "new", "numbers",
+})
+
+
+def _added_by_country(text: str) -> dict[str, int]:
+    """Per-country counts from an add result, {} when it has none.
+
+    "✅ 53412 added, 46588 duplicates skipped" has no country on it, so it
+    yields {} - the caller then reads it the old, country-blind way.
+    """
+    found: dict[str, int] = {}
+    for match in _ADDED_LINE_RE.finditer(text or ""):
+        name = match.group("country").strip()
+        if not name or name.casefold() in _ADDED_LINE_LABELS:
+            continue
+        try:
+            found.setdefault(name, int(match.group("count").replace(",", "")))
+        except ValueError:
+            continue
+    return found
+
+
+def _added_for(text: str, country: str | None) -> int | None:
+    """How many numbers an add contributed for ONE country.
+
+    The chat is shared by every country's add, so a slow bot's "Bangladesh:
+    0 added" can be the text another country's wait ends up holding. Reading
+    that as the other country's count wrote off a good file (never refilled
+    again) while the spent one kept being re-sent. So: this country's own
+    line when the reply has per-country lines, None when it has lines but
+    none of them is this country, and the plain count otherwise.
+    """
+    lines = _added_by_country(text)
+    if lines and country:
+        return country_names.find(lines, country)
+    return _parse_added_count(text)
+
+
 KNOWN_COUNTRIES_KEY = "otp_bot_known_countries"
 
 
@@ -253,8 +320,8 @@ SETTABLE_FIELDS: dict[str, dict[str, Any]] = {
     },
     "cleanup_command": {
         "type": "str",
-        "label": "Cleanup command",
-        "example": "/useddelete",
+        "label": "Cleanup command sent before adding (none = send nothing)",
+        "example": "none",
     },
     "add_command_template": {
         "type": "str",
@@ -392,7 +459,7 @@ def coerce_setting(key: str, raw: str) -> Any:
     """
     spec = SETTABLE_FIELDS.get(key)
     if spec is None:
-        raise ValueError(f"'{key}' ta kono setting na. /otpset likhe list dekho.")
+        raise ValueError(f"'{key}' isn't a setting. Send /otpset to see the full list.")
 
     value = raw.strip()
     if spec["type"] == "time":
@@ -409,29 +476,50 @@ def coerce_setting(key: str, raw: str) -> Any:
             return True
         if lowered in _FALSE_WORDS:
             return False
-        raise ValueError(f"{key}: 'on' othoba 'off' likho.")
+        raise ValueError(f"{key}: please use 'on' or 'off'.")
 
     if spec["type"] == "int":
         try:
             number = int(value.replace(",", ""))
         except ValueError:
-            raise ValueError(f"{key}: ekta number lagbe (jemon {spec['example']}).") from None
+            raise ValueError(f"{key}: needs a number (e.g. {spec['example']}).") from None
         low, high = spec.get("min", 0), spec.get("max", 10**9)
         if not low <= number <= high:
-            raise ValueError(f"{key}: {low} theke {high} er moddhe hote hobe.")
+            raise ValueError(f"{key}: must be between {low:,} and {high:,}.")
         return number
+
+    # "none" is how a blank is typed in a chat: no cleanup command at all.
+    if key == "cleanup_command" and value.casefold() in {"", "none", "off", "no", "-", "na"}:
+        return ""
 
     # Strings: a template that loses its placeholders silently stops working,
     # so check the ones the sender actually substitutes.
     if key == "add_command_template" and "{tag}" not in value:
-        raise ValueError("add_command_template e {tag} thakte hobe.")
+        raise ValueError("add_command_template must contain {tag}.")
     if key == "force_delete_command" and "{country}" not in value:
-        raise ValueError("force_delete_command e {country} thakte hobe.")
+        raise ValueError("force_delete_command must contain {country}.")
     if key == "delete_done_command" and "{country}" not in value:
-        raise ValueError("delete_done_command e {country} thakte hobe.")
+        raise ValueError("delete_done_command must contain {country}.")
     if key == "target_bot" and not value.startswith("@"):
-        raise ValueError("target_bot '@' diye shuru hobe (jemon @PBDxbot).")
+        raise ValueError("target_bot must start with '@' (e.g. @PBDxbot).")
     return value[:200]
+
+
+def _num(value: Any) -> str:
+    """A count with thousands separators; '?' when there is none."""
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _numbers(value: Any) -> str:
+    """'1 number' / '7,625 numbers' - how counts read in owner messages."""
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return "numbers"
+    return f"{count:,} number{'' if count == 1 else 's'}"
 
 
 async def set_setting_from_chat(key: str, raw: str) -> str:
@@ -439,37 +527,43 @@ async def set_setting_from_chat(key: str, raw: str) -> str:
     value = coerce_setting(key, raw)
     await save_config({key: value})
     shown = "on" if value is True else "off" if value is False else (value or "(blank)")
-    line = f"\u2705 {key} = {shown}"
+    line = f"\u2705 Saved: {key} = {shown}"
+    notes: list[str] = []
 
     # These two silently END a run, and a small number is very easy to read
     # as "every N" rather than "stop after N". Saying so at the moment it is
     # set is the difference between a deliberate short run and waking up to
     # a task that stopped minutes after you went to bed.
     if key == "run_minutes" and value:
-        line += (
-            f"\n\u26A0\uFE0F Mane: shuru hoar {value} min por task NIJEI BONDHO hobe."
-            "\n   Sara raat chalate chaile: /otpset run_minutes 0"
-        )
+        notes += [
+            f"\u26A0\uFE0F Heads-up: the run will STOP by itself "
+            f"{format_run_minutes(int(value))} after it starts.",
+            "To keep it running all night: /otpset run_minutes 0",
+        ]
     if key == "max_refills" and value:
-        line += (
-            f"\n\u26A0\uFE0F Mane: {value} bar re-add er por task NIJEI BONDHO hobe."
-            "\n   Limit chara chalate chaile: /otpset max_refills 0"
-        )
+        notes += [
+            f"\u26A0\uFE0F Heads-up: the run will STOP by itself after "
+            f"{int(value):,} re-add{'' if int(value) == 1 else 's'}.",
+            "To run with no limit: /otpset max_refills 0",
+        ]
     if key == "delete_when_done" and value is True:
-        line += (
-            "\n\u26A0\uFE0F Task shesh hole oi country-r number bot theke MUCHE jabe."
+        notes.append(
+            "\u26A0\uFE0F Heads-up: when a run finishes, that country's numbers "
+            "will be DELETED from the bot."
         )
     if key == "stop_at":
         from app.automation import otp_schedule
 
         clock = otp_schedule.clock_now()
         if value:
-            line += (
-                f"\n\u23F0 Dubai time {value} hole task bondho hobe."
-                f"\n   Ekhon: {clock['dubai']} Dubai / {clock['utc']} UTC"
-            )
+            notes += [
+                f"\u23F0 The run will stop at {value} Dubai time.",
+                f"It's now {clock['dubai']} Dubai / {clock['utc']} UTC.",
+            ]
         else:
-            line += "\n\u267E\uFE0F Kono stop time nai."
+            notes.append("\u267E\uFE0F No stop time set.")
+    if notes:
+        line += "\n\n" + "\n".join(notes)
     return line
 
 
@@ -496,13 +590,13 @@ async def describe_settings() -> str:
         lines.append(f"    {spec['label']}")
     lines += [
         "",
-        "Bodlate: /otpset <key> <value>",
-        "Jemon: /otpset interval_minutes 15",
-        "       /otpset target_bot @PBDxbot",
-        "       /otpset force_delete_before_add on",
+        "To change one: /otpset <key> <value>",
+        "e.g. /otpset interval_minutes 15",
+        "     /otpset target_bot @PBDxbot",
+        "     /otpset force_delete_before_add on",
         "",
-        "Ek country-r jonno alada: /otpset <country> <key> <value>",
-        "Jemon: /otpset Bangladesh interval_minutes 5",
+        "Just for one country: /otpset <country> <key> <value>",
+        "e.g. /otpset Bangladesh interval_minutes 5",
     ]
     return "\n".join(lines)
 
@@ -513,15 +607,21 @@ async def set_country_setting_from_chat(country: str, key: str, raw: str) -> str
 
     if key not in otp_schedule.OVERRIDABLE:
         allowed = ", ".join(otp_schedule.OVERRIDABLE)
-        raise ValueError(f"'{key}' country-r jonno set kora jay na. Jegula jay: {allowed}")
+        raise ValueError(f"'{key}' can't be set per country. These can: {allowed}")
 
     value = coerce_setting(key, raw)
     canonical = await canonical_country(country)
-    await otp_schedule.set_country_settings(canonical, {key: value})
+    if key == "paused":
+        # Through set_paused, so resuming re-arms the timer and starts a
+        # fresh run for one that already ran out - written directly, a
+        # finished country came back only to be finished again next pass.
+        await otp_schedule.set_paused(canonical, bool(value))
+    else:
+        await otp_schedule.set_country_settings(canonical, {key: value})
     if key == "interval_minutes":
         await otp_schedule.arm_country(canonical, int(value))
     shown = "on" if value is True else "off" if value is False else value
-    return f"\u2705 {canonical}: {key} = {shown}"
+    return f"\u2705 Saved for {canonical}: {key} = {shown}"
 
 
 PENDING_INPUT_KEY = f"{SETTING_KEY}_pending_input"
@@ -561,7 +661,7 @@ async def handle_pending_input(text: str) -> str | None:
     field, country = pending["field"], pending.get("country")
     if is_skip_trigger(text):
         await set_pending_input(None)
-        return "Thik ache, bad dilam."
+        return "\U0001F44D Okay, skipped \u2014 nothing was changed."
 
     try:
         if country:
@@ -571,7 +671,7 @@ async def handle_pending_input(text: str) -> str | None:
     except ValueError as exc:
         # Keep the question open: the owner meant to answer it, they just
         # typed something unusable, and dropping it would lose the context.
-        return f"\u274C {exc}\n\nAbar likho, othoba 'bad' bolo."
+        return f"\u274C {exc}\n\nPlease try again, or say \"skip\" to cancel."
 
     await set_pending_input(None)
     return reply
@@ -658,6 +758,47 @@ async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
+# Deadlines for one Telegram call. A call that never returns used to hold the
+# conversation lock forever, and from then on every scheduler cycle queued up
+# behind it. Uploading a large file legitimately takes longer than a message.
+_BOT_CALL_TIMEOUT_S = 120.0
+_SEND_FILE_TIMEOUT_S = 300.0
+# How long a scheduled cycle waits for the conversation before giving up for
+# this round. Owner-initiated start/refresh still wait their turn.
+_CYCLE_LOCK_WAIT_S = 600.0
+
+
+async def _bot_call(awaitable: Any, timeout_s: float) -> Any:
+    """Await one userbot call, but never for longer than ``timeout_s``.
+
+    A timeout is reported as a UserbotError, which every caller already
+    handles as "Telegram failed" - so a hung call ends the operation cleanly
+    and releases the lock instead of stalling everything behind it.
+    """
+    try:
+        return await asyncio.wait_for(awaitable, timeout_s)
+    except asyncio.TimeoutError as exc:
+        raise UserbotError(f"Telegram did not answer within {timeout_s:g} s") from exc
+
+
+# One conversation with the target bot at a time. Every step here reads
+# "the bot's newest message after X" as the answer to what it just sent, so
+# two flows interleaving in that chat - the scheduler's refill and a Start
+# pressed in Telegram - read each other's replies: an add reported with the
+# stock table as its result, a stock check misread as zero. Keyed per event
+# loop because an asyncio.Lock is bound to the loop it is first used on.
+_conversation_locks: dict[int, asyncio.Lock] = {}
+
+
+def _conversation_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _conversation_locks.get(id(loop))
+    if lock is None:
+        _conversation_locks.clear()  # a previous loop's lock is dead weight
+        lock = _conversation_locks[id(loop)] = asyncio.Lock()
+    return lock
+
+
 @dataclass(slots=True)
 class CycleResult:
     ok: bool
@@ -678,6 +819,13 @@ class CycleResult:
     # Countries whose wall-clock start time arrived during this cycle, so
     # this pass is where their numbers were actually sent for the first time.
     started_now: list[dict[str, Any]] = field(default_factory=list)
+    # Countries whose start time arrived while the bot still had stock for
+    # them: started (monitored from now on) but the file is HELD until the
+    # stock runs low, instead of wiping live numbers to add it.
+    held_at_start: list[dict[str, Any]] = field(default_factory=list)
+    # Per-country add failures. The cycle carries on with the other
+    # countries instead of abandoning them all over one slow reply.
+    add_errors: list[str] = field(default_factory=list)
     files_processed: list[str] = field(default_factory=list)
     error: str = ""
     ran_at: str = field(default_factory=_now_iso)
@@ -700,6 +848,30 @@ async def get_config() -> dict[str, Any]:
         # the panel, which writes START_NOW rather than "".
         if stored.get("start_at", START_NOW) == "":
             merged["start_at"] = DEFAULT_CONFIG["start_at"]
+
+        if int(stored.get("config_version") or 1) < 2:
+            # Version 2: the owner asked for two things to stop for good.
+            #   - /useddelete before every add. It put used numbers back
+            #     into stock; blank now means "send no cleanup command".
+            #   - Wiping a country off the bot when its run ends. A finished
+            #     run is now HELD (file kept, country paused) instead.
+            # Applied once and persisted, so either can still be turned
+            # back on deliberately afterwards.
+            if merged.get("cleanup_command") == "/useddelete":
+                merged["cleanup_command"] = ""
+            merged["delete_when_done"] = False
+            merged["config_version"] = CONFIG_VERSION
+            async with session_scope() as session:
+                await repo.set_setting(session, SETTING_KEY, merged)
+            # The same goes for a country's own override (e.g. left by the
+            # "One-shot burst" preset): turning only the global flag off
+            # still had that country /frcd'd at the end of its run.
+            for key, overrides in (await otp_schedule.get_all_country_settings()).items():
+                if overrides.get("delete_when_done") is True:
+                    await otp_schedule.set_country_settings(
+                        str(overrides.get("display_name") or key), {"delete_when_done": False}
+                    )
+            log.info("otp_bot_config_migrated", extra={"version": CONFIG_VERSION})
     return merged
 
 
@@ -708,6 +880,13 @@ async def save_config(patch: dict[str, Any]) -> dict[str, Any]:
     current.update({k: v for k, v in patch.items() if k in DEFAULT_CONFIG})
     async with session_scope() as session:
         await repo.set_setting(session, SETTING_KEY, current)
+    if "start_at" in patch:
+        # Runs still waiting on the old default follow the new one; runs
+        # already going are never paused by it.
+        # Read back rather than taken from the patch: a stored "" is read
+        # as the default start time, and the gate must match what runs see.
+        effective = (await get_config()).get("start_at") or ""
+        await otp_schedule.regate_waiting_runs(str(effective))
     return current
 
 
@@ -1133,9 +1312,10 @@ def format_run_minutes(minutes: int) -> str:
     """Human-readable run length, e.g. 1200 -> '20h'."""
     minutes = int(minutes or 0)
     if minutes <= 0:
-        return "kono limit nai"
+        return "no limit"
     if minutes % 1440 == 0:
-        return f"{minutes // 1440} din"
+        days = minutes // 1440
+        return f"{days} day{'' if days == 1 else 's'}"
     if minutes % 60 == 0:
         return f"{minutes // 60}h"
     if minutes > 60:
@@ -1154,7 +1334,7 @@ def parse_run_minutes(text: str) -> int:
 
     raw = text.strip()
     if not raw:
-        raise ValueError("Koto somoy cholbe likho (jemon 20h), othoba 'limit nai'.")
+        raise ValueError("How long should it run? e.g. 20h — or say 'no limit'.")
 
     lowered = " ".join(raw.casefold().split())
     if any(phrase in lowered for phrase in otp_caption._NEVER_PHRASES):
@@ -1174,11 +1354,11 @@ def parse_run_minutes(text: str) -> int:
         # else, and the buttons cover the common hour values anyway.
         value = int(digits)
         if value > 100_000:
-            raise ValueError("Eto boro somoy dite parbo na (max 100000 min).")
+            raise ValueError("That's too long — the maximum is 100,000 min.")
         return value
 
     raise ValueError(
-        "Bujhlam na. '20h', '90 min', '2 din', ba 'limit nai' emn kore likho."
+        "Sorry, I didn't catch that. Try '20h', '90 min', '2 days' or 'no limit'."
     )
 
 
@@ -1231,12 +1411,13 @@ def runtime_question(countries: list[str], default_minutes: int) -> str:
     who = ", ".join(countries[:4]) + (" ..." if len(countries) > 4 else "")
     clock = otp_schedule.clock_now()
     return (
-        f"\u23F3 {who} - koto somoy cholbe?\n"
-        f"Ekhon {clock['dubai']} Dubai.\n\n"
-        f"Default: {format_run_minutes(default_minutes)} "
-        f"(kichu na bolle eitai boshbe).\n"
-        "Niche button, ba nijer moto likho: '20h', '90 min', '2 din', "
-        "'limit nai'."
+        f"\u23F3 How long should {who} run?\n"
+        "\n"
+        f"\u2022 Default: {format_run_minutes(default_minutes)} "
+        "(used if you skip this)\n"
+        f"\u2022 Time now: {clock['dubai']} Dubai\n"
+        "\n"
+        "Tap a button below, or type e.g. '20h', '90 min', '2 days' or 'no limit'."
     )
 
 
@@ -1249,8 +1430,8 @@ async def apply_runtime_answer(countries: list[str], minutes: int) -> str:
     await set_awaiting_runtime(None)
     who = ", ".join(countries[:4]) + (" ..." if len(countries) > 4 else "")
     if minutes <= 0:
-        return f"\u267E\uFE0F {who}: kono somoy limit nai - 'stop' na bola porjonto cholbe."
-    return f"\u23F3 {who}: {format_run_minutes(minutes)} cholbe, tarpor nijei bondho hobe."
+        return f"\u267E\uFE0F {who}: no time limit \u2014 runs until you say \"stop\"."
+    return f"\u23F3 {who}: runs for {format_run_minutes(minutes)}, then stops by itself."
 
 
 class AddRejected(Exception):
@@ -1285,7 +1466,7 @@ async def _last_bot_message(target: str, *, limit: int = 5) -> dict[str, Any] | 
     OLDEST message in the window instead, which is why a quota check could
     sit at "no reply" while the answer was already sitting in the chat.
     """
-    messages = await get_userbot().read_messages(target, limit)
+    messages = await _bot_call(get_userbot().read_messages(target, limit), _BOT_CALL_TIMEOUT_S)
     for message in messages:
         if not message.get("out"):
             return message
@@ -1299,39 +1480,89 @@ async def _wait_for_new_bot_reply(
     timeout_s: float = 90.0,
     poll_s: float = 3.0,
     matches: Any | None = None,
+    settle_s: float | None = None,
+    keep_unmatched: bool = False,
 ) -> dict[str, Any] | None:
     """Wait for a bot message NEWER than ``after_id`` (optionally one whose
     text satisfies ``matches``).
 
-    A fixed sleep-then-read is not enough: a large file can take the target
-    bot well over a minute to ingest, and reading too early returns its
-    PREVIOUS message - which is how an add once got reported with the
-    /useddelete reply ("Deleted 4,796 used numbers") as its result.
+    Every message newer than the anchor is examined, oldest first - not
+    just the newest one. The bot can answer and then post something else
+    within one poll (a notice, the next progress line), and looking only at
+    the newest message skipped the actual answer forever.
 
-    Recency alone is not enough either: the bot emits progress/completion
-    messages of its own, so a quota check can land on the tail end of an
-    earlier add ("Fast Add Complete!") and fail to parse. ``matches`` lets
-    the caller say what the answer should look like, and unmatched messages
-    are skipped rather than mistaken for the reply.
+    ``settle_s`` is for replies whose final form we can recognise but
+    whose wording may vary: a new message that does not match is accepted
+    anyway once nothing newer has appeared, and its text has not changed,
+    for that long. It handles a bot that edits "Processing..." into the
+    result (same id, new text) without ever hanging on a wording we did
+    not anticipate. Without it, a non-matching message is skipped.
+
+    ``keep_unmatched`` keeps the newest non-matching message WITHOUT ever
+    accepting it early: the whole window is waited for a match, and only
+    when it runs out is that message returned instead of None. That is what
+    an add needs - a progress line that sits unchanged for a while is still
+    a progress line, and settling on it let the real result land during the
+    next country's wait and be credited to that country.
     """
     waited = 0.0
-    newest_seen = after_id
+    pending: dict[str, Any] | None = None
+    pending_key: tuple[int, str] | None = None
+    pending_since = 0.0
     while waited < timeout_s:
         await _sleep(poll_s)
         waited += poll_s
-        message = await _last_bot_message(target)
-        if message is None:
-            continue
-        message_id = int(message.get("id", 0))
-        if newest_seen is not None and message_id <= newest_seen:
-            continue
-        if matches is not None and not matches(message.get("text") or ""):
-            # Something new, but not the answer we asked for - remember it so
-            # we keep moving forward instead of re-examining it every poll.
-            newest_seen = message_id
-            continue
-        return message
-    return None
+        messages = await _bot_call(get_userbot().read_messages(target, 10), _BOT_CALL_TIMEOUT_S)
+        fresh = sorted(
+            (
+                m for m in messages
+                if not m.get("out")
+                and (after_id is None or int(m.get("id", 0)) > after_id)
+            ),
+            key=lambda m: int(m.get("id", 0)),
+        )
+        for message in fresh:
+            if matches is None or matches(message.get("text") or ""):
+                return message
+        if fresh and (settle_s is not None or keep_unmatched):
+            newest = fresh[-1]
+            key = (int(newest.get("id", 0)), newest.get("text") or "")
+            if key != pending_key:
+                pending, pending_key, pending_since = newest, key, waited
+            elif settle_s is not None and waited - pending_since >= settle_s:
+                return pending
+    # Out of time: a reply we could not classify still beats "no reply".
+    return pending
+
+
+def _is_add_result(text: str) -> bool:
+    """Does this look like the bot's FINAL answer to an add, rather than a
+    progress line? Used to wait past "Processing..." to the real result."""
+    if _parse_added_count(text) is not None or _looks_like_failure(text):
+        return True
+    return bool(re.search(r"complete|success|duplicate|\bdup\b", text, re.IGNORECASE))
+
+
+def _is_add_result_for(text: str, country: str | None) -> bool:
+    """_is_add_result, but only for THIS country's add.
+
+    A result that names countries ("Bangladesh: 0 added (5 dup)") answers
+    for those countries only: if none of them is ours it is some earlier,
+    slower add finishing, and must not end our wait. A result that names no
+    country ("✅ 53412 added, ...") cannot be told apart and counts as before.
+    """
+    lines = _added_by_country(text)
+    if lines and country:
+        return country_names.find(lines, country) is not None
+    return _is_add_result(text)
+
+
+def _add_wait_seconds(entry: dict[str, Any]) -> float:
+    """How long to wait for an add's answer. A 60,000-number file takes the
+    bot far longer than a 300-number one; a fixed 90 s timed out on big
+    files and reported a perfectly good add as "no reply"."""
+    count = int(entry.get("count") or 0)
+    return 90.0 + min(count / 500.0, 210.0)
 
 
 async def _force_delete_country(target: str, country: str, cfg: dict[str, Any]) -> str:
@@ -1349,7 +1580,7 @@ async def _force_delete_country(target: str, country: str, cfg: dict[str, Any]) 
 
     previous = await _last_bot_message(target)
     previous_id = int(previous.get("id", 0)) if previous else None
-    await get_userbot().send_message(target, command)
+    await _bot_call(get_userbot().send_message(target, command), _BOT_CALL_TIMEOUT_S)
     reply = await _wait_for_new_bot_reply(target, after_id=previous_id, timeout_s=45.0)
     return (reply.get("text") or "") if reply else ""
 
@@ -1369,7 +1600,7 @@ async def _tidy_messages(target: str, message_ids: list[int | None]) -> None:
         deleter = getattr(userbot, "delete_messages", None)
         if deleter is None:
             return
-        await deleter(target, ids)
+        await _bot_call(deleter(target, ids), _BOT_CALL_TIMEOUT_S)
     except Exception:  # noqa: BLE001 - tidying is cosmetic
         log.warning("otp_bot_tidy_failed", extra={"ids": ids})
 
@@ -1377,12 +1608,17 @@ async def _tidy_messages(target: str, message_ids: list[int | None]) -> None:
 async def _finish_country(
     target: str, entry: dict[str, Any], cfg: dict[str, Any], reason: str
 ) -> dict[str, Any]:
-    """Retire one country: stop monitoring it and optionally clear its
-    numbers off the target bot.
+    """End one country's run: stop adding to it, but HOLD its file.
 
-    Deleting is opt-in (delete_when_done). It is irreversible on the bot's
-    side, so it must never be what happens by default just because a run
-    ended.
+    The file stays in the active set and the country is paused, so the run
+    can be picked up again with one tap (resume) and nothing about it is
+    lost. Removing the entry outright - what this used to do - threw the
+    file away the moment a time limit passed, and the owner's complaint was
+    exactly that: "it deletes the file instead of holding it".
+
+    Clearing the country's numbers off the target bot is a separate, opt-in
+    decision (delete_when_done). It is irreversible on the bot's side, so it
+    must never be what happens by default just because a run ended.
     """
     country = entry.get("country") or entry["name"]
     outcome: dict[str, Any] = {
@@ -1407,8 +1643,11 @@ async def _finish_country(
             try:
                 previous = await _last_bot_message(target)
                 previous_id = int(previous.get("id", 0)) if previous else None
-                await get_userbot().send_message(
-                    target, command.format(country=country, uid=uid)
+                await _bot_call(
+                    get_userbot().send_message(
+                        target, command.format(country=country, uid=uid)
+                    ),
+                    _BOT_CALL_TIMEOUT_S,
                 )
                 reply = await _wait_for_new_bot_reply(
                     target, after_id=previous_id, timeout_s=60.0
@@ -1421,41 +1660,91 @@ async def _finish_country(
                 log.exception("otp_bot_finish_delete_error")
                 outcome["error"] = f"delete failed ({type(exc).__name__}): {exc}"
 
-    # Stop monitoring it either way - the run is over even if the delete
-    # could not be done.
-    await remove_active_file(entry["id"])
-    await otp_schedule.clear_run_state(country)
+    # Hold it either way - the run is over even if the delete could not be
+    # done. Paused, not removed: the file and the country's settings stay.
+    await _update_active_entry(
+        entry["id"], finished_at=_now_iso(), finished_reason=reason,
+    )
+    await otp_schedule.mark_finished(country, reason)
+    outcome["held"] = True
     return outcome
 
 
-async def _add_after_wait(
-    target: str, entries: list[dict[str, Any]], cfg: dict[str, Any]
-) -> list[dict[str, Any]]:
-    """Do the first add for countries whose start time has just arrived.
-
-    Kept apart from the refill path because it is genuinely a start, not a
-    top-up: the cleanup command runs once, the run clock begins now, and the
-    waiting_start marker comes off so the next cycle treats the country as
-    ordinary. Never raises - a failure here is reported and the country is
-    retried next cycle rather than being silently dropped.
-    """
-    outcomes: list[dict[str, Any]] = []
-    if not entries:
-        return outcomes
-
-    try:
-        await get_userbot().send_message(target, cfg["cleanup_command"])
-        await _sleep(2)
-    except Exception as exc:  # noqa: BLE001 - cleanup is best-effort
-        log.warning("otp_bot_wait_cleanup_failed", extra={"error": str(exc)[:200]})
-
+async def _update_active_entry(entry_id: str, **changes: Any) -> dict[str, Any] | None:
+    """Set (or, with None, remove) fields on one stored active entry."""
     active = await get_active_files()
-    by_id = {e["id"]: e for e in active}
-    changed = False
+    for stored in active:
+        if stored["id"] == entry_id:
+            for key, value in changes.items():
+                if value is None:
+                    stored.pop(key, None)
+                else:
+                    stored[key] = value
+            await _save_files(ACTIVE_KEY, active)
+            return stored
+    return None
 
+
+async def clear_finished(country: str) -> None:
+    """Called when a held country is resumed: it is an ordinary running
+    country again, so the "finished" and "file used up" marks come off."""
+    wanted = " ".join(country.strip().casefold().split())
+    active = await get_active_files()
+    changed = False
+    for stored in active:
+        name = " ".join((stored.get("country") or stored["name"]).casefold().split())
+        if name == wanted:
+            for key in ("finished_at", "finished_reason", "exhausted_at"):
+                if stored.pop(key, None) is not None:
+                    changed = True
+    if changed:
+        await _save_files(ACTIVE_KEY, active)
+
+
+async def _start_scheduled(
+    target: str,
+    entries: list[dict[str, Any]],
+    cfg: dict[str, Any],
+    stock: dict[str, int] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Begin the countries whose wall-clock start time has just arrived.
+
+    Same rule as a manual start: a country the bot still holds stock for is
+    NOT added to. The file is held and the country starts being monitored,
+    so it is added the moment stock runs low. Adding regardless - what this
+    used to do - meant that with "wipe before add" on, a scheduled start
+    /frcd-ed a country's live numbers just to put the new file in.
+
+    ``stock`` is the /st reading of this same cycle; None means unknown
+    (old /myquota-style reply), in which case the file is added as before.
+
+    Returns (started_with_add, held). Never raises - a failed add is
+    reported and the country is retried next cycle rather than dropped.
+    """
+    started: list[dict[str, Any]] = []
+    held: list[dict[str, Any]] = []
+    if not entries:
+        return started, held
+
+    cleaned_up = False
     for entry in entries:
         country = entry.get("country") or entry["name"]
         entry_cfg = await otp_schedule.effective_config(country, cfg)
+        have = _stock_for(stock, country) if stock else None
+        threshold = int(entry_cfg.get("quota_threshold") or 0)
+
+        if have is not None and have > threshold and cfg.get("skip_add_if_stocked", True):
+            # The run clock starts now even though nothing was sent: the
+            # start time has arrived, and from here on it is monitored and
+            # refilled like any running country.
+            await otp_schedule.begin_run(country)
+            await _update_active_entry(
+                entry["id"], waiting_start=None, held=True, stock_at_start=have,
+            )
+            entry.pop("waiting_start", None)
+            held.append({"country": country, "stock": have, "count": entry.get("count")})
+            continue
+
         outcome: dict[str, Any] = {
             "country": country,
             "count": entry.get("count"),
@@ -1464,6 +1753,9 @@ async def _add_after_wait(
             "error": "",
         }
         try:
+            if not cleaned_up:
+                await _send_cleanup(target, cfg)
+                cleaned_up = True
             outcome["reply"] = (await _add_one_file(target, entry, entry_cfg))[:300]
             outcome["added"] = True
         except (UserbotError, AddRejected, FileNotFoundError) as exc:
@@ -1471,8 +1763,7 @@ async def _add_after_wait(
         except Exception as exc:  # noqa: BLE001 - one bad country must not
             log.exception("otp_bot_wait_add_error")   # kill the whole cycle
             outcome["error"] = f"{type(exc).__name__}: {exc}"[:300]
-
-        outcomes.append(outcome)
+        started.append(outcome)
 
         if outcome["added"]:
             # The run clock starts NOW, not when the file was uploaded: a
@@ -1481,15 +1772,29 @@ async def _add_after_wait(
             # start time again here would make the country wait a second
             # time, tomorrow, having just begun.
             await otp_schedule.begin_run(country)
-            stored = by_id.get(entry["id"])
-            if stored is not None:
-                stored.pop("waiting_start", None)
-                changed = True
+            await _update_active_entry(entry["id"], waiting_start=None, held=None)
             entry.pop("waiting_start", None)
 
-    if changed:
-        await _save_files(ACTIVE_KEY, active)
-    return outcomes
+    return started, held
+
+
+async def _send_cleanup(target: str, cfg: dict[str, Any]) -> None:
+    """Send the configured cleanup command, if there is one.
+
+    Blank (the default) sends nothing: the owner does not want /useddelete
+    putting used numbers back into stock. Best-effort - a failed cleanup
+    must not stop the add that follows it.
+    """
+    command = str(cfg.get("cleanup_command") or "").strip()
+    if not command:
+        return
+    try:
+        await _bot_call(get_userbot().send_message(target, command), _BOT_CALL_TIMEOUT_S)
+        await _sleep(2)
+    except UserbotError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - cleanup is best-effort
+        log.warning("otp_bot_cleanup_failed", extra={"error": str(exc)[:200]})
 
 
 async def _add_one_file(target: str, entry: dict[str, Any], cfg: dict[str, Any]) -> str:
@@ -1510,7 +1815,9 @@ async def _add_one_file(target: str, entry: dict[str, Any], cfg: dict[str, Any])
     previous = await _last_bot_message(target)
     previous_id = int(previous.get("id", 0)) if previous else None
 
-    sent_file = await get_userbot().send_file(target, str(target_path))
+    sent_file = await _bot_call(
+        get_userbot().send_file(target, str(target_path)), _SEND_FILE_TIMEOUT_S
+    )
     await _sleep(2)
 
     command_text = cfg["add_command_template"].format(
@@ -1519,9 +1826,29 @@ async def _add_one_file(target: str, entry: dict[str, Any], cfg: dict[str, Any])
         count=cfg["count"],
         country=entry.get("country") or "",
     )
-    await get_userbot().send_message(target, command_text, reply_to=sent_file.get("message_id"))
+    await _bot_call(
+        get_userbot().send_message(target, command_text, reply_to=sent_file.get("message_id")),
+        _BOT_CALL_TIMEOUT_S,
+    )
 
-    reply = await _wait_for_new_bot_reply(target, after_id=previous_id)
+    # Wait for the RESULT ("... added", "Fast Add Complete!", a rejection),
+    # not the first thing the bot says: a progress line taken as the answer
+    # hid how many numbers were really added, so a spent file was never
+    # noticed. No settling on an unrecognised message: a "Processing..."
+    # that sat unchanged for 20 s was once taken as the answer, and the real
+    # "Bangladesh: 0 added" then landed in the NEXT country's wait and was
+    # credited to it. Only a result for THIS country (or one naming no
+    # country) ends the wait; when the window runs out, the newest thing the
+    # bot said is still returned rather than nothing.
+    country = entry.get("country")
+    reply = await _wait_for_new_bot_reply(
+        target,
+        after_id=previous_id,
+        timeout_s=_add_wait_seconds(entry),
+        matches=lambda text: _is_add_result_for(text, country),
+        settle_s=None,
+        keep_unmatched=True,
+    )
     if reply is None:
         raise AddRejected(
             f"{entry['name']}: no reply from {target} within the wait window - "
@@ -1542,12 +1869,19 @@ async def refresh_countries_from_bot() -> dict[str, Any]:
     Lets the owner populate the country list without waiting for a refill
     cycle - and confirms the bot is reachable at the same time.
     """
+    async with _conversation_lock():
+        return await _refresh_countries_locked()
+
+
+async def _refresh_countries_locked() -> dict[str, Any]:
     cfg = await get_config()
     target = cfg["target_bot"]
     try:
         before = await _last_bot_message(target)
         before_id = int(before.get("id", 0)) if before else None
-        sent = await get_userbot().send_message(target, cfg["quota_command"])
+        sent = await _bot_call(
+            get_userbot().send_message(target, cfg["quota_command"]), _BOT_CALL_TIMEOUT_S
+        )
         reply = await _wait_for_new_bot_reply(
             target,
             after_id=before_id,
@@ -1579,7 +1913,9 @@ async def _stock_snapshot(target: str, cfg: dict[str, Any]) -> dict[str, int]:
     try:
         before = await _last_bot_message(target)
         before_id = int(before.get("id", 0)) if before else None
-        sent = await get_userbot().send_message(target, cfg["quota_command"])
+        sent = await _bot_call(
+            get_userbot().send_message(target, cfg["quota_command"]), _BOT_CALL_TIMEOUT_S
+        )
         reply = await _wait_for_new_bot_reply(
             target,
             after_id=before_id,
@@ -1599,10 +1935,10 @@ async def _stock_snapshot(target: str, cfg: dict[str, Any]) -> dict[str, int]:
 
 
 async def start_automation(*, respect_schedule: bool = False) -> dict[str, Any]:
-    """Consume every queued (and tagged) file: cleanup once, then add each
-    file as its own reply-based command. On success the queue becomes the
-    new active_files set (replacing whatever was active before) and the
-    periodic monitor (enabled) turns on.
+    """Consume every queued (and tagged) file: add each one as its own
+    reply-based command, or hold it when its country is still stocked. The
+    started files are merged into the active set and the periodic monitor
+    (enabled) turns on.
 
     Starts NOW by default, which is what the name says and what pressing
     Start means. ``respect_schedule`` is for the one caller that is not an
@@ -1610,6 +1946,24 @@ async def start_automation(*, respect_schedule: bool = False) -> dict[str, Any]:
     anything about. That is where a default start time belongs; answering
     an explicit "shuru" with "sure, in six hours" is not.
     """
+    async with _conversation_lock():
+        return await _start_automation_locked(respect_schedule=respect_schedule)
+
+
+async def _is_running(country: str, cfg: dict[str, Any]) -> bool:
+    """Is this country currently being monitored (started, not finished)?"""
+    wanted = " ".join(country.strip().casefold().split())
+    for entry in await get_active_files():
+        name = " ".join((entry.get("country") or entry["name"]).casefold().split())
+        if name != wanted or entry.get("finished_at") or entry.get("waiting_start"):
+            continue
+        state = await otp_schedule.get_run_state(country)
+        if state and not state.get("finished_at") and await otp_schedule.has_started(country, cfg):
+            return True
+    return False
+
+
+async def _start_automation_locked(*, respect_schedule: bool) -> dict[str, Any]:
     cfg = await get_config()
     queue = await get_queue()
 
@@ -1634,6 +1988,16 @@ async def start_automation(*, respect_schedule: bool = False) -> dict[str, Any]:
 
     target = cfg["target_bot"]
     result: dict[str, Any] = {"ok": False, "target_bot": target, "files": [], "error": "", "ran_at": _now_iso()}
+    # Files that went through (added, held or scheduled) leave the queue;
+    # files that failed stay in it, so a retry never re-sends the ones that
+    # already worked.
+    started: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    errors: list[str] = []
+    gates: dict[str, str] = {}
+    # Set when an error outside the per-file handling cut the start short:
+    # the files it never reached are neither started nor failed.
+    aborted = False
 
     try:
         # Read the bot's own stock once, before adding anything. A country
@@ -1646,7 +2010,6 @@ async def start_automation(*, respect_schedule: bool = False) -> dict[str, Any]:
             stock = await _stock_snapshot(target, cfg)
 
         needs_add: list[dict[str, Any]] = []
-        waiting: list[dict[str, Any]] = []
         for entry in queue:
             country = entry.get("country") or entry["name"]
             entry_cfg = await otp_schedule.effective_config(country, cfg)
@@ -1654,13 +2017,21 @@ async def start_automation(*, respect_schedule: bool = False) -> dict[str, Any]:
             # A country with a wall-clock start time must not touch the
             # target bot yet. Arm it, show it, add nothing - the whole point
             # of "start at 21:00" is that nothing happens before 21:00.
-            start_at = str(entry_cfg.get("start_at") or "").strip() if respect_schedule else ""
-            if otp_schedule._is_now(start_at):
+            start_at = str(entry_cfg.get("start_at") or "").strip() if respect_schedule else ""
+            if otp_schedule._is_now(start_at):
                 start_at = ""
+            own_start = (await otp_schedule.get_country_settings(country)).get("start_at")
+            if start_at and own_start is None and await _is_running(country, cfg):
+                # A fresh file for a country that is ALREADY running, with no
+                # time stated for it: the default start time is for new runs,
+                # never a reason to pause this one. Gating it here stopped a
+                # live country being refilled until 04:00 the next morning.
+                start_at = ""
+            gates[country] = start_at
             if start_at:
                 entry["waiting_start"] = start_at
-                waiting.append(entry)
                 begins = otp_schedule.next_occurrence(start_at)
+                started.append(entry)
                 result["files"].append({
                     "name": entry["name"],
                     "country": entry.get("country"),
@@ -1670,7 +2041,8 @@ async def start_automation(*, respect_schedule: bool = False) -> dict[str, Any]:
                     "added": False,
                     "waiting_start": start_at,
                     "starts_at": begins.isoformat() if begins else None,
-                    "reply": f"{start_at} (Dubai) e shuru hobe",
+                    "reply": f"starts at {start_at} Dubai time",
+                    **_limits_of(entry_cfg),
                 })
                 continue
             entry.pop("waiting_start", None)
@@ -1680,7 +2052,9 @@ async def start_automation(*, respect_schedule: bool = False) -> dict[str, Any]:
             if have is not None and have > threshold:
                 # Already stocked: hold the file, watch the country.
                 entry["skipped_add"] = True
+                entry["held"] = True
                 entry["stock_at_start"] = have
+                started.append(entry)
                 result["files"].append({
                     "name": entry["name"],
                     "country": entry.get("country"),
@@ -1689,24 +2063,33 @@ async def start_automation(*, respect_schedule: bool = False) -> dict[str, Any]:
                     "interval_minutes": entry_cfg.get("interval_minutes"),
                     "added": False,
                     "stock": have,
-                    "reply": f"already has {have:,} - kept for when it runs out",
+                    "reply": f"bot already has {have:,} — kept until stock runs low",
+                    **_limits_of(entry_cfg),
                 })
             else:
                 entry.pop("skipped_add", None)
+                entry.pop("held", None)
                 needs_add.append(entry)
 
         # Only tidy up if something is actually going to be added; otherwise
         # this is a pointless command in a chat the owner reads.
         if needs_add:
-            await get_userbot().send_message(target, cfg["cleanup_command"])
-            await _sleep(2)
+            await _send_cleanup(target, cfg)
 
         for entry in needs_add:
             country = entry.get("country") or entry["name"]
             # Each country runs on its own settings from the very first add,
             # not just from the second cycle onwards.
             entry_cfg = await otp_schedule.effective_config(country, cfg)
-            reply = await _add_one_file(target, entry, entry_cfg)
+            try:
+                reply = await _add_one_file(target, entry, entry_cfg)
+            except (AddRejected, FileNotFoundError) as exc:
+                # One file failing must not lose track of the others: the
+                # ones before it are already on the bot and need monitoring.
+                failed.append(entry)
+                errors.append(str(exc))
+                continue
+            started.append(entry)
             result["files"].append({
                 "name": entry["name"],
                 "country": entry.get("country"),
@@ -1716,65 +2099,104 @@ async def start_automation(*, respect_schedule: bool = False) -> dict[str, Any]:
                 "added": True,
                 "stock": _stock_for(stock, country) if stock else None,
                 "reply": reply,
+                **_limits_of(entry_cfg),
             })
 
-        # Arm every country, added or not: the whole point of skipping an add
-        # is that monitoring still runs and refills it later.
-        for entry in queue:
-            country = entry.get("country") or entry["name"]
-            entry_cfg = await otp_schedule.effective_config(country, cfg)
-            await otp_schedule.arm_country(
-                country, int(entry_cfg.get("interval_minutes", 10))
-            )
-            # Fresh run: the refill count and the time limit both start now,
-            # not from whenever this country last ran. For a country waiting
-            # on a start time the clock is re-based when that time actually
-            # arrives (see _add_after_wait) - what begin_run records here is
-            # the anchor the start time is measured from, and the gate this
-            # particular run must wait for.
-            await otp_schedule.begin_run(
-                country,
-                start_at=(str(entry_cfg.get("start_at") or "").strip()
-                          if respect_schedule else ""),
-            )
-
-        await save_config({"enabled": True, "awaiting_tag_entry_id": None})
-        # MERGE into the active set, never replace it. A second upload used to
-        # wipe every country already running - the owner adds Nigeria and
-        # silently loses the Bangladesh run started an hour ago. A new file
-        # for a country already running supersedes that country's entry only.
-        existing = await get_active_files()
-        fresh_countries = {(e.get("country") or e["name"]) for e in queue}
-        kept = [e for e in existing if (e.get("country") or e["name"]) not in fresh_countries]
-        await _save_files(ACTIVE_KEY, kept + queue)
-        await _save_files(QUEUE_KEY, [])
-        result["kept_running"] = [e.get("country") or e["name"] for e in kept]
-        # Surfaced so the owner is told up front when this run will end -
-        # a silent finish minutes later looks identical to a crash.
-        result["limits"] = {
-            "max_refills": int(cfg.get("max_refills") or 0),
-            "run_minutes": int(cfg.get("run_minutes") or 0),
-            "delete_when_done": bool(cfg.get("delete_when_done")),
-        }
-        result["ok"] = True
-
     except UserbotError as exc:
-        result["error"] = f"telegram account not linked or errored: {exc}"
-    except FileNotFoundError as exc:
-        result["error"] = str(exc)
-    except AddRejected as exc:
-        result["error"] = str(exc)
+        aborted = True
+        errors.append(f"telegram account not linked or errored: {exc}")
     except Exception as exc:  # noqa: BLE001 - start() must never crash the caller
         # log.exception keeps the real traceback in the container logs; the
         # owner-facing string alone is not enough to debug a crash like the
         # recursive-_sleep one, which read simply as "maximum recursion depth
         # exceeded" with no indication of where.
+        aborted = True
         log.exception("otp_bot_start_error")
-        result["error"] = f"unexpected error ({type(exc).__name__}): {exc}"
+        errors.append(f"unexpected error ({type(exc).__name__}): {exc}")
+
+    if errors and not started:
+        # Nothing went through: leave the queue exactly as it was, so a
+        # retry is safe and nothing half-started is being monitored.
+        result["error"] = "; ".join(errors)
+        async with session_scope() as session:
+            await repo.set_setting(session, LAST_START_KEY, result)
+        return result
+
+    for entry in started:
+        country = entry.get("country") or entry["name"]
+        entry_cfg = await otp_schedule.effective_config(country, cfg)
+        # A country whose last run finished is paused (held). A new file
+        # for it is the owner asking for a new run, so it comes off hold.
+        was_finished = bool((await otp_schedule.get_run_state(country)).get("finished_at"))
+        # Arm every started country, added or not: the whole point of
+        # holding a file is that monitoring still runs and adds it later.
+        await otp_schedule.arm_country(
+            country, int(entry_cfg.get("interval_minutes", 10))
+        )
+        # Fresh run: the refill count and the time limit both start now,
+        # not from whenever this country last ran. For a country waiting
+        # on a start time the clock is re-based when that time actually
+        # arrives (see _start_scheduled) - what begin_run records here is
+        # the anchor the start time is measured from, and the gate this
+        # particular run must wait for.
+        await otp_schedule.begin_run(country, start_at=gates.get(country, ""))
+        if was_finished:
+            await otp_schedule.set_paused(country, False)
+
+    await save_config({"enabled": True, "awaiting_tag_entry_id": None})
+    # MERGE into the active set, never replace it. A second upload used to
+    # wipe every country already running - the owner adds Nigeria and
+    # silently loses the Bangladesh run started an hour ago. A new file
+    # for a country already running supersedes that country's entry only.
+    existing = await get_active_files()
+    fresh_countries = {(e.get("country") or e["name"]) for e in started}
+    kept = [e for e in existing if (e.get("country") or e["name"]) not in fresh_countries]
+    await _save_files(ACTIVE_KEY, kept + started)
+    # Take out ONLY what went through, from the queue as it is NOW. Writing
+    # back the failed list instead dropped every file an abort never reached
+    # (in neither list) and every file uploaded while this start held the
+    # lock - each upload is its own task and queues itself meanwhile.
+    started_ids = {e.get("id") for e in started}
+    current_queue = await get_queue()
+    await _save_files(QUEUE_KEY, [e for e in current_queue if e.get("id") not in started_ids])
+    if aborted:
+        failed_ids = {e.get("id") for e in failed}
+        failed = failed + [
+            e for e in queue if e.get("id") not in started_ids and e.get("id") not in failed_ids
+        ]
+        result["partial"] = True
+    result["kept_running"] = [e.get("country") or e["name"] for e in kept]
+    # Surfaced so the owner is told up front when this run will end -
+    # a silent finish minutes later looks identical to a crash.
+    result["limits"] = {
+        "max_refills": int(cfg.get("max_refills") or 0),
+        "run_minutes": int(cfg.get("run_minutes") or 0),
+        "delete_when_done": bool(cfg.get("delete_when_done")),
+    }
+    # Some files went in and some did not: the started ones are monitored,
+    # the failed ones wait in the queue for a retry.
+    result["failed"] = [
+        {"name": e["name"], "country": e.get("country"), "count": e.get("count")}
+        for e in failed
+    ]
+    result["error"] = "; ".join(errors)
+    result["ok"] = True
 
     async with session_scope() as session:
         await repo.set_setting(session, LAST_START_KEY, result)
     return result
+
+
+def _limits_of(entry_cfg: dict[str, Any]) -> dict[str, Any]:
+    """The finish conditions that apply to one country, for the start
+    message. Taken from the country's EFFECTIVE settings: reading only the
+    global ones told the owner "no time limit" for a country whose own
+    20h limit was about to end it."""
+    return {
+        "run_minutes": int(entry_cfg.get("run_minutes") or 0),
+        "max_refills": int(entry_cfg.get("max_refills") or 0),
+        "stop_at": str(entry_cfg.get("stop_at") or ""),
+    }
 
 
 async def maybe_auto_start() -> dict[str, Any] | None:
@@ -1868,43 +2290,44 @@ async def handle_status_trigger() -> str:
 
 
 def help_text() -> str:
-    """Everything the thread understands, in the owner's own words."""
+    """Everything the thread understands. Explained in English; the example
+    inputs stay in the Banglish/Bengali the owner actually types."""
     return (
-        "\U0001F501 OTP-bot - ja ja bola jay:\n"
+        "\U0001F501 OTP-bot \u2014 what you can tell me\n"
         "\n"
-        "File dile nijei shuru hoy. File-er sathe caption likhle oitai\n"
-        "answer hishebe nibo - ja likhbe na, shudhu oitai jiggesh korbo.\n"
+        "Send a number file and it starts by itself. Anything you write in the\n"
+        "file's caption is taken as the answer \u2014 I only ask about what's missing.\n"
         "\n"
-        "Caption-e ja bola jay:\n"
-        "  bangladesh whatsapp 20h      - country + service + koto somoy\n"
-        "  shuru 21:00 bondho 06:00     - kokhon on, kokhon off (Dubai)\n"
-        "  telegram, kono stop nai      - service, somoy limit chara\n"
-        "  nigeria 2 din                - country + koto din cholbe\n"
-        "  rat 9 ta porjonto            - shomoy bhabe likhleo bujhbo\n"
+        "Caption examples:\n"
+        "\u2022 bangladesh whatsapp 20h \u2014 country + service + run time\n"
+        "\u2022 shuru 21:00 bondho 06:00 \u2014 start and stop time (Dubai)\n"
+        "\u2022 telegram, kono stop nai \u2014 service, no time limit\n"
+        "\u2022 nigeria 2 din \u2014 country + how many days\n"
+        "\u2022 rat 9 ta porjonto \u2014 everyday phrasing works too\n"
         "\n"
-        "Bangla-teo likhte paro - shob ek bhabe kaj kore:\n"
-        "  \u09ac\u09be\u0982\u09b2\u09be\u09a6\u09c7\u09b6 \u09b9\u09cb\u09df\u09be\u099f\u09b8\u0985\u09cd\u09af\u09be\u09aa \u09e8\u09e6 \u0998\u09a8\u09cd\u099f\u09be\n"
-        "  \u09b6\u09c1\u09b0\u09c1 \u09e8\u09e7:\u09e6\u09e6 \u09ac\u09a8\u09cd\u09a7 \u09e6\u09ec:\u09e6\u09e6\n"
-        "  \u09b8\u0995\u09be\u09b2 \u09ec\u099f\u09be \u09a5\u09c7\u0995\u09c7 \u09b0\u09be\u09a4 \u09e7\u09e7\u099f\u09be \u09aa\u09b0\u09cd\u09af\u09a8\u09cd\u09a4\n"
+        "Bengali script works exactly the same:\n"
+        "\u2022 \u09ac\u09be\u0982\u09b2\u09be\u09a6\u09c7\u09b6 \u09b9\u09cb\u09df\u09be\u099f\u09b8\u0985\u09cd\u09af\u09be\u09aa \u09e8\u09e6 \u0998\u09a8\u09cd\u099f\u09be\n"
+        "\u2022 \u09b6\u09c1\u09b0\u09c1 \u09e8\u09e7:\u09e6\u09e6 \u09ac\u09a8\u09cd\u09a7 \u09e6\u09ec:\u09e6\u09e6\n"
+        "\u2022 \u09b8\u0995\u09be\u09b2 \u09ec\u099f\u09be \u09a5\u09c7\u0995\u09c7 \u09b0\u09be\u09a4 \u09e7\u09e7\u099f\u09be \u09aa\u09b0\u09cd\u09af\u09a8\u09cd\u09a4\n"
         "\n"
-        "Lekha:\n"
-        "  start / shuru    - shuru koro\n"
-        "  stop / bondho    - thamao\n"
-        "  status           - ekhon ki cholche\n"
-        "  20h / 90 min / limit nai - koto somoy cholbe (jiggesh korle)\n"
-        "  <country> bad dao - oi country bad\n"
-        "  sob bad dao      - queue khali koro\n"
+        "Messages:\n"
+        "\u2022 start / shuru \u2014 start running\n"
+        "\u2022 stop / bondho \u2014 stop\n"
+        "\u2022 status \u2014 what's running right now\n"
+        "\u2022 20h / 90 min / limit nai \u2014 run time (when I ask)\n"
+        "\u2022 <country> bad dao \u2014 drop that country\n"
+        "\u2022 sob bad dao \u2014 empty the queue\n"
         "\n"
-        "Notun file default 04:00 (Dubai) e shuru hobe. Ekhoni chalate\n"
-        "caption-e 'ekhoni shuru' likho, ba panel-e On at > Ekhoni.\n"
+        "New files start at 04:00 (Dubai) by default. To start right away, write\n"
+        "\"ekhoni shuru\" in the caption, or use \u25b6\ufe0f On at in the /otpbot panel.\n"
         "\n"
-        "Command:\n"
-        "  /otpbot    - button panel (sob ekhane)\n"
-        "  /otpset    - setting dekho / bodlao\n"
-        "  /otppreset - preset list / save / apply\n"
+        "Commands:\n"
+        "\u2022 /otpbot \u2014 button panel (everything is there)\n"
+        "\u2022 /otpset \u2014 view / change settings\n"
+        "\u2022 /otppreset \u2014 list / save / apply presets\n"
         "\n"
-        "Button diye: interval, restock point, country on/off, on-time,\n"
-        "off-time, koto somoy cholbe, ekta file delete, preset - sob."
+        "The buttons cover interval, restock point, country on/off, start time,\n"
+        "stop time, run time, deleting a file and presets."
     )
 
 
@@ -2028,62 +2451,134 @@ async def _notify_owner(text: str) -> None:
         log.exception("otp_bot_notify_failed")
 
 
-def _format_start_success(result: dict[str, Any]) -> str:
-    added = [f for f in result["files"] if f.get("added", True)]
-    waiting = [f for f in result["files"] if f.get("waiting_start")]
-    held = [
-        f for f in result["files"]
-        if not f.get("added", True) and not f.get("waiting_start")
-    ]
+def _ends_when(file: dict[str, Any], limits: dict[str, Any]) -> str:
+    """When one started country stops by itself - "after 20h or 5 re-adds",
+    "at 23:30 Dubai time" - or "" when nothing will stop it.
 
-    head = "\u2705 Auto-start" if result.get("auto") else "\u2705 Shuru hoye geche"
-    lines = [f"{head} - {len(added)} file add kora holo {result['target_bot']}-e."]
+    Read from the file's own (effective, per-country) limits. Results stored
+    before those fields existed fall back to the global ones.
+    """
+    run_minutes = int(file.get("run_minutes", limits.get("run_minutes")) or 0)
+    max_refills = int(file.get("max_refills", limits.get("max_refills")) or 0)
+    stop_at = str(file.get("stop_at") or "").strip()
+    if otp_schedule._is_now(stop_at):
+        stop_at = ""
+
+    after: list[str] = []
+    if run_minutes > 0:
+        after.append(format_run_minutes(run_minutes))
+    if max_refills > 0:
+        after.append(f"{max_refills:,} re-add{'' if max_refills == 1 else 's'}")
+    parts: list[str] = []
+    if after:
+        parts.append("after " + " or ".join(after))
+    if stop_at:
+        parts.append(f"at {stop_at} Dubai time")
+    return " or ".join(parts)
+
+
+def _format_start_success(result: dict[str, Any]) -> str:
+    files = list(result.get("files") or [])
+    added = [f for f in files if f.get("added", True)]
+    waiting = [f for f in files if f.get("waiting_start")]
+    held = [f for f in files if not f.get("added", True) and not f.get("waiting_start")]
+    target = result.get("target_bot") or "the bot"
+
+    if result.get("auto"):
+        head = "\u2705 Auto-started"
+    elif result.get("resumed"):
+        head = "\u2705 Resumed"
+    else:
+        head = "\u2705 Started"
+    if added:
+        head += f" \u2014 {len(added)} file{'' if len(added) == 1 else 's'} sent to {target}"
+    else:
+        head += f" \u2014 nothing sent to {target} yet"
+
+    body: list[str] = []
     for f in added:
-        country = f.get("country") or "?"
-        lines.append(f"  {country} - {f['count']} number (tag: {f['tag']})")
-        lines.append(f"     {str(f['reply'])[:150]}")
-    # Scheduled countries have not been touched at all yet - saying so is the
-    # difference between "waiting as asked" and "my file was ignored".
-    for f in waiting:
-        country = f.get("country") or "?"
-        lines.append(
-            f"  \u23F0 {country} - {f['count']} number, "
-            f"{f['waiting_start']} (Dubai) e shuru hobe (tag: {f['tag']})"
-        )
+        line = f"\u2022 {f.get('country') or '?'} \u2014 {_numbers(f.get('count'))}"
+        if f.get("tag"):
+            line += f" ({f['tag']})"
+        new = _parse_added_count(str(f.get("reply") or ""))
+        if new is not None:
+            line += f", {new:,} added"
+        body.append(line)
     # Files held back are not failures - the country already had numbers, so
     # sending them now would only produce duplicates. Say so plainly, or it
     # reads as "my file was ignored".
     for f in held:
-        country = f.get("country") or "?"
-        lines.append(
-            f"  \u23F8 {country} - {f['count']} number rakha holo "
-            f"(bot e ekhon {f.get('stock', 0):,} ache)"
+        body.append(
+            f"\u23F8 Held: {f.get('country') or '?'} \u2014 {_numbers(f.get('count'))} kept "
+            f"(bot still has {_num(f.get('stock', 0))}). "
+            "It will be added automatically when stock runs low."
         )
-        lines.append("     Shesh hoar shathe shathe auto add hobe.")
+    # Scheduled countries have not been touched at all yet - saying so is the
+    # difference between "waiting as asked" and "my file was ignored".
+    for f in waiting:
+        tag = f" ({f['tag']})" if f.get("tag") else ""
+        body.append(
+            f"\u23F0 Scheduled: {f.get('country') or '?'} \u2014 {_numbers(f.get('count'))}{tag}, "
+            f"starts at {f['waiting_start']} Dubai time."
+        )
     if result.get("kept_running"):
-        lines.append(f"  \u267B\uFE0F Age theke cholche: {', '.join(result['kept_running'])}")
-    lines.append("")
-    # State the finish conditions explicitly. A run that stops on its own is
-    # correct behaviour, but only if the owner knows it will - otherwise it
-    # reads as "the automation broke overnight".
+        body.append(
+            f"\u267B\uFE0F Still running from before: {', '.join(result['kept_running'])}"
+        )
+
+    # Some files went in and some did not: the failed ones are still queued.
+    failed_section: list[str] = []
+    failed = list(result.get("failed") or [])
+    if failed:
+        failed_section.append(
+            f"\u274C {len(failed)} file{'' if len(failed) == 1 else 's'} could not be sent "
+            "\u2014 kept in the queue for a retry:"
+        )
+        for f in failed:
+            failed_section.append(
+                f"\u2022 {f.get('country') or f.get('name') or '?'} \u2014 {_numbers(f.get('count'))}"
+            )
+        if result.get("error"):
+            failed_section.append(f"Error: {str(result['error'])[:300]}")
+        failed_section.append(
+            f"Say \"start\" to try {'it' if len(failed) == 1 else 'them'} again."
+        )
+
+    # State the finish conditions explicitly, per country. A run that stops
+    # on its own is correct behaviour, but only if the owner knows it will -
+    # otherwise it reads as "the automation broke overnight".
     limits = result.get("limits") or {}
-    max_refills, run_minutes = limits.get("max_refills"), limits.get("run_minutes")
-    if max_refills or run_minutes:
-        parts = []
-        if max_refills:
-            parts.append(f"{max_refills} bar re-add")
-        if run_minutes:
-            parts.append(f"{run_minutes} min")
-        lines.append(f"\u26A0\uFE0F Ei task {' othoba '.join(parts)} por NIJEI BONDHO hobe.")
-        if limits.get("delete_when_done"):
-            lines.append("   Tarpor oi country-r number bot theke muche jabe.")
-        lines.append("   Limit chara chalate: /otpset run_minutes 0, /otpset max_refills 0")
+    ends: dict[str, str] = {}
+    for f in added + held + waiting:
+        country = f.get("country") or f.get("name") or "?"
+        ends.setdefault(country, _ends_when(f, limits))
+    limited = [(country, when) for country, when in ends.items() if when]
+    unlimited = [country for country, when in ends.items() if not when]
+
+    footer: list[str] = []
+    if not limited:
+        footer.append(
+            "\u267E\uFE0F No time or re-add limit \u2014 it keeps running until you say \"stop\"."
+        )
     else:
-        lines.append("\u267E\uFE0F Kono time/count limit nai - 'stop' na bola porjonto cholbe.")
-    lines.append(
-        "Periodically stock check hobe, khali hole nijei cleanup+re-add korbe."
-    )
-    return "\n".join(lines)
+        if len(ends) == 1:
+            country, when = limited[0]
+            footer.append(f"\u23F3 {country} stops by itself {when}.")
+        else:
+            listed = ", ".join(f"{country} {when}" for country, when in limited)
+            lead = "Each country stops by itself" if not unlimited else "Stops by itself"
+            footer.append(f"\u23F3 {lead} ({listed}).")
+        if unlimited:
+            footer.append(
+                f"\u267E\uFE0F No limit for {', '.join(unlimited)} \u2014 "
+                "runs until you say \"stop\"."
+            )
+        if limits.get("delete_when_done"):
+            footer.append("\U0001F5D1 When a run ends, its numbers are deleted from the bot.")
+    footer.append("Stock is checked automatically; empty countries are refilled.")
+
+    sections = [[head], body, failed_section, footer]
+    return "\n\n".join("\n".join(section) for section in sections if section)
 
 
 def tag_question(entry: dict[str, Any]) -> str:
@@ -2100,11 +2595,12 @@ def _tag_question(entry: dict[str, Any]) -> str:
     """
     country = entry.get("country") or "?"
     count = entry.get("count")
-    detail = f"{count} number" if count else "numbers"
+    detail = _numbers(count) if count else "numbers"
     return (
-        f"\U0001F30D {country} - {detail}\n"
-        f"(file: {entry.get('source_name') or entry['name']})\n\n"
-        "Ei country-r jonno kon service/tag e add korbo? (jemon: WhatsApp, Telegram)"
+        f"\U0001F30D {country} — {detail}\n"
+        f"File: {entry.get('source_name') or entry['name']}\n"
+        "\n"
+        "Which service (tag) should I add these under? (e.g. WhatsApp, Telegram)"
     )
 
 
@@ -2126,7 +2622,11 @@ async def handle_start_trigger() -> str:
             # what I had going". Low-risk and fully reversible (stop undoes
             # it), so just do it instead of asking.
             return await handle_resume_trigger()
-        return "Kono file queue-e nai. Age file upload koro, tarpor 'start' bolo."
+        return (
+            "\U0001F4ED Nothing in the queue yet.\n"
+            "\n"
+            "Upload a number file first, then say \"start\"."
+        )
 
     needing = await countries_needing_runtime(queue)
     if needing:
@@ -2139,7 +2639,7 @@ async def handle_start_trigger() -> str:
         text = _format_start_success(result)
         await _notify_owner(f"\U0001F7E2 OTP-bot automation started.\n\n{text}")
         return text
-    return f"\u274C Start korte parlam na: {result['error']}"
+    return f"\u274C Couldn't start: {result['error']}"
 
 
 def format_start_result(result: dict[str, Any]) -> str:
@@ -2157,7 +2657,7 @@ async def _continue_after_tagging(prefix: str) -> str:
 
     queue = await get_queue()
     if not queue:
-        return f"{prefix}\n\nQueue ekhon khali. Notun file dao, tarpor 'start' bolo."
+        return f"{prefix}\n\nThe queue is empty now. Send a new file, then say \"start\"."
 
     # Tags are settled; the remaining question is how long it should run.
     # Asked once for the whole batch, and only for the countries that do not
@@ -2176,7 +2676,7 @@ async def _continue_after_tagging(prefix: str) -> str:
         text_out = _format_start_success(result)
         await _notify_owner(f"\U0001F7E2 OTP-bot automation started.\n\n{text_out}")
         return f"{prefix}\n\n{text_out}"
-    return f"{prefix}\n\n\u274C Start korte parlam na: {result['error']}"
+    return f"{prefix}\n\n\u274C Couldn't start: {result['error']}"
 
 
 async def handle_runtime_answer(text: str) -> str:
@@ -2184,7 +2684,7 @@ async def handle_runtime_answer(text: str) -> str:
     pending = await get_awaiting_runtime()
     countries = list((pending or {}).get("countries") or [])
     if not countries:
-        return "Kono somoy-er proshno khola nai."
+        return "There's no run-time question open right now."
 
     if is_skip_trigger(text):
         # Skipping takes the stated default rather than leaving the run
@@ -2198,7 +2698,7 @@ async def handle_runtime_answer(text: str) -> str:
     try:
         minutes = parse_run_minutes(text)
     except ValueError as exc:
-        return f"\u274C {exc}\n\nAbar likho, othoba 'bad' bollei default boshbe."
+        return f"\u274C {exc}\n\nPlease try again \u2014 or say \"skip\" to use the default."
 
     note = await apply_runtime_answer(countries, minutes)
     return await _continue_after_runtime(note)
@@ -2212,21 +2712,21 @@ async def _continue_after_runtime(prefix: str) -> str:
         return f"{prefix}\n\n{_tag_question(next_entry)}"
 
     if not await get_queue():
-        return f"{prefix}\n\nQueue khali - notun file dao."
+        return f"{prefix}\n\nThe queue is empty \u2014 send a new file."
 
     result = await start_automation()
     if result["ok"]:
         text_out = _format_start_success(result)
         await _notify_owner(f"\U0001F7E2 OTP-bot automation started.\n\n{text_out}")
         return f"{prefix}\n\n{text_out}"
-    return f"{prefix}\n\n\u274C Start korte parlam na: {result['error']}"
+    return f"{prefix}\n\n\u274C Couldn't start: {result['error']}"
 
 
 async def handle_tag_answer(text: str) -> str:
     """Owner just answered a "what tag for X" question."""
     entry = await get_awaiting_tag_entry()
     if entry is None:
-        return "Kono file tag-er jonno wait kortese na. 'start' bolle shuru hobe."
+        return "No file is waiting for a service right now. Say \"start\" to begin."
 
     label = entry.get("country") or entry["name"]
 
@@ -2234,11 +2734,11 @@ async def handle_tag_answer(text: str) -> str:
     # exactly when the owner notices a country they did not mean to send.
     if is_skip_trigger(text):
         await remove_from_queue(entry["id"])
-        return await _continue_after_tagging(f"\U0001F5D1 {label} bad deoa holo.")
+        return await _continue_after_tagging(f"\U0001F5D1 {label} removed.")
 
     await set_queue_tag(entry["id"], text)
     await set_awaiting_tag_entry(None)
-    return await _continue_after_tagging(f"\u2705 {label} -> {text.strip()[:60]}")
+    return await _continue_after_tagging(f"\u2705 {label} \u2192 {text.strip()[:60]}")
 
 
 async def handle_remove_country(country: str) -> str:
@@ -2248,12 +2748,13 @@ async def handle_remove_country(country: str) -> str:
         queue = await get_queue()
         active = await get_active_files()
         known = sorted({e.get("country") or "?" for e in queue + active})
-        available = ", ".join(known) if known else "(kichu nai)"
-        return f"'{country}' khuje pelam na.\nEkhon ache: {available}"
+        available = ", ".join(known) if known else "(nothing)"
+        return f"\U0001F50D Couldn't find '{country}'.\n\nIn the list now: {available}"
 
     total = sum(e.get("count") or 0 for e in removed)
     label = removed[0].get("country") or country
-    text = f"\U0001F5D1 {label} bad deoa holo ({len(removed)} entry, {total} number)."
+    entries = f"{len(removed)} entr{'y' if len(removed) == 1 else 'ies'}"
+    text = f"\U0001F5D1 {label} removed ({entries}, {_numbers(total)})."
 
     # If that removal answered the open question, keep the flow moving.
     if await get_awaiting_tag_entry() is None and await next_untagged_entry() is not None:
@@ -2265,22 +2766,25 @@ async def handle_clear_queue() -> str:
     """Owner said "sob bad dao" - empty the not-yet-started queue."""
     count = await clear_queue()
     if not count:
-        return "Queue emnitei khali."
+        return "\U0001F4ED The queue is already empty."
     return (
-        f"\U0001F5D1 Queue clear kora holo ({count} entry bad).\n"
-        "Cholte thaka file gulo (active) thik-i ache - oigula bondho korte 'stop' bolo."
+        f"\U0001F5D1 Queue cleared \u2014 {count} entr{'y' if count == 1 else 'ies'} removed.\n"
+        "\n"
+        "Files that are already running are untouched. Say \"stop\" to stop those too."
     )
 
 
 async def handle_stop_trigger() -> str:
     cfg = await get_config()
     if not cfg["enabled"]:
-        return "Automation already off."
+        return "\u23F8\uFE0F The automation is already off."
     await stop_automation()
-    await _notify_owner("\U0001F534 OTP-bot automation bondho kora holo.")
+    await _notify_owner("\U0001F534 OTP-bot automation stopped.")
     return (
-        "\u23F8\uFE0F Automation bondho kora holo. Notun file dile ba 'start' bolle "
-        "abar jiggesh korbo kon file diye shuru korbo."
+        "\u23F8\uFE0F Automation stopped.\n"
+        "\n"
+        "Your files are kept. To run again, send a new file or say \"start\" "
+        "to resume the current ones."
     )
 
 
@@ -2290,14 +2794,31 @@ async def handle_resume_trigger() -> str:
     """
     active = await get_active_files()
     if not active:
-        return "Kono age-r active file nai - notun file upload koro, tarpor 'start' bolo."
-    await _save_files(QUEUE_KEY, active)
+        return (
+            "\U0001F4ED There are no previous files to resume.\n"
+            "\n"
+            "Upload a new file, then say \"start\"."
+        )
+    # Copied in beside whatever is already queued, never over it.
+    queue = await get_queue()
+    queued_ids = {e.get("id") for e in queue}
+    copies = [e for e in active if e.get("id") not in queued_ids]
+    await _save_files(QUEUE_KEY, queue + copies)
     result = await start_automation()
+    if not result["ok"]:
+        # Nothing started: the copies must not linger in the queue as
+        # duplicates of files that are still in the active set.
+        copied_ids = {e.get("id") for e in copies}
+        remaining = [e for e in await get_queue() if e.get("id") not in copied_ids]
+        await _save_files(QUEUE_KEY, remaining)
     if result["ok"]:
+        result["resumed"] = True
         text = _format_start_success(result)
-        await _notify_owner(f"\U0001F7E2 OTP-bot automation resumed (age-r file diye).\n\n{text}")
+        await _notify_owner(
+            f"\U0001F7E2 OTP-bot automation resumed with the previous files.\n\n{text}"
+        )
         return text
-    return f"\u274C Resume korte parlam na: {result['error']}"
+    return f"\u274C Couldn't resume: {result['error']}"
 
 
 # --------------------------------------------------------------------------- #
@@ -2316,7 +2837,30 @@ async def run_cycle(config: dict[str, Any] | None = None, *, force: bool = False
     so each country keeps its own pace, but a human pressing "Check now" is
     asking for a check right now - answering "not due yet" would make the
     button look broken.
+
+    The wait for the conversation is bounded (_CYCLE_LOCK_WAIT_S): if some
+    other operation still holds it, this round reports "busy" and the next
+    one tries again, instead of every cycle queueing up behind it.
     """
+    lock = _conversation_lock()
+    try:
+        await asyncio.wait_for(lock.acquire(), _CYCLE_LOCK_WAIT_S)
+    except asyncio.TimeoutError:
+        log.warning("otp_bot_cycle_busy", extra={"waited_s": _CYCLE_LOCK_WAIT_S})
+        result = CycleResult(
+            ok=False,
+            action="error",
+            error="busy: another operation with the bot is still running",
+        )
+        await _save_last_result(result)
+        return result
+    try:
+        return await _run_cycle_locked(config, force=force)
+    finally:
+        lock.release()
+
+
+async def _run_cycle_locked(config: dict[str, Any] | None, *, force: bool) -> CycleResult:
     cfg = config or await get_config()
     target = cfg["target_bot"]
     result = CycleResult(ok=False, action="error")
@@ -2327,16 +2871,21 @@ async def run_cycle(config: dict[str, Any] | None = None, *, force: bool = False
         await _save_last_result(result)
         return result
 
-    # Only refill the countries whose own timer has come up. With a single
+    # Only look at the countries whose own timer has come up. With a single
     # shared interval a slow country was being re-added on the fast one's
-    # clock, which is pure noise for the target bot.
+    # clock, which is pure noise for the target bot. A finished (held)
+    # country is paused, so due_countries already leaves it out.
     countries = [e.get("country") or e["name"] for e in active_files]
     if force:
         # A manual check looks at everything, and still re-arms the timers so
         # the next automatic pass is measured from now. A country still
         # waiting for its start time is exempt: "Check now" means check what
         # is running, not "override the schedule I just set".
-        ready = [c for c in countries if await otp_schedule.has_started(c, cfg)]
+        ready = [
+            c for c in countries
+            if await otp_schedule.has_started(c, cfg)
+            and not await otp_schedule.is_paused(c)
+        ]
         for country in ready:
             entry_cfg = await otp_schedule.effective_config(country, cfg)
             await otp_schedule.arm_country(
@@ -2350,24 +2899,23 @@ async def run_cycle(config: dict[str, Any] | None = None, *, force: bool = False
         await _save_last_result(result)
         return result
 
+    ready_set = set(ready)
     due_files = [
-        e for e in active_files if (e.get("country") or e["name"]) in set(ready)
+        e for e in active_files
+        if (e.get("country") or e["name"]) in ready_set and not e.get("finished_at")
     ]
 
-    # A scheduled country whose start time has now arrived was deliberately
-    # never added at start(). Its first cycle is that add - without this it
-    # would sit forever being "checked" against stock it never contributed.
-    newly_started = [e for e in due_files if e.get("waiting_start")]
-    if newly_started:
-        result.started_now = await _add_after_wait(target, newly_started, cfg)
-
     try:
-        # Anchor on the last bot message before asking, so a slow answer is
-        # waited for rather than the previous one being mistaken for it.
+        # Read stock FIRST, before anything is added. Everything below - a
+        # scheduled start, a refill, a finish - is decided from this one
+        # reading. Anchor on the last bot message before asking, so a slow
+        # answer is waited for rather than the previous one mistaken for it.
         before_quota = await _last_bot_message(target)
         before_quota_id = int(before_quota.get("id", 0)) if before_quota else None
 
-        sent_stock = await get_userbot().send_message(target, cfg["quota_command"])
+        sent_stock = await _bot_call(
+            get_userbot().send_message(target, cfg["quota_command"]), _BOT_CALL_TIMEOUT_S
+        )
         # Only a message that actually carries per-country stock counts as
         # the answer: the bot also posts its own add/progress notices, and
         # one of those arriving first previously produced a misread.
@@ -2379,7 +2927,7 @@ async def run_cycle(config: dict[str, Any] | None = None, *, force: bool = False
         )
 
         # Tidy up the check itself: the stock command and its reply are
-        # bookkeeping, and on a 2-minute interval they bury the chat the
+        # bookkeeping, and on a 1-minute interval they bury the chat the
         # owner actually reads. Done after the reply is captured, so the
         # data is already in hand.
         if cfg.get("tidy_stock_messages", True):
@@ -2389,6 +2937,9 @@ async def run_cycle(config: dict[str, Any] | None = None, *, force: bool = False
             )
 
         if stock_msg is None:
+            # Nothing is decided blind: no add, no start, no finish. A
+            # scheduled start in particular waits for a reading - starting
+            # without one is exactly how a still-stocked country got wiped.
             result.error = (
                 f"no reply from {target} to {cfg['quota_command']} "
                 "(check the userbot is linked and the command still works)"
@@ -2407,79 +2958,119 @@ async def run_cycle(config: dict[str, Any] | None = None, *, force: bool = False
         result.active_quota = _parse_quota(stock_msg["text"])
         if result.active_quota is None and stock:
             result.active_quota = sum(stock.values())
+        if not stock and result.active_quota is None:
+            result.error = "could not read stock from the reply"
+            await _save_last_result(result)
+            return result
 
-        if not stock:
-            # A plain /myquota reply has no per-country breakdown. Fall back
-            # to the old all-or-nothing behaviour rather than refusing to
-            # work, so an owner who kept /myquota configured is not stranded.
-            if result.active_quota is None:
-                result.error = "could not read stock from the reply"
-                await _save_last_result(result)
-                return result
-            if result.active_quota > cfg["quota_threshold"]:
-                result.ok = True
-                result.action = "skipped"
-                await _save_last_result(result)
-                return result
-            refill = due_files
-        else:
-            # Per-country decision: only refill the countries that are
-            # actually empty. A country with stock left does not need
-            # touching just because a sibling ran out.
-            refill = []
-            for entry in due_files:
-                country = entry.get("country") or entry["name"]
-                entry_cfg = await otp_schedule.effective_config(country, cfg)
+        # 1. Finish lines, for every due country that is running - not only
+        # the empty ones. A 20h run ends at 20h even if the bot still has
+        # numbers; checking only before a refill left "finished" countries
+        # running for as long as their stock happened to last.
+        running: list[dict[str, Any]] = []
+        for entry in due_files:
+            if entry.get("waiting_start"):
+                continue
+            country = entry.get("country") or entry["name"]
+            entry_cfg = await otp_schedule.effective_config(country, cfg)
+            done_reason = await otp_schedule.finished_reason(country, cfg)
+            if done_reason:
+                result.finished.append(
+                    await _finish_country(target, entry, entry_cfg, done_reason)
+                )
+            else:
+                running.append(entry)
+
+        # 2. Scheduled starts whose time has come: hold if still stocked,
+        # add if not.
+        newly_started = [e for e in due_files if e.get("waiting_start")]
+        if newly_started:
+            result.started_now, result.held_at_start = await _start_scheduled(
+                target, newly_started, cfg, stock or None,
+            )
+
+        # 3. Refills: only countries actually at or below their own restock
+        # point, and never a file already known to be used up.
+        refill: list[dict[str, Any]] = []
+        for entry in running:
+            country = entry.get("country") or entry["name"]
+            entry_cfg = await otp_schedule.effective_config(country, cfg)
+            if stock:
                 have = _stock_for(stock, country)
-                if have is None:
-                    # Not listed at all means the bot is holding none of it.
-                    have = 0
-                if have <= int(entry_cfg.get("quota_threshold", 0)):
-                    refill.append(entry)
+                # Not listed at all means the bot is holding none of it.
+                have = 0 if have is None else have
+            else:
+                # A plain /myquota reply has no per-country breakdown: fall
+                # back to the old all-or-nothing reading.
+                have = int(result.active_quota or 0)
+            if have > int(entry_cfg.get("quota_threshold", 0)):
+                continue
+            if entry.get("exhausted_at"):
+                # Re-sending a file the bot already answered with "0 added"
+                # changes nothing - it just floods the bot every minute. The
+                # owner was told once; a new file for this country clears it.
+                continue
+            refill.append(entry)
 
-            if not refill:
-                result.ok = True
+        if not refill:
+            result.ok = True
+            if result.started_now or result.held_at_start or result.finished:
+                result.action = "started/finished"
+            elif not stock:
+                # Single-number /myquota reply: there is no per-country
+                # picture to describe, just "healthy".
+                result.action = "skipped"
+            else:
                 result.action = "skipped - every due country still has stock"
-                await _save_last_result(result)
-                return result
+            await _save_last_result(result)
+            return result
 
-        # Clean up once, then re-add the countries that ran out - each with
-        # its OWN limit/count/tag/cleanup mode.
-        await get_userbot().send_message(target, cfg["cleanup_command"])
-        await _sleep(2)
+        # Clean up once (only if a cleanup command is configured), then
+        # re-add the countries that ran low - each with its OWN
+        # limit/count/tag/wipe mode.
+        await _send_cleanup(target, cfg)
 
         replies: list[str] = []
         for entry in refill:
             country = entry.get("country") or entry["name"]
             entry_cfg = await otp_schedule.effective_config(country, cfg)
-
-            # Has this country reached its own finish line? Checked before
-            # the re-add, so "3 refills" means 3, not 4.
-            done_reason = await otp_schedule.finished_reason(country, cfg)
-            if done_reason:
-                finished = await _finish_country(target, entry, entry_cfg, done_reason)
-                result.finished.append(finished)
+            try:
+                reply = await _add_one_file(target, entry, entry_cfg)
+            except (AddRejected, FileNotFoundError) as exc:
+                # One country's slow or rejected add must not leave every
+                # other empty country unfilled until the next pass.
+                result.add_errors.append(f"{country}: {exc}"[:300])
                 continue
-
-            reply = await _add_one_file(target, entry, entry_cfg)
             await otp_schedule.record_refill(country)
+            if entry.get("held"):
+                await _update_active_entry(entry["id"], held=None)
             result.files_processed.append(entry["name"])
             if reply:
                 replies.append(f"{country}: {reply}")
 
             # The file is spent when the bot had no stock AND the re-add
             # contributed nothing new - every number in it is already known.
-            added = _parse_added_count(reply)
+            # Read THIS country's count only: another country's "0 added"
+            # must never write this file off.
+            added = _added_for(reply, entry.get("country"))
             if added == 0:
+                await _update_active_entry(entry["id"], exhausted_at=_now_iso())
                 result.exhausted.append({
                     "country": country,
                     "name": entry["name"],
-                    "had_stock": _stock_for(stock, country) or 0,
+                    "had_stock": _stock_for(stock, country) or 0 if stock else 0,
                 })
 
         result.add_reply = "\n".join(replies)
-        result.ok = True
-        result.action = f"added ({len(refill)} countr{'y' if len(refill) == 1 else 'ies'})"
+        done = len(result.files_processed)
+        result.action = f"added ({done} countr{'y' if done == 1 else 'ies'})"
+        if result.add_errors:
+            # Reported as a failure so the owner hears about it, but only
+            # after every other country has been dealt with.
+            result.ok = False
+            result.error = "; ".join(result.add_errors)
+        else:
+            result.ok = True
         await _save_last_result(result)
         return result
 

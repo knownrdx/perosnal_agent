@@ -12,6 +12,9 @@ name or a country, both of which can easily blow the limit.
 
 from __future__ import annotations
 
+import html
+import re
+import zlib
 from typing import Any
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -19,6 +22,104 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from app.automation import otp_bot
 
 PREFIX = "otp"
+
+# Telegram REJECTS a message over 4096 characters - it does not truncate it -
+# and the error lands in aiogram's log, not the chat, so an over-long status
+# or start report simply never arrived. The cap is counted in UTF-16 units,
+# where every emoji here is two, hence the margin below the real limit.
+MESSAGE_LIMIT = 4000
+
+
+def country_key(country: str) -> str:
+    """A short, stable id for one country, for use in callback_data.
+
+    Buttons used to carry a country's POSITION in the active+queue list.
+    That list reorders constantly - every start moves the restarted country
+    to the end, a finished or removed country shifts everything after it -
+    so a button rendered a minute earlier acted on a different country,
+    "Remove" included. A hash of the name means the same country for as
+    long as the button exists, and fits the 64-byte cap however long the
+    name ("Saint Vincent And The Grenadines") is.
+    """
+    flat = " ".join(country.casefold().split())
+    return "k" + format(zlib.crc32(flat.encode("utf-8")), "08x")
+
+
+def is_all_countries(token: str) -> bool:
+    """True for the global pickers' target (-1: On at / Off at / run length)
+    rather than one country's key."""
+    return token.strip().startswith("-")
+
+
+def resolve_country(token: str, names: list[str]) -> str | None:
+    """The country a button's token refers to, or None if it is gone.
+
+    A bare number is a button rendered before keys existed: still honoured
+    so old messages keep working, but bounds-checked both ways - a negative
+    index used to wrap round to the LAST country.
+    """
+    token = token.strip()
+    if token.startswith("k"):
+        return next((name for name in names if country_key(name) == token), None)
+    try:
+        index = int(token)
+    except ValueError:
+        return None
+    return names[index] if 0 <= index < len(names) else None
+
+
+def split_text(text: str, limit: int = MESSAGE_LIMIT) -> list[str]:
+    """Break a reply into Telegram-sized pieces, at line breaks where possible."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            # One absurdly long line (a bot reply pasted whole): hard-cut it.
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    # Telegram also rejects an empty message, which a run of blank lines at a
+    # chunk boundary would otherwise produce.
+    return [chunk for chunk in chunks if chunk.strip()] or [text[:limit]]
+
+
+
+def upload_problem(data: bytes) -> str | None:
+    """Why an upload to the OTP thread cannot be a numbers file, or None.
+
+    Shared by the Telegram and web upload paths. Anything is read as text
+    downstream: a spreadsheet becomes binary noise the country splitter
+    files under "Unknown", which auto-start then sends to the target bot
+    under a real tag. NUL bytes never occur in a UTF-8 text export, so they
+    are the tell (a UTF-16 export carries a BOM and is let through).
+    """
+    if b"\x00" in data[:8192] and not data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return (
+            "\u274C This is not a text file (xlsx / zip / pdf?), so I did not queue it.\n"
+            "\n"
+            "\u2022 Send the numbers as a .txt file\n"
+            "\u2022 One number per line"
+        )
+    if not re.search(rb"\d", data):
+        return (
+            "\u274C There are no numbers in this file, so I did not queue it.\n"
+            "\n"
+            "\u2022 Check that you sent the right file\n"
+            "\u2022 Send the numbers as a .txt file, one per line"
+        )
+    return None
 
 
 def _rows(buttons: list[InlineKeyboardButton], per_row: int = 2) -> list[list[InlineKeyboardButton]]:
@@ -35,7 +136,7 @@ def service_keyboard(entry_id: str) -> InlineKeyboardMarkup:
     ]
     rows = _rows(buttons, per_row=3)
     rows.append([
-        InlineKeyboardButton(text="\U0001F5D1 Bad dao", callback_data=f"{PREFIX}:skip:{entry_id}"),
+        InlineKeyboardButton(text="\U0001F5D1 Remove", callback_data=f"{PREFIX}:skip:{entry_id}"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -53,7 +154,7 @@ def interval_keyboard(current: int | None = None) -> InlineKeyboardMarkup:
     rows = _rows(buttons, per_row=3)
     rows.append([
         InlineKeyboardButton(
-            text="\u270F\uFE0F Onno somoy (custom)", callback_data=f"{PREFIX}:intc:"
+            text="\u270F\uFE0F Custom", callback_data=f"{PREFIX}:intc:"
         )
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -65,7 +166,7 @@ def threshold_keyboard(current: int | None = None) -> InlineKeyboardMarkup:
         InlineKeyboardButton(
             text=(
                 ("\u2705 " if t == current else "")
-                + ("Khali hole" if t == 0 else f"{t:,} baki")
+                + ("When empty" if t == 0 else f"{t:,} left")
             ),
             callback_data=f"{PREFIX}:thr:{t}",
         )
@@ -74,7 +175,7 @@ def threshold_keyboard(current: int | None = None) -> InlineKeyboardMarkup:
     rows = _rows(buttons, per_row=3)
     rows.append([
         InlineKeyboardButton(
-            text="\u270F\uFE0F Onno number (custom)", callback_data=f"{PREFIX}:thrc:"
+            text="\u270F\uFE0F Custom", callback_data=f"{PREFIX}:thrc:"
         )
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -115,12 +216,12 @@ def control_keyboard(enabled: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="\u23F0 Off at", callback_data=f"{PREFIX}:ask_stopall:"),
         ],
         [
-            InlineKeyboardButton(text="\u23F3 Koto somoy", callback_data=f"{PREFIX}:ask_runall:"),
+            InlineKeyboardButton(text="\u23F3 Run time", callback_data=f"{PREFIX}:ask_runall:"),
             InlineKeyboardButton(text="\U0001F9F9 Cleanup", callback_data=f"{PREFIX}:ask_clean:"),
         ],
         [
             InlineKeyboardButton(text="\U0001F4D0 Presets", callback_data=f"{PREFIX}:ask_preset:"),
-            InlineKeyboardButton(text="\U0001F5D1 File delete", callback_data=f"{PREFIX}:ask_del1:"),
+            InlineKeyboardButton(text="\U0001F5D1 Delete file", callback_data=f"{PREFIX}:ask_del1:"),
         ],
         [
             InlineKeyboardButton(
@@ -136,11 +237,11 @@ def control_keyboard(enabled: bool) -> InlineKeyboardMarkup:
 
 
 def country_keyboard(entries: list[dict[str, Any]], action: str) -> InlineKeyboardMarkup | None:
-    """One button per country, carrying a short index rather than the name.
+    """One button per country, carrying a short key rather than the name.
 
     Country names are unbounded and often non-ASCII, and callback_data is
-    capped at 64 bytes, so the index is resolved back to a name by the
-    handler against the same ordering.
+    capped at 64 bytes, so the key is resolved back to a name by the
+    handler (see country_key for why it is not the list position).
     """
     seen: list[str] = []
     for entry in entries:
@@ -150,8 +251,10 @@ def country_keyboard(entries: list[dict[str, Any]], action: str) -> InlineKeyboa
     if not seen:
         return None
     buttons = [
-        InlineKeyboardButton(text=country, callback_data=f"{PREFIX}:{action}:{index}")
-        for index, country in enumerate(seen)
+        InlineKeyboardButton(
+            text=country, callback_data=f"{PREFIX}:{action}:{country_key(country)}"
+        )
+        for country in seen
     ]
     return InlineKeyboardMarkup(inline_keyboard=_rows(buttons, per_row=2))
 
@@ -168,7 +271,7 @@ def country_names(entries: list[dict[str, Any]]) -> list[str]:
     return seen
 
 
-def preset_keyboard(names: list[str], country_index: int) -> InlineKeyboardMarkup:
+def preset_keyboard(names: list[str], country_index: int | str) -> InlineKeyboardMarkup:
     buttons = [
         InlineKeyboardButton(
             text=name, callback_data=f"{PREFIX}:usepre:{country_index}:{index}"
@@ -178,7 +281,7 @@ def preset_keyboard(names: list[str], country_index: int) -> InlineKeyboardMarku
     return InlineKeyboardMarkup(inline_keyboard=_rows(buttons, per_row=2))
 
 
-def country_interval_keyboard(country_index: int, current: int | None) -> InlineKeyboardMarkup:
+def country_interval_keyboard(country_index: int | str, current: int | None) -> InlineKeyboardMarkup:
     buttons = [
         InlineKeyboardButton(
             text=(f"\u2705 {m} min" if m == current else f"{m} min"),
@@ -191,20 +294,20 @@ def country_interval_keyboard(country_index: int, current: int | None) -> Inline
     # owner cannot pick 7 or 90 minutes from Telegram at all.
     rows.append([
         InlineKeyboardButton(
-            text="\u270F\uFE0F Onno somoy (custom)",
+            text="\u270F\uFE0F Custom",
             callback_data=f"{PREFIX}:cintc:{country_index}",
         )
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def country_threshold_keyboard(country_index: int, current: int | None) -> InlineKeyboardMarkup:
+def country_threshold_keyboard(country_index: int | str, current: int | None) -> InlineKeyboardMarkup:
     """When to restock this country - by numbers left, not only at zero."""
     buttons = [
         InlineKeyboardButton(
             text=(
                 ("\u2705 " if t == current else "")
-                + ("Khali hole" if t == 0 else f"{t:,} baki")
+                + ("When empty" if t == 0 else f"{t:,} left")
             ),
             callback_data=f"{PREFIX}:cthr:{country_index}:{t}",
         )
@@ -213,50 +316,50 @@ def country_threshold_keyboard(country_index: int, current: int | None) -> Inlin
     rows = _rows(buttons, per_row=3)
     rows.append([
         InlineKeyboardButton(
-            text="\u270F\uFE0F Onno number (custom)",
+            text="\u270F\uFE0F Custom",
             callback_data=f"{PREFIX}:cthrc:{country_index}",
         )
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def country_field_keyboard(country_index: int, country: str, paused: bool = False) -> InlineKeyboardMarkup:
+def country_field_keyboard(country_index: int | str, country: str, paused: bool = False) -> InlineKeyboardMarkup:
     """What about this country do you want to change?"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
-                text=("\u25B6\uFE0F Chalu koro" if paused else "\u23F8 Off koro"),
+                text=("\u25B6\uFE0F Resume" if paused else "\u23F8 Pause"),
                 callback_data=f"{PREFIX}:cpause:{country_index}",
             ),
             InlineKeyboardButton(
-                text="\U0001F5D1 Bad dao", callback_data=f"{PREFIX}:rmc2:{country_index}"
+                text="\U0001F5D1 Remove", callback_data=f"{PREFIX}:rmc2:{country_index}"
             ),
         ],
         [
             InlineKeyboardButton(
-                text="\u23F1 Koto por por check",
+                text="\u23F1 Check interval",
                 callback_data=f"{PREFIX}:pickc:{country_index}",
             ),
         ],
         [
             InlineKeyboardButton(
-                text="\U0001F4E6 Koto baki thakte restock",
+                text="\U0001F4E6 Restock at",
                 callback_data=f"{PREFIX}:pickt:{country_index}",
             ),
         ],
         [
             InlineKeyboardButton(
-                text="\u25B6\uFE0F Kokhon shuru hobe",
+                text="\u23F0 Start time",
                 callback_data=f"{PREFIX}:pickstart:{country_index}",
             ),
             InlineKeyboardButton(
-                text="\u23F0 Kokhon off hobe",
+                text="\U0001F6D1 Stop time",
                 callback_data=f"{PREFIX}:pickst:{country_index}",
             ),
         ],
         [
             InlineKeyboardButton(
-                text="\u23F3 Koto somoy cholbe",
+                text="\u23F3 Run time",
                 callback_data=f"{PREFIX}:pickrt:{country_index}",
             ),
         ],
@@ -301,7 +404,7 @@ def file_delete_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=_rows(buttons, per_row=1))
 
 
-def stop_time_keyboard(country_index: int, current: str = "") -> InlineKeyboardMarkup:
+def stop_time_keyboard(country_index: int | str, current: str = "") -> InlineKeyboardMarkup:
     """Common stop times, in Dubai time - plus a custom option and 'never'."""
     choices = ("06:00", "09:00", "12:00", "18:00", "21:00", "23:30")
     buttons = [
@@ -314,17 +417,17 @@ def stop_time_keyboard(country_index: int, current: str = "") -> InlineKeyboardM
     rows = _rows(buttons, per_row=3)
     rows.append([
         InlineKeyboardButton(
-            text="\u270F\uFE0F Onno time", callback_data=f"{PREFIX}:cstopc:{country_index}"
+            text="\u270F\uFE0F Other time", callback_data=f"{PREFIX}:cstopc:{country_index}"
         ),
         InlineKeyboardButton(
-            text=("\u2705 Kokhono na" if not current else "\u267E\uFE0F Kokhono na"),
+            text=("\u2705 Never" if not current else "\u267E\uFE0F Never"),
             callback_data=f"{PREFIX}:cstop:{country_index}:never",
         ),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def start_time_keyboard(country_index: int, current: str = "") -> InlineKeyboardMarkup:
+def start_time_keyboard(country_index: int | str, current: str = "") -> InlineKeyboardMarkup:
     """When should this country BEGIN, in Dubai time.
 
     Index -1 sets the global default every country inherits, matching how the
@@ -341,10 +444,10 @@ def start_time_keyboard(country_index: int, current: str = "") -> InlineKeyboard
     rows = _rows(buttons, per_row=3)
     rows.append([
         InlineKeyboardButton(
-            text="\u270F\uFE0F Onno time", callback_data=f"{PREFIX}:cstartc:{country_index}"
+            text="\u270F\uFE0F Other time", callback_data=f"{PREFIX}:cstartc:{country_index}"
         ),
         InlineKeyboardButton(
-            text=("\u2705 Ekhoni" if not current else "\u25B6\uFE0F Ekhoni"),
+            text=("\u2705 Now" if not current else "\u25B6\uFE0F Now"),
             callback_data=f"{PREFIX}:cstart:{country_index}:now",
         ),
     ])
@@ -364,16 +467,16 @@ def runtime_keyboard() -> InlineKeyboardMarkup:
     rows = _rows(buttons, per_row=3)
     rows.append([
         InlineKeyboardButton(
-            text="\u270F\uFE0F Onno somoy", callback_data=f"{PREFIX}:rtc:"
+            text="\u270F\uFE0F Other", callback_data=f"{PREFIX}:rtc:"
         ),
         InlineKeyboardButton(
-            text="\u267E\uFE0F Limit nai", callback_data=f"{PREFIX}:rt:0"
+            text="\u267E\uFE0F No limit", callback_data=f"{PREFIX}:rt:0"
         ),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def country_runtime_keyboard(country_index: int, current: int | None) -> InlineKeyboardMarkup:
+def country_runtime_keyboard(country_index: int | str, current: int | None) -> InlineKeyboardMarkup:
     """Same choices, for one already-running country."""
     buttons = [
         InlineKeyboardButton(
@@ -389,10 +492,10 @@ def country_runtime_keyboard(country_index: int, current: int | None) -> InlineK
     rows = _rows(buttons, per_row=3)
     rows.append([
         InlineKeyboardButton(
-            text="\u270F\uFE0F Onno somoy", callback_data=f"{PREFIX}:crtc:{country_index}"
+            text="\u270F\uFE0F Other", callback_data=f"{PREFIX}:crtc:{country_index}"
         ),
         InlineKeyboardButton(
-            text=("\u2705 Limit nai" if not current else "\u267E\uFE0F Limit nai"),
+            text=("\u2705 No limit" if not current else "\u267E\uFE0F No limit"),
             callback_data=f"{PREFIX}:crt:{country_index}:0",
         ),
     ])
@@ -407,9 +510,9 @@ def country_toggle_keyboard(entries: list[dict[str, Any]], paused: set[str]) -> 
     buttons = [
         InlineKeyboardButton(
             text=("\u23F8 " if country not in paused else "\u25B6\uFE0F ") + country,
-            callback_data=f"{PREFIX}:cpause:{index}",
+            callback_data=f"{PREFIX}:cpause:{country_key(country)}",
         )
-        for index, country in enumerate(names)
+        for country in names
     ]
     return InlineKeyboardMarkup(inline_keyboard=_rows(buttons, per_row=2))
 
@@ -434,87 +537,209 @@ def removal_keyboard(entries: list[dict[str, Any]]) -> InlineKeyboardMarkup | No
     ]
     return InlineKeyboardMarkup(inline_keyboard=_rows(buttons, per_row=2))
 
+# --------------------------------------------------------------------------- #
+# Status panel (Telegram HTML)
+# --------------------------------------------------------------------------- #
+# Short ASCII codes, not emoji, inside the table: an emoji is two cells wide
+# in some monospace fonts and one in others, which knocks every column after
+# it out of line. Explained by a legend under the table instead.
+STATE_LEGEND = {
+    "RUN": "running",
+    "OFF": "turned off",
+    "WAIT": "waiting for its start time",
+    "HELD": "held back",
+    "DONE": "finished",
+    "USED": "file used up - send a new one",
+}
+_COUNTRY_WIDTH = 14
+
+
+def _short_country(name: str) -> str:
+    flat = " ".join(name.split())
+    return flat if len(flat) <= _COUNTRY_WIDTH else flat[: _COUNTRY_WIDTH - 1] + "."
+
+
+def _number(value: Any) -> str:
+    return "-" if value is None else f"{int(value):,}"
+
+
+def _span(minutes: Any) -> str:
+    """Compact duration for one table cell: 90 -> '1h30m', 2880 -> '2d'."""
+    minutes = int(minutes or 0)
+    if minutes <= 0:
+        return "-"
+    days, rest = divmod(minutes, 1440)
+    hours, mins = divmod(rest, 60)
+    return (f"{days}d" if days else "") + (f"{hours}h" if hours else "") + (
+        f"{mins}m" if mins else ""
+    )
+
+
+def _dubai_hhmm(when: Any) -> str:
+    from datetime import datetime
+
+    from app.automation import otp_schedule
+
+    try:
+        moment = when if isinstance(when, datetime) else datetime.fromisoformat(str(when))
+        return moment.astimezone(otp_schedule.DUBAI_TZ).strftime("%H:%M")
+    except (TypeError, ValueError):
+        return "?"
+
+
+def html_to_plain(text: str) -> str:
+    """The same status for places that show text as-is (web chat, history)."""
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+async def _country_rows(
+    active: list[dict[str, Any]], config: dict[str, Any], stock: dict[str, int]
+) -> list[tuple[str, ...]]:
+    """One table row per running country: state, name, sizes, timing."""
+    from app.automation import otp_schedule
+
+    overview = {
+        row["country"]: row
+        for row in await otp_schedule.schedule_overview(
+            [e.get("country") or e["name"] for e in active], config
+        )
+    }
+    rows: list[tuple[str, ...]] = []
+    for entry in active:
+        country = entry.get("country") or entry["name"]
+        row = overview.get(country, {})
+        # A finished country is also paused, so finished is checked first -
+        # "DONE" says more than "OFF" about why nothing is happening.
+        if entry.get("finished_at"):
+            state, upcoming = "DONE", "done"
+        elif entry.get("exhausted_at"):
+            state, upcoming = "USED", "new file"
+        elif row.get("paused"):
+            state, upcoming = "OFF", "paused"
+        elif not await otp_schedule.has_started(country, config):
+            # Not running yet - "next in 5m" for a country that will not
+            # touch the bot until 21:00 would simply be false.
+            begins = await otp_schedule.pending_start_at(country, config)
+            state = "WAIT"
+            upcoming = _dubai_hhmm(begins) if begins else str(row.get("start_at") or "?")
+        elif entry.get("held"):
+            state, upcoming = "HELD", "held"
+        else:
+            due = row.get("due_in_seconds")
+            state = "RUN"
+            upcoming = "now" if due is None or due <= 0 else _span(max(1, due // 60))
+        every = _span(row.get("interval_minutes") or config.get("interval_minutes"))
+        if row.get("customised"):
+            every += "*"
+        ends = str(row.get("stop_at") or "") or _span(row.get("run_minutes"))
+        have = otp_bot._stock_for(stock, country) if stock else None
+        rows.append((
+            state, _short_country(country), _number(entry.get("count") or 0),
+            _number(have), every, ends, upcoming,
+        ))
+    return rows
+
+
+def _table_line(cells: tuple[str, ...]) -> str:
+    state, country, size, have, every, ends, upcoming = cells
+    return (
+        f"{state:<4} {country:<{_COUNTRY_WIDTH}} {size:>7} {have:>7} "
+        f"{every:<6} {ends:<6} {upcoming}"
+    ).rstrip()
+
 
 async def status_text() -> str:
-    """One compact summary of everything the panel can change."""
+    """The panel, as Telegram HTML: a summary, then one table row per country.
+
+    Send it with parse_mode="HTML". Every value that comes from the owner or
+    the target bot is escaped - a country or bot reply containing "<" or "&"
+    would otherwise make Telegram reject the whole message. It always fits
+    in ONE message: rows that do not fit become "+N more", because a status
+    that is too long is not shortened by Telegram but refused outright.
+    """
     from app.automation import otp_schedule
 
     config = await otp_bot.get_config()
     queue = await otp_bot.get_queue()
     active = await otp_bot.get_active_files()
     last = await otp_bot.get_last_result()
+    esc = html.escape
 
-    lines = [
-        "\U0001F501 OTP-bot automation",
-        f"\U0001F551 {otp_schedule.clock_now()['dubai_full']}",
+    threshold = int(config.get("quota_threshold") or 0)
+    restock = f"{threshold:,} left" if threshold else "when empty"
+    cleanup_command = str(config.get("cleanup_command") or "").strip()
+    if config.get("force_delete_before_add"):
+        cleanup = "wipe country first (/frcd)"
+    elif cleanup_command:
+        cleanup = f"used/expired only ({cleanup_command})"
+    else:
+        cleanup = "nothing deleted before adding"
+    if last:
+        last_check = (
+            f"{'OK' if last.get('ok') else 'FAILED'} - {last.get('action') or '?'}"
+            f" at {_dubai_hhmm(last.get('ran_at'))}"
+        )
+    else:
+        last_check = "not yet"
+
+    head = [
+        "<b>\U0001F501 OTP-bot automation</b>",
+        f"\U0001F551 {esc(otp_schedule.clock_now()['dubai_full'])}",
         "",
-        f"Running: {'yes' if config['enabled'] else 'no'}",
-        f"Target: {config['target_bot']}",
-        f"Stock check: {config['quota_command']}",
-        f"Restock when: {'khali hole' if not config['quota_threshold'] else str(config['quota_threshold']) + ' baki'}",
-        f"Cleanup: {'wipe country first (/frcd)' if config.get('force_delete_before_add') else 'used/expired only'}",
+        f"<b>Running:</b> {'yes' if config.get('enabled') else 'no'}",
+        f"<b>Target bot:</b> {esc(str(config.get('target_bot') or ''))}",
+        f"<b>Stock command:</b> {esc(str(config.get('quota_command') or ''))}",
+        f"<b>Restock point:</b> {esc(restock)}",
+        f"<b>Cleanup mode:</b> {esc(cleanup)}",
+        f"<b>Last check:</b> {esc(last_check)}",
+    ]
+    if last and last.get("error"):
+        head.append(f"<b>Error:</b> {esc(str(last['error'])[:200])}")
+
+    stock = dict((last or {}).get("country_stock") or {})
+    rows = await _country_rows(active, config, stock) if active else []
+    header = ("St", "Country", "File", "Stock", "Every", "Ends", "Next")
+    legend = [f"{code} {meaning}" for code, meaning in STATE_LEGEND.items()
+              if any(r[0] == code for r in rows)]
+    if any(r[4].endswith("*") for r in rows):
+        legend.append("* custom settings")
+    queue_lines = [
+        f"\u2022 {esc(e.get('country') or e['name'])} "
+        f"({_number(e.get('count') or 0)}) - {esc(e.get('tag') or 'no service yet')}"
+        for e in queue
     ]
 
-    if active:
-        # Per-country, because that is now the unit of scheduling: each has
-        # its own interval and its own next-run time.
-        overview = {
-            row["country"]: row
-            for row in await otp_schedule.schedule_overview(
-                [e.get("country") or e["name"] for e in active], config
-            )
-        }
-        lines += ["", "Running now:"]
-        for entry in active:
-            country = entry.get("country") or entry["name"]
-            row = overview.get(country, {})
-            due = row.get("due_in_seconds")
-            when = "due now" if due is None or due <= 0 else f"in {max(1, due // 60)}m"
-            mark = " *" if row.get("customised") else ""
-            restock = (
-                "khali hole" if not row.get("quota_threshold")
-                else f"{row['quota_threshold']} baki"
-            )
-            state = "\u23F8 OFF" if row.get("paused") else "\u25B6\uFE0F on"
-            stop_at = f", off at {row['stop_at']}" if row.get("stop_at") else ""
-            run_for = (
-                f", {otp_bot.format_run_minutes(row['run_minutes'])} cholbe"
-                if row.get("run_minutes") else ""
-            )
-            if row.get("waiting_to_start"):
-                # Not running yet - saying "next in 5m" for a country that
-                # will not touch the bot until 21:00 is simply false.
-                state = "\u23F0 WAIT"
-                when = f"starts {row.get('start_at')}"
-            lines.append(
-                f"  {state} {country} ({entry.get('count') or 0})"
-                f" - {entry.get('tag') or 'General'}"
-                f" | every {row.get('interval_minutes')}m, restock {restock}"
-                f"{stop_at}{run_for}, next {when}{mark}"
-            )
-        if any(overview.get(c, {}).get("customised") for c in overview):
-            lines.append("  (* = custom settings for that country)")
+    def render(shown_rows: int, shown_queue: int) -> str:
+        out = list(head)
+        if rows:
+            body = [_table_line(header)] + [_table_line(r) for r in rows[:shown_rows]]
+            if shown_rows < len(rows):
+                body.append(f"+{len(rows) - shown_rows} more")
+            # Padded on the raw text, escaped afterwards: escaping first
+            # would count "&amp;" as five characters and skew the column.
+            out += [
+                "",
+                f"<b>Running now ({len(rows)})</b>",
+                "<pre>" + esc("\n".join(body)) + "</pre>",
+                "<i>" + esc(" \u00B7 ".join(legend)) + "</i>",
+            ]
+        if queue_lines:
+            out += ["", f"<b>Waiting to start ({len(queue_lines)})</b>"]
+            out += queue_lines[:shown_queue]
+            if shown_queue < len(queue_lines):
+                out.append(f"+{len(queue_lines) - shown_queue} more")
+        if not rows and not queue_lines:
+            out += ["", "Nothing queued or running - send a numbers file here."]
+        return "\n".join(out)
 
-    if queue:
-        lines += ["", "Waiting to start:"]
-        lines += [
-            f"  {e.get('country') or e['name']} ({e.get('count') or 0})"
-            f" - {e.get('tag') or 'no service yet'}"
-            for e in queue
-        ]
-    if not active and not queue:
-        lines += ["", "Nothing queued or running - send a numbers file here."]
-
-    if last:
-        outcome = "ok" if last.get("ok") else "FAILED"
-        lines += ["", f"Last check: {outcome} ({last.get('action', '')})"]
-        stock = last.get("country_stock") or {}
-        if stock:
-            lines.append("Live stock:")
-            lines += [f"  {name}: {count}" for name, count in stock.items()]
-        elif last.get("active_quota") is not None:
-            lines.append(f"Quota then: {last['active_quota']}")
-        if last.get("error"):
-            lines.append(f"Error: {last['error'][:200]}")
-
-    return "\n".join(lines)
+    shown_rows, shown_queue = len(rows), len(queue_lines)
+    text = render(shown_rows, shown_queue)
+    # The waiting list goes first: what is running is what the owner opened
+    # the panel to see.
+    while len(text) > MESSAGE_LIMIT and (shown_rows or shown_queue):
+        if shown_queue:
+            shown_queue -= 1
+        else:
+            shown_rows -= 1
+        text = render(shown_rows, shown_queue)
+    return text

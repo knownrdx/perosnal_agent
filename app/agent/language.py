@@ -1,4 +1,4 @@
-"""Reply in whatever language the owner wrote in.
+"""Understand any language the owner writes in; always answer in English.
 
 Two different problems live here, and conflating them is why the bot only
 ever worked in English:
@@ -8,26 +8,30 @@ ever worked in English:
    Latin-text patterns. A message in another script matches nothing and
    falls through to the model - which is the opposite of the point, since
    those triggers exist precisely so the bot keeps working when the model is
-   down. Handled for Bengali by app/agent/bangla.py, which transliterates
-   into the Banglish the patterns already match.
+   down. Handled for Bengali by app/agent/bangla.py (via :func:`normalise`),
+   which transliterates into the Banglish the patterns already match.
 
-2. ANSWERING in the same language the owner used. That is this module. It
-   does NOT try to translate anything - it tells the model what it is
-   looking at and to match it. Modern models are good at this when asked
-   explicitly and bad at it when left to guess, and the failure mode when
-   they guess (a Bengali question answered in Hindi, or an English question
-   answered in Bengali) is exactly what the owner saw.
+2. ANSWERING. The owner writes English, Banglish and Bengali script, but
+   wants every reply in English - one language he can skim on a phone,
+   whatever he typed. The standing rule lives in app/llm/prompts.py
+   (REPLY_STYLE). This module adds the per-message nudge: models mirror the
+   language of the message in front of them very strongly, so for a
+   non-English message the model is told what it is reading AND that the
+   answer is still English. Left unprompted, a Bengali question comes back in
+   Bengali (or Hindi) no matter what the system prompt said earlier.
 
 Detection is script-first because that is unambiguous and free. Romanised
 languages that share the Latin alphabet cannot be told apart by script, so
-for those the model is simply told "match the owner's language" and left to
-recognise it - which it does reliably, being the one thing it is good at.
+Banglish is recognised by its function words instead.
 """
 
 from __future__ import annotations
 
 import re
 import unicodedata
+
+# The one language every reply is written in, whatever the owner typed.
+REPLY_LANGUAGE = "English"
 
 # Unicode block -> the name a model will recognise. Ordered by how likely the
 # owner is to use them; ties do not matter because detection counts characters.
@@ -104,7 +108,8 @@ def detect(text: str) -> str:
 
     # A non-Latin script wins even when Latin characters outnumber it: a
     # message mixing English technical words with Bengali is a Bengali
-    # message, and answering it in English is the complaint, not the fix.
+    # message, and that is exactly when the model needs the reminder that
+    # the answer is still English.
     non_latin = {name: n for name, n in counts.items() if name != "Latin"}
     if non_latin:
         name = max(non_latin, key=lambda key: non_latin[key])
@@ -119,39 +124,35 @@ def detect(text: str) -> str:
         return "Banglish (Bengali written in Latin letters)"
     if not words:
         # Digits, punctuation, emoji or unit suffixes ("20h", "06:00", "ok?"):
-        # there is no language here to match, and forcing one onto a reply to
-        # a bare number is worse than saying nothing. Single letters do not
-        # count as words for exactly this reason - "20h" is a duration.
+        # there is no language here to name. Single letters do not count as
+        # words for exactly this reason - "20h" is a duration.
         return ""
     return "English"
 
 
 def directive(text: str) -> str:
-    """A system-prompt line telling the model which language to answer in.
+    """A per-message system line: what the owner wrote in, answered in English.
 
-    Empty when the message gives no signal, so nothing is forced onto a bare
-    "ok" or a number.
+    The standing English-only rule is REPLY_STYLE in app/llm/prompts.py. This
+    is the reminder placed right beside the message, because models mirror
+    the language in front of them and a rule stated once at the top loses to
+    a Bengali question at the bottom. Naming the language also tells the model
+    that "bot ta ki cholche" is Bengali to be understood, not noise.
+
+    Empty for English (nothing to steer away from) and for a message with no
+    words in it, like "20h".
     """
     language = detect(text)
-    if not language:
+    if not language or language == REPLY_LANGUAGE:
         return ""
 
     if language.startswith("Banglish"):
-        return (
-            "The owner wrote in Banglish - Bengali speech typed in Latin "
-            "letters. Reply in Banglish too, Latin letters only (never "
-            "Bengali script, never Hindi or Urdu words). Keep technical "
-            "words in English: file, server, bot, restart, error. "
-            "English is acceptable if you cannot phrase it naturally in "
-            "Banglish - but never switch to a third language."
-        )
-    if language == "English":
-        return "The owner wrote in English. Reply in English."
+        language = "Banglish (Bengali typed in Latin letters)"
     return (
-        f"The owner wrote in {language}. Reply in {language}, in the same "
-        "script they used. Keep technical terms in English where that is "
-        "how they are normally written. English is acceptable if you cannot "
-        "phrase it naturally - but never switch to a third language."
+        f"The owner's message is in {language}. Understand it fully, but "
+        f"reply in {REPLY_LANGUAGE} only - clear, friendly {REPLY_LANGUAGE}. "
+        "Do not answer in Bengali script, Banglish, Hindi or any other "
+        "language, even though the message is not in English."
     )
 
 

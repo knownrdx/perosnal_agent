@@ -7,7 +7,9 @@ Two separate promises are tested here:
    exist so the bot works when the model is down, and until now a message in
    Bengali script matched none of them and was handed to the very model they
    are meant to bypass.
-2. The model is TOLD which language to answer in, rather than left to guess.
+2. Whatever he writes in - English, Banglish, Bengali script - the answer
+   comes back in English. The model is told so, both in the standing prompt
+   and right beside a non-English message, and the canned replies are English.
 """
 
 import pytest
@@ -63,15 +65,27 @@ def test_a_few_bengali_words_beat_many_english_ones():
     assert language.detect("please restart the server এখন করো") == "Bengali"
 
 
-def test_the_directive_names_the_language_and_forbids_a_third():
-    """Naming it is the point; a Bengali question must not come back in Hindi."""
-    assert "Bengali" in language.directive("বট টা কি চলছে")
-    assert "Arabic" in language.directive("قم بإنشاء ملف")
-    assert "Banglish" in language.directive("bot ta ki cholche")
-    # English needs no warning - there is no third language to drift into
-    # when the reply language is the model's default.
-    for text in ("বট টা কি চলছে", "قم بإنشاء ملف", "bot ta ki cholche"):
-        assert "third language" in language.directive(text)
+def test_the_directive_names_the_language_but_asks_for_english():
+    """The model must know what it is reading - and still answer in English."""
+    cases = {
+        "বট টা কি চলছে": "Bengali",
+        "قم بإنشاء ملف": "Arabic",
+        "bot ta ki cholche": "Banglish",
+    }
+    for text, named in cases.items():
+        line = language.directive(text)
+        assert named in line, text
+        assert "reply in English only" in line, text
+        # The old mirror-the-owner instruction must be gone for good.
+        assert f"Reply in {named}" not in line, text
+        assert "third language" not in line, text
+
+
+def test_english_needs_no_directive():
+    """English is already the reply language; there is nothing to steer."""
+    assert language.REPLY_LANGUAGE == "English"
+    assert language.directive("please send me the report") == ""
+    assert language.directive("is the bot running?") == ""
 
 
 # --------------------------------------------------------------------- #
@@ -226,3 +240,113 @@ def test_the_existing_banglish_captions_are_unchanged():
         "tag": "IMO", "country": "Uganda", "run_minutes": 720,
     }
     assert parse_caption("") == {}
+
+
+# --------------------------------------------------------------------- #
+# replies: understood in any language, always answered in English
+# --------------------------------------------------------------------- #
+
+class _RecordingLLM:
+    """Records what the model was sent; answers with a fixed line or fails."""
+
+    def __init__(self, reply: str = "All good.", error: Exception | None = None):
+        self.reply = reply
+        self.error = error
+        self.calls: list[list] = []
+
+    async def chat(self, messages, *, temperature=None):
+        from app.llm.base import LLMResponse
+
+        self.calls.append(messages)
+        if self.error is not None:
+            raise self.error
+        return LLMResponse(content=self.reply, model="fake")
+
+
+def _system_text(messages) -> str:
+    return "\n".join(m.content for m in messages if m.role == "system")
+
+
+def test_every_owner_facing_prompt_says_english_always():
+    """Chat, task reports and the briefing all carry the same rule."""
+    from app.agent.briefing import NARRATIVE_SYSTEM
+    from app.agent.conversation import CHAT_PROMPT
+    from app.llm import prompts
+
+    style = prompts.REPLY_STYLE
+    assert "ALWAYS reply in English" in style
+    assert "Banglish" in style and "Bengali script" in style   # still understood
+    assert "•" in style                                    # Telegram bullets
+    assert "No markdown" in style                               # plain-text sends
+
+    assert style in CHAT_PROMPT
+    assert "always answer in English" in CHAT_PROMPT
+    assert style in prompts.SYSTEM_PROMPT
+    assert "final_answer and question are ALWAYS in English" in prompts.SYSTEM_PROMPT
+    assert "in English" in prompts.PLANNER_PROMPT
+    assert "Write in English, always" in NARRATIVE_SYSTEM
+
+
+def test_the_task_context_ends_with_the_english_reminder():
+    """The last thing the engine reads before deciding is the reply language."""
+    from app.llm.prompts import render_context
+
+    text = render_context(
+        task_id="t1", user_request="ekta report banao", step=1, max_steps=8,
+        history=[], memories=[], conversation=[],
+    )
+    assert text.rstrip().endswith("Write final_answer and question in English.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, named",
+    [
+        ("বট টা কি এখন চলছে?", "Bengali"),
+        ("tumi ki korte paro amar jonno", "Banglish"),
+    ],
+)
+async def test_a_non_english_chat_message_is_answered_in_english(text, named):
+    from app.agent.conversation import chat_reply
+
+    llm = _RecordingLLM(reply="Yes, it's running.")
+    answer = await chat_reply(42, text, llm=llm)
+
+    assert answer == "Yes, it's running."
+    sent = llm.calls[0]
+    system = _system_text(sent)
+    assert "ALWAYS reply in English" in system
+    assert f"owner's message is in {named}" in system
+    assert "reply in English only" in system
+    assert f"Reply in {named}" not in system
+    # Understanding is untouched: the owner's words reach the model as written.
+    assert sent[-1].role == "user" and sent[-1].content == text
+
+
+@pytest.mark.asyncio
+async def test_an_english_chat_message_gets_no_extra_directive():
+    from app.agent.conversation import CHAT_PROMPT, chat_reply
+
+    llm = _RecordingLLM()
+    await chat_reply(42, "what can you do for me?", llm=llm)
+    system_messages = [m for m in llm.calls[0] if m.role == "system"]
+    assert system_messages[0].content == CHAT_PROMPT
+    assert not any("owner's message is in" in m.content for m in system_messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    ["kemon acho, bot ta ki cholche?", "বট টা কি চলছে", "how are you?"],
+)
+async def test_the_model_down_reply_is_english_whatever_was_asked(text):
+    """The one reply guaranteed to arrive when every model is down."""
+    from app.agent.conversation import MODEL_DOWN_REPLY, chat_reply
+    from app.llm import LLMError
+
+    answer = await chat_reply(42, text, llm=_RecordingLLM(error=LLMError("down")))
+
+    assert answer == MODEL_DOWN_REPLY
+    assert "couldn't reach the model" in answer and "/status" in answer
+    assert not bangla.has_bengali(answer)
+    assert not language.detect(answer).startswith("Banglish")

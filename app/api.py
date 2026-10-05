@@ -271,6 +271,11 @@ def create_app() -> FastAPI:
         snapshot = await health_snapshot()
         if not snapshot["checks"]["database"]["ok"]:
             raise HTTPException(status_code=503, detail="database unavailable")
+        # A dead scheduler loop means the OTP refills have silently stopped;
+        # the container must stop looking healthy when that happens.
+        scheduler = snapshot["checks"].get("scheduler") or {"ok": True}
+        if not scheduler["ok"]:
+            raise HTTPException(status_code=503, detail=scheduler.get("error", "scheduler stopped"))
         return {"status": "ready"}
 
     # --- web UI session auth -------------------------------------------- #
@@ -644,7 +649,8 @@ def create_app() -> FastAPI:
                 status_code=400, detail=f"level must be one of: {', '.join(sorted(valid))}"
             )
         async with session_scope() as session:
-            await repo.set_setting(session, "autonomy_level", level)
+            # A bare string: read back at boot by get_setting_value.
+            await repo.set_setting_value(session, "autonomy_level", level)
         get_settings().autonomy_level = level
         return {"level": level}
 
@@ -822,11 +828,28 @@ def create_app() -> FastAPI:
                 out.write(chunk)
 
         rel = rel_path(target)
+        from app.automation import otp_bot
+
+        in_otp_thread = await otp_bot.is_otp_thread(chat_id)
+        if in_otp_thread:
+            from app.telegram import otp_panel
+
+            # Same check as the Telegram handler: a spreadsheet or an empty
+            # file is not a list of numbers, and queued anyway it became
+            # "Unknown" noise that auto-start sent to the target bot.
+            problem = otp_panel.upload_problem(target.read_bytes())
+            if problem:
+                raise HTTPException(status_code=400, detail=problem)
+
         async with session_scope() as session:
             row = await repo.ensure_session(session, chat_id)
-            ctx = dict(row.context or {})
-            ctx["pending_upload"] = {"path": rel, "name": safe_name}
-            await repo.update_session(session, chat_id, context=ctx)
+            if not in_otp_thread:
+                # An OTP-thread upload is already queued for the bot; left as
+                # pending_upload too, it was attached to the owner's next
+                # unrelated job as well.
+                ctx = dict(row.context or {})
+                ctx["pending_upload"] = {"path": rel, "name": safe_name}
+                await repo.update_session(session, chat_id, context=ctx)
             # Record the upload as a visible chat message too - otherwise it
             # only lived in invisible session context and disappeared the
             # moment history reloaded, looking like the upload never happened.
@@ -836,8 +859,6 @@ def create_app() -> FastAPI:
                 thread_id=row.current_thread_id,
             )
 
-        from app.automation import otp_bot
-
         # Only files dropped into the dedicated OTP thread join its queue -
         # elsewhere an upload is just an attachment for the next instruction.
         queued = False
@@ -845,7 +866,7 @@ def create_app() -> FastAPI:
         caption_note = ""
         needs_run_time: dict[str, Any] | None = None
         auto_started: dict[str, Any] | None = None
-        if await otp_bot.is_otp_thread(chat_id):
+        if in_otp_thread:
             analysis = await otp_bot.enqueue_file(rel, safe_name, caption)
             countries = analysis["countries"]
             caption_note = analysis.get("caption_note", "")
@@ -1100,7 +1121,15 @@ def create_app() -> FastAPI:
                     values[field] = otp_schedule.parse_stop_time(values[field])
                 except ValueError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Pausing goes through set_paused so resuming does its bookkeeping
+        # (re-arm, fresh run for a finished country). Clearing it (null)
+        # resumes too, then drops the override.
+        paused = values.pop("paused", ...)
         applied = await otp_schedule.set_country_settings(country, values)
+        if paused is not ...:
+            applied = await otp_schedule.set_paused(country, bool(paused))
+            if paused is None:
+                applied = await otp_schedule.set_country_settings(country, {"paused": None})
         if "interval_minutes" in values and values["interval_minutes"]:
             await otp_schedule.arm_country(country, int(values["interval_minutes"]))
         cfg = await otp_bot.get_config()

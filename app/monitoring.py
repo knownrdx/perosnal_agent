@@ -73,18 +73,51 @@ def resources() -> dict[str, Any]:
         return {"error": str(exc)[:200]}
 
 
+def _alive(task: Any) -> bool:
+    """A task object existing says nothing about whether it still runs.
+
+    A loop that crashed (or returned) leaves its finished Task behind, so
+    checking "is not None" kept reporting a dead scheduler as running - the
+    one state where /status most needs to tell the truth.
+    """
+    return task is not None and not task.done()
+
+
 def workers_state() -> dict[str, Any]:
     worker = RUNTIME.get("worker")
     scheduler = RUNTIME.get("scheduler")
     bot = RUNTIME.get("bot")
     running = []
-    if worker is not None and getattr(worker, "_tasks", None):
-        running.append(f"task_worker x{len(worker._tasks)}")
-    if scheduler is not None and getattr(scheduler, "_task", None) is not None:
+    alive_workers = [t for t in (getattr(worker, "_tasks", None) or []) if _alive(t)]
+    if alive_workers:
+        running.append(f"task_worker x{len(alive_workers)}")
+    if scheduler is not None and _alive(getattr(scheduler, "_task", None)):
         running.append("scheduler")
-    if bot is not None and getattr(bot, "_task", None) is not None:
+    if bot is not None and _alive(getattr(bot, "_task", None)):
         running.append("telegram")
     return {"running": ", ".join(running) or "none", "count": len(running)}
+
+
+def check_scheduler() -> dict[str, Any]:
+    """Whether the scheduler loop - and with it the OTP automation - is alive.
+
+    Not started (START_SCHEDULER=false) or already stopped on shutdown is
+    fine: nothing has died. A started loop whose task has finished is not -
+    nothing restarts it, so every job, the briefing and the OTP refills have
+    silently stopped.
+    """
+    scheduler = RUNTIME.get("scheduler")
+    task = getattr(scheduler, "_task", None) if scheduler is not None else None
+    if task is None:
+        return {"ok": True, "running": False}
+    if not task.done():
+        return {"ok": True, "running": True}
+    if task.cancelled():
+        reason = "cancelled"
+    else:
+        exc = task.exception()
+        reason = f"{type(exc).__name__}: {exc}" if exc is not None else "exited"
+    return {"ok": False, "running": False, "error": f"scheduler loop stopped ({reason})"[:300]}
 
 
 async def check_bridges() -> dict[str, Any]:
@@ -114,15 +147,17 @@ async def health_snapshot() -> dict[str, Any]:
                       "pending_approvals": 0, "enabled_jobs": 0, "memory_entries": 0}
 
     res = resources()
+    scheduler = check_scheduler()
     degraded = (
         not database["ok"]
+        or not scheduler["ok"]
         or res.get("disk_percent", 0) > 95
         or res.get("memory_percent", 0) > 97
     )
     return {
         "ok": not degraded,
         "uptime_s": int(time.time() - START_TIME),
-        "checks": {"database": database, "llm": llm, "bridges": bridges},
+        "checks": {"database": database, "llm": llm, "bridges": bridges, "scheduler": scheduler},
         "resources": res,
         "workers": workers_state(),
         "stats": task_stats,

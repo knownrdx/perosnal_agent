@@ -104,7 +104,7 @@ async def test_otp_tag_answer_intercepted_before_router(environment, monkeypatch
     set_userbot(FakeUserbot())
     try:
         reply = await handle_message(CHAT_ID, USER_ID, "BD")
-        assert "Shuru hoye geche" in reply.text
+        assert "Started" in reply.text
         assert (await otp_bot.get_config())["enabled"] is True
     finally:
         set_userbot(None)

@@ -177,6 +177,12 @@ async def test_start_reports_a_crash_as_a_crash_not_a_bot_rejection(environment,
         async def send_message(self, *args, **kwargs):
             raise ValueError("something genuinely broke")
 
+        async def send_file(self, *args, **kwargs):
+            raise ValueError("something genuinely broke")
+
+        async def read_messages(self, *args, **kwargs):
+            raise ValueError("something genuinely broke")
+
     set_userbot(ExplodingUserbot())
     result = await otp_bot.start_automation()
 
@@ -558,7 +564,7 @@ async def test_owner_is_told_which_country_ran_out_and_what_to_do(environment):
     assert notifier.sent, "the owner must be told - they are the only one who can fix it"
     message = notifier.sent[-1]["text"]
     assert "Bangladesh" in message
-    assert "shesh" in message            # says the stock is gone
+    assert "Out of stock" in message     # says the stock is gone
     assert "file" in message.lower()     # says a new file is what is needed
 
 
@@ -605,7 +611,7 @@ async def test_a_healthy_refill_does_not_raise_the_stock_alarm(environment):
     await _run_scheduler_once(notifier)
 
     joined = " ".join(n["text"] for n in notifier.sent)
-    assert "stock shesh" not in joined
+    assert "out of stock" not in joined.lower()
 
 
 # --------------------------------------------------------------------------- #
@@ -867,9 +873,20 @@ async def test_a_country_stops_after_its_refill_limit(environment):
     third = await otp_bot.run_cycle(await otp_bot.get_config())
 
     assert [f["country"] for f in third.finished] == ["Bangladesh"]
-    assert "2 bar" in third.finished[0]["reason"]
-    # And it stops being monitored.
-    assert await otp_bot.get_active_files() == []
+    assert "2 re-adds" in third.finished[0]["reason"]
+    # And it stops being refilled - HELD, not thrown away: the file stays,
+    # marked finished, and the country is paused until resumed.
+    active = await otp_bot.get_active_files()
+    assert len(active) == 1 and active[0].get("finished_at")
+    assert third.finished[0]["held"] is True
+    assert await otp_schedule.is_paused("Bangladesh")
+
+    await _make_everything_due()
+    bot = _empty_stock_bot()
+    set_userbot(bot)
+    after = await otp_bot.run_cycle(await otp_bot.get_config())
+    assert after.files_processed == []
+    assert bot.sent_files == []
 
 
 async def test_a_country_stops_after_its_time_limit(environment):
@@ -978,8 +995,11 @@ async def test_delete_without_a_uid_reports_it_instead_of_sending_junk(environme
     assert result.finished[0]["deleted"] is False
     assert "user id" in result.finished[0]["error"]
     assert "{uid}" not in " ".join(text for _, text, *_r in bot.sent_messages)
-    # The run still ends - a failed delete must not leave it cycling.
-    assert await otp_bot.get_active_files() == []
+    # The run still ends - a failed delete must not leave it cycling. It is
+    # held (paused, file kept), not removed.
+    active = await otp_bot.get_active_files()
+    assert active[0].get("finished_at")
+    assert await otp_schedule.is_paused("Bangladesh")
 
 
 async def test_limits_are_per_country(environment):
@@ -1007,9 +1027,12 @@ async def test_limits_are_per_country(environment):
         ]))
         await otp_bot.run_cycle(await otp_bot.get_config())
 
-    remaining = {e.get("country") for e in await otp_bot.get_active_files()}
-    assert "Bangladesh" in remaining
-    assert "Nigeria" not in remaining
+    running = {
+        e.get("country") for e in await otp_bot.get_active_files()
+        if not e.get("finished_at")
+    }
+    assert "Bangladesh" in running
+    assert "Nigeria" not in running
 
 
 async def test_the_owner_is_told_when_a_run_finishes(environment):
@@ -1028,7 +1051,7 @@ async def test_the_owner_is_told_when_a_run_finishes(environment):
     await _run_scheduler_once(notifier)
 
     joined = " ".join(n["text"] for n in notifier.sent)
-    assert "shesh" in joined
+    assert "Run finished" in joined
     assert "Bangladesh" in joined
 
 
@@ -1218,7 +1241,7 @@ async def test_the_start_message_explains_a_held_file(environment):
 
     assert "Central African Republic" in text
     assert "90,712" in text
-    assert "auto add hobe" in text
+    assert "added automatically" in text
 
 
 # --------------------------------------------------------------------------- #
@@ -1332,21 +1355,21 @@ async def test_setting_a_run_limit_warns_that_it_ends_the_run(environment):
     minutes after it started.
     """
     reply = await otp_bot.set_setting_from_chat("run_minutes", "3")
-    assert "BONDHO" in reply
+    assert "STOP" in reply
     assert "run_minutes 0" in reply  # tells you how to undo it
 
     reply = await otp_bot.set_setting_from_chat("max_refills", "3")
-    assert "BONDHO" in reply
+    assert "STOP" in reply
 
 
 async def test_clearing_a_limit_does_not_warn(environment):
     reply = await otp_bot.set_setting_from_chat("run_minutes", "0")
-    assert "BONDHO" not in reply
+    assert "STOP" not in reply
 
 
 async def test_delete_when_done_warns_that_numbers_will_be_removed(environment):
     reply = await otp_bot.set_setting_from_chat("delete_when_done", "on")
-    assert "MUCHE" in reply
+    assert "DELETED" in reply
 
 
 async def test_start_says_when_the_run_will_end(environment):
@@ -1360,8 +1383,8 @@ async def test_start_says_when_the_run_will_end(environment):
     text = otp_bot._format_start_success(result)
 
     assert "3 min" in text
-    assert "2 bar" in text
-    assert "BONDHO" in text
+    assert "2 re-adds" in text
+    assert "stops by itself" in text
 
 
 async def test_start_says_when_there_are_no_limits(environment):
@@ -1377,8 +1400,8 @@ async def test_start_says_when_there_are_no_limits(environment):
     result = await otp_bot.start_automation()
     text = otp_bot._format_start_success(result)
 
-    assert "limit nai" in text
-    assert "BONDHO" not in text
+    assert "No time or re-add limit" in text
+    assert "stops by itself" not in text
 
 
 # --------------------------------------------------------------------------- #
@@ -1395,7 +1418,7 @@ async def test_skip_during_the_tag_question_drops_that_country(environment):
 
     reply = await otp_bot.handle_tag_answer("bad dao")
 
-    assert "bad deoa holo" in reply
+    assert "removed" in reply
     remaining = {e["country"] for e in await otp_bot.get_queue()}
     assert skipped_country not in remaining
     # And it moved straight on to asking about the other country.
@@ -1613,7 +1636,9 @@ async def test_start_sends_cleanup_then_reply_based_add_per_file(environment):
     # This test is about the add mechanics (cleanup first, then file + reply
     # command), so the stock pre-check is turned off - with it on, the first
     # message sent is /st and the sequence under test starts one later.
-    await otp_bot.save_config({"skip_add_if_stocked": False})
+    # A cleanup command is only sent when one is configured (the default is
+    # none - the owner does not want /useddelete), so configure one here.
+    await otp_bot.save_config({"skip_add_if_stocked": False, "cleanup_command": "/cleanup"})
     rel = await _write_numbers_file("numbers_BD.txt")
     entry = await _enqueue_single(rel, "numbers_BD.txt")
     assert entry["tag"] == "BD"  # inferred, start() should proceed with no prompt
@@ -1626,7 +1651,7 @@ async def test_start_sends_cleanup_then_reply_based_add_per_file(environment):
     assert result["files"][0]["tag"] == "BD"
 
     # cleanup command sent first
-    assert fake.sent_messages[0][1] == "/useddelete"
+    assert fake.sent_messages[0][1] == "/cleanup"
     # file sent, then add-command sent as a REPLY to that file's message
     assert len(fake.sent_files) == 1
     add_reply_to = fake.sent_messages[1][2]
@@ -1835,7 +1860,7 @@ async def test_handle_start_trigger_asks_one_tag_at_a_time(environment):
     assert await otp_bot.get_awaiting_tag_entry() is not None
 
     reply3 = await otp_bot.handle_tag_answer("IN")
-    assert "Shuru hoye geche" in reply3  # both tagged now, actually started
+    assert "Started" in reply3  # both tagged now, actually started
     assert await otp_bot.get_awaiting_tag_entry() is None
     assert len(await otp_bot.get_active_files()) == 2
 
@@ -1850,14 +1875,14 @@ async def test_the_run_length_is_asked_once_and_then_it_starts(environment):
     await otp_bot.enqueue_file(rel, "numbers_BD.txt")
 
     asked = await otp_bot.handle_start_trigger()
-    assert "koto somoy cholbe" in asked
+    assert "How long should" in asked
     assert "20h" in asked                     # the default, stated
     assert (await otp_bot.get_awaiting_runtime())["countries"] == ["Bangladesh"]
 
     set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
     answered = await otp_bot.handle_runtime_answer("8h")
 
-    assert "Shuru hoye geche" in answered
+    assert "Started" in answered
     assert await otp_bot.get_awaiting_runtime() in (None, {})
     settings = await otp_schedule.get_country_settings("Bangladesh")
     assert settings["run_minutes"] == 480
@@ -1873,7 +1898,7 @@ async def test_no_limit_stays_expressible(environment):
     set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
     reply = await otp_bot.handle_runtime_answer("limit nai")
 
-    assert "kono somoy limit nai" in reply.lower()
+    assert "no time limit" in reply.lower()
     settings = await otp_schedule.get_country_settings("Bangladesh")
     assert settings["run_minutes"] == 0
 
@@ -1902,7 +1927,7 @@ async def test_handle_start_trigger_resumes_active_files_with_no_new_upload(envi
     # should decide to resume the same file on its own, not ask which one.
     set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
     reply = await otp_bot.handle_start_trigger()
-    assert "resumed" in reply.lower() or "Shuru hoye geche" in reply
+    assert "resumed" in reply.lower() or "Started" in reply
     assert (await otp_bot.get_config())["enabled"] is True
 
 
@@ -1967,10 +1992,11 @@ async def test_cycle_refills_when_quota_exhausted(environment):
     assert "Added 2 numbers" in result.add_reply
     assert result.files_processed == ["numbers_BD.txt"]
 
-    # Cleanup command sent before the file.
-    assert fake.sent_messages[1][1] == "/useddelete"
+    # No cleanup command by default: stock check, then straight to the file
+    # and its reply-based add command.
+    assert all(text != "/useddelete" for _, text, *_r in fake.sent_messages)
     assert len(fake.sent_files) == 1
-    add_command_reply_to = fake.sent_messages[2][2]
+    add_command_reply_to = fake.sent_messages[1][2]
     assert add_command_reply_to is not None
 
 

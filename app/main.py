@@ -46,18 +46,23 @@ class Application:
         from app.db import repo
         from app.db.base import session_scope
 
+        # get_setting_value, not get_setting: these are stored as bare strings,
+        # and get_setting only ever returns dicts, so it would read them as
+        # missing and every restart would fall back to .env.
         async with session_scope() as session:
-            level = await repo.get_setting(session, "autonomy_level")
-            briefing = await repo.get_setting(session, "briefing_enabled")
-            cron = await repo.get_setting(session, "briefing_cron")
+            level = await repo.get_setting_value(session, "autonomy_level")
+            briefing = await repo.get_setting_value(session, "briefing_enabled")
+            cron = await repo.get_setting_value(session, "briefing_cron")
 
         if level in {"balanced", "high", "paranoid"}:
             self.settings.autonomy_level = level
             log.info("autonomy_restored", extra={"level": level})
         if briefing in {"true", "false"}:
             self.settings.briefing_enabled = briefing == "true"
-        if cron:
-            self.settings.briefing_cron = cron
+            log.info("briefing_restored", extra={"enabled": briefing == "true"})
+        if isinstance(cron, str) and cron.strip():
+            self.settings.briefing_cron = cron.strip()
+            log.info("briefing_cron_restored", extra={"cron": cron.strip()})
 
     def _check_workspace_writable(self) -> None:
         """Fail loudly at boot if the workspace is not writable.

@@ -125,22 +125,31 @@ class TaskWorker:
         log.info("task_claimed", extra={"task_id": task_id, "worker": worker_id})
         heartbeat = asyncio.create_task(self._heartbeat(task_id, worker_id))
         try:
+            # learn=False: the deadline covers the task, not the learning
+            # that follows it (see the end of this method).
             status = await asyncio.wait_for(
-                self.engine.run_task(task_id), timeout=self.settings.task_timeout_s
+                self.engine.run_task(task_id, learn=False),
+                timeout=self.settings.task_timeout_s,
             )
             log.info("task_finished", extra={"task_id": task_id, "status": status})
         except asyncio.TimeoutError:
-            async with session_scope() as session:
-                await repo.set_task_status(
-                    session,
-                    task_id,
-                    TaskStatus.FAILED,
-                    error=f"task exceeded the global timeout ({self.settings.task_timeout_s}s)",
-                    failure_kind=FailureKind.TEMPORARY.value,
-                )
-            log.error("task_timeout", extra={"task_id": task_id})
-            if self.notifier is not None:
-                await self.notifier.task_failed(task_id)
+            if await self._already_finished(task_id):
+                # The deadline hit after the outcome was committed (e.g. while
+                # the completion message was still sending). The result
+                # stands; overwriting it would report finished work as failed.
+                log.warning("task_timeout_after_finish", extra={"task_id": task_id})
+            else:
+                async with session_scope() as session:
+                    await repo.set_task_status(
+                        session,
+                        task_id,
+                        TaskStatus.FAILED,
+                        error=f"task exceeded the global timeout ({self.settings.task_timeout_s}s)",
+                        failure_kind=FailureKind.TEMPORARY.value,
+                    )
+                log.error("task_timeout", extra={"task_id": task_id})
+                if self.notifier is not None:
+                    await self.notifier.task_failed(task_id)
         except asyncio.CancelledError:
             async with session_scope() as session:
                 await repo.update_task(
@@ -164,6 +173,23 @@ class TaskWorker:
             heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat
+        # Post-task learning runs here, outside the try: the task's deadline
+        # must not cover it (a slow model would get finished work marked
+        # FAILED), and a shutdown cancellation during it must not reach the
+        # handler above that requeues the task as PENDING. The engine bounds
+        # it with its own timeout and swallows its errors; it is a no-op
+        # unless the task actually reached an outcome.
+        await self.engine.learn_after(task_id)
+
+    @staticmethod
+    async def _already_finished(task_id: str) -> bool:
+        async with session_scope() as session:
+            task = await repo.get_task(session, task_id)
+        return task is not None and task.status in {
+            TaskStatus.COMPLETED.value,
+            TaskStatus.FAILED.value,
+            TaskStatus.CANCELLED.value,
+        }
 
     async def _heartbeat(self, task_id: str, worker_id: str) -> None:
         interval = max(30, self.lease_s // 3)

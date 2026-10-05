@@ -8,9 +8,11 @@ Three sources of learning:
 1. Reflection - the LLM reads the finished task's tool trace and extracts
    owner preferences, reusable procedures and gotchas.
 2. Failure patterns - deterministic, no LLM: when the same tool fails the same
-   way repeatedly, an avoid-rule is written automatically.
+   way repeatedly, an avoid-rule is written automatically. It lapses after
+   FAILURE_RULE_TTL_DAYS without a recurrence.
 3. Retrieval - before each step, the most relevant memories are scored and
-   injected into the prompt, so what was learned actually gets used.
+   injected into the prompt, so what was learned actually gets used. Bengali
+   script is transliterated first, so it matches Banglish and English.
 
 Everything is filtered through the same secret guard as the memory tool: no
 credentials are ever stored.
@@ -20,11 +22,15 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from datetime import datetime, timedelta
 from typing import Any
 
+from sqlalchemy import select
+
+from app.agent import language
 from app.db import repo
 from app.db.base import session_scope
-from app.db.models import Task
+from app.db.models import MemoryEntry, Task, utcnow
 from app.llm import LLMError, Message, get_llm
 from app.logging_conf import get_logger
 from app.tools.memory_tools import looks_like_secret
@@ -34,6 +40,15 @@ log = get_logger(__name__)
 MAX_LESSONS_PER_TASK = 3
 MIN_STEPS_TO_REFLECT = 2
 FAILURE_THRESHOLD = 3
+
+# A failure rule with no fresh occurrence for this long stops being injected.
+# 14 days because the failures behind these rules are mostly circumstantial -
+# a site was down, a login expired, a network blip - and once that is fixed a
+# rule that keeps saying "this tool fails" steers the model away from a tool
+# that now works. Two weeks still covers a weekly job hitting the same error
+# twice in a row, so a genuinely recurring problem is never forgotten between
+# runs; and any fresh occurrence revives the rule immediately.
+FAILURE_RULE_TTL_DAYS = 14
 
 REFLECTION_PROMPT = """You are the memory of a personal AI agent.
 
@@ -139,9 +154,20 @@ async def reflect_on_task(task_id: str, llm: Any | None = None) -> list[dict[str
 
 
 async def learn_from_failures() -> list[dict[str, str]]:
-    """Deterministic learning: turn repeated identical failures into rules."""
-    from sqlalchemy import select
+    """Deterministic learning: turn repeated identical failures into rules.
 
+    A rule is (re)written only when there is NEW EVIDENCE for it: it does not
+    exist yet, or the same failure happened again after the rule was last
+    written. The rule's timestamp therefore means "last seen failing", which
+    is what lets retrieval drop rules nobody has hit for
+    FAILURE_RULE_TTL_DAYS. Re-saving every rule after every task, as this
+    used to, kept every rule forever fresh - and parked them all at the top
+    of the newest-200 window that retrieval scans, crowding out real lessons.
+
+    A changed count with no fresh occurrence (old failures sliding out of the
+    200-row scan) is not news and does not refresh the rule. Failures that are
+    already older than the TTL never create a rule in the first place.
+    """
     from app.db.models import ToolCall
 
     async with session_scope() as session:
@@ -155,14 +181,20 @@ async def learn_from_failures() -> list[dict[str, str]]:
         ).all()
 
         patterns: Counter[tuple[str, str]] = Counter()
+        last_seen: dict[tuple[str, str], datetime] = {}
         for call in rows:
             if not call.error:
                 continue
             # Normalise the error to its shape, not its specific values.
             shape = re.sub(r"['\"][^'\"]{1,120}['\"]", "'X'", call.error[:160])
             shape = re.sub(r"\d+", "N", shape)
-            patterns[(call.tool, shape.strip())] += 1
+            pattern = (call.tool, shape.strip())
+            patterns[pattern] += 1
+            # Rows arrive newest first, so the first one seen is the latest.
+            if call.created_at is not None:
+                last_seen.setdefault(pattern, call.created_at)
 
+        fresh_since = utcnow() - timedelta(days=FAILURE_RULE_TTL_DAYS)
         learned: list[dict[str, str]] = []
         for (tool_name, shape), count in patterns.most_common(5):
             if count < FAILURE_THRESHOLD:
@@ -174,6 +206,15 @@ async def learn_from_failures() -> list[dict[str, str]]:
             )
             if looks_like_secret(value):
                 continue
+
+            latest = last_seen.get((tool_name, shape))
+            if latest is None or latest < fresh_since:
+                continue  # stale evidence: not worth a rule any more
+            existing = await session.scalar(select(MemoryEntry).where(MemoryEntry.key == key))
+            written_at = existing.updated_at if existing is not None else None
+            if written_at is not None and latest <= written_at:
+                continue  # nothing happened since the rule was written
+
             await repo.memory_store(
                 session, key=key, value=value, kind="gotcha", tags=["learned", "failure"]
             )
@@ -191,11 +232,37 @@ _STOPWORDS = {
     "the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "for", "with",
     "is", "are", "was", "be", "it", "this", "that", "my", "me", "i", "you",
     "please", "can", "could", "would", "then", "when", "send", "get", "do",
+    # Banglish filler - pronouns, particles and the do/give/send/take verbs
+    # that end almost every request ("report ta pathao", "eta koro"). Without
+    # these, two unrelated Banglish sentences "match" on grammar alone.
+    "ami", "amar", "amake", "tumi", "tomar", "tumar", "apni", "apnar",
+    "eta", "ota", "oita", "ekta", "sob", "shob", "ache", "nai", "hobe", "holo",
+    "koro", "kore", "kori", "korbo", "korbe", "dao", "diye", "deo", "nao",
+    "pathao", "pathiye", "theke", "abar", "ekhon", "ekhoni", "aro", "keno",
+    "kemon", "kivabe", "kokhon", "kothay", "kono", "accha", "haa", "valo",
 }
+
+# Retrieval budget. A plain lesson is one sentence, so 300 characters is
+# plenty; a skill is the distilled summary of several lessons and is stored
+# at up to 2000, so it gets more room - cutting it to a one-liner threw away
+# exactly the part synthesis was for. The total cap keeps the injected block
+# bounded however many long skills match (6 x 300 was the old ceiling).
+ENTRY_CHARS = 300
+SKILL_CHARS = 900
+MEMORY_CONTEXT_CHARS = 2400
+SKILL_BOOST = 0.45
 
 
 def _tokens(text: str) -> set[str]:
-    words = re.findall(r"[a-z0-9]+", str(text).lower())
+    """Content words, after folding Bengali script into Banglish.
+
+    The owner writes English, Banglish and Bengali script, and memories end
+    up in all three. A Latin-only tokeniser saw a Bengali-script request as
+    zero words and matched nothing. ``language.normalise`` is the same
+    transliteration the deterministic triggers use, so "হোয়াটসঅ্যাপ স্টক"
+    and "whatsapp stock" become the same tokens.
+    """
+    words = re.findall(r"[a-z0-9]+", language.normalise(str(text)).lower())
     return {w for w in words if len(w) > 2 and w not in _STOPWORDS}
 
 
@@ -211,24 +278,54 @@ def score_memory(request_tokens: set[str], key: str, value: str, kind: str) -> f
         score += 0.35
     if kind == "workflow":
         score += 0.15
+    # A skill summarises several lessons on one topic, so on that topic it
+    # should outrank any single one of them (hence more than the gotcha
+    # boost). Only on an actual word match, though: unlike a preference, a
+    # skill is ABOUT something, and an unrelated one is noise in the prompt.
+    if kind == "skill" and overlap:
+        score += SKILL_BOOST
     return score
 
 
+def _is_stale_failure_rule(entry: MemoryEntry, stale_before: datetime) -> bool:
+    """An auto-written avoid-rule that has not fired for FAILURE_RULE_TTL_DAYS.
+
+    learn_from_failures only touches a rule when the failure recurs, so its
+    updated_at is "last seen failing".
+    """
+    if "failure" not in (entry.tags or []) or entry.updated_at is None:
+        return False
+    return entry.updated_at < stale_before
+
+
 async def relevant_memories(user_request: str, limit: int = 6) -> list[str]:
-    """Top-scoring memories for a request, formatted for the prompt."""
+    """Top-scoring memories for a request, formatted for the prompt.
+
+    At most ``limit`` entries and MEMORY_CONTEXT_CHARS characters in total.
+    An entry that would overflow the budget is skipped rather than ending
+    the scan, so a shorter, lower-ranked lesson can still use the space left.
+    """
     async with session_scope() as session:
         entries = await repo.memory_recent(session, limit=200)
 
+    stale_before = utcnow() - timedelta(days=FAILURE_RULE_TTL_DAYS)
     request_tokens = _tokens(user_request)
     scored = [
         (score_memory(request_tokens, entry.key, entry.value, entry.kind), entry)
         for entry in entries
+        if not _is_stale_failure_rule(entry, stale_before)
     ]
     scored.sort(key=lambda pair: pair[0], reverse=True)
 
     out: list[str] = []
-    for score, entry in scored[:limit]:
-        if score <= 0.05:
+    used = 0
+    for score, entry in scored:
+        if len(out) >= limit or score <= 0.05:
+            break  # sorted, so nothing after this scores higher
+        cap = SKILL_CHARS if entry.kind == "skill" else ENTRY_CHARS
+        line = f"[{entry.kind}] {entry.key}: {entry.value}"[:cap]
+        if used + len(line) > MEMORY_CONTEXT_CHARS:
             continue
-        out.append(f"[{entry.kind}] {entry.key}: {entry.value}"[:300])
+        out.append(line)
+        used += len(line)
     return out
