@@ -199,20 +199,79 @@ async def test_skip_button_drops_that_country(runner):
     assert await otp_bot.get_queue() == []
 
 
-async def test_per_country_interval_button_only_touches_that_country(runner):
-    entry = await _queue_one()
-    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
-    await _queue_one("ng.txt", prefix="+234")
+async def test_the_global_interval_buttons_save_the_global_value(runner):
+    """Main panel -> Check interval -> a choice: ONE value for every country."""
+    from app.telegram import otp_panel
 
-    # Index 0 is the first country in the queue ordering.
-    query = _Query("otp:cint:0:5", await _owner_id(runner))
+    await _queue_one()
+    await _queue_one("ng.txt", prefix="+234")
+    await otp_bot.save_config({"interval_minutes": 1})
+
+    ask = _Query("otp:ask_int:", await _owner_id(runner))
+    await _handler(runner)(ask)
+    prompt = ask.message.answers[-1]
+    assert "every 1 min" in prompt["text"]
+    data = [b.callback_data for row in prompt["markup"].inline_keyboard for b in row]
+    assert data == [f"otp:int:{m}" for m in otp_bot.INTERVAL_CHOICES] + ["otp:intc:"]
+
+    for minutes in otp_bot.INTERVAL_CHOICES:
+        query = _Query(f"otp:int:{minutes}", await _owner_id(runner))
+        await _handler(runner)(query)
+        cfg = await otp_bot.get_config()
+        assert cfg["interval_minutes"] == minutes
+        assert query.message.edits, "the panel should be refreshed in place"
+        assert "all countries" in otp_panel.html_to_plain(query.message.edits[-1]["text"])
+    # Nothing was written per country.
+    for country in ("Bangladesh", "Nigeria"):
+        assert "interval_minutes" not in await otp_schedule.get_country_settings(country)
+
+
+async def test_an_out_of_range_interval_button_changes_nothing(runner):
+    before = (await otp_bot.get_config())["interval_minutes"]
+    query = _Query("otp:int:0", await _owner_id(runner))
     await _handler(runner)(query)
 
-    cfg = await otp_bot.get_config()
-    assert (await otp_schedule.effective_config("Bangladesh", cfg))["interval_minutes"] == 5
-    assert (await otp_schedule.effective_config("Nigeria", cfg))["interval_minutes"] == cfg[
-        "interval_minutes"
-    ]
+    assert (await otp_bot.get_config())["interval_minutes"] == before
+    assert query.acks[-1]["alert"] is True
+
+
+async def test_old_per_country_interval_buttons_answer_gracefully(runner):
+    """Per-country "Check interval" buttons still sit in chat history. A tap
+    must be answered with a short note - not an error - and change nothing."""
+    from app.telegram import otp_panel
+
+    entry = await _queue_one()
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    key = otp_panel.country_key("Bangladesh")
+    before = (await otp_bot.get_config())["interval_minutes"]
+
+    for data in (f"otp:pickc:{key}", f"otp:cint:{key}:5", f"otp:cintc:{key}",
+                 "otp:cint:0:5", "otp:cintc:0", "otp:cint:7:5"):
+        query = _Query(data, await _owner_id(runner))
+        await _handler(runner)(query)
+
+        assert query.acks[-1]["text"] == otp_panel.INTERVAL_IS_GLOBAL, data
+        assert query.message.answers == [], data  # no "that button did not work"
+        assert query.message.edits == [], data
+
+    assert "interval_minutes" not in await otp_schedule.get_country_settings("Bangladesh")
+    assert (await otp_bot.get_config())["interval_minutes"] == before
+    assert not (await otp_bot.get_pending_input() or {}).get("field")
+
+
+async def test_the_country_panel_offers_no_interval(runner):
+    from app.telegram import otp_panel
+
+    entry = await _queue_one()
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+
+    query = _Query(f"otp:fields:{otp_panel.country_key('Bangladesh')}", await _owner_id(runner))
+    await _handler(runner)(query)
+
+    answer = query.message.answers[-1]
+    assert "Checks every" not in answer["text"]
+    labels = [b.text for row in answer["markup"].inline_keyboard for b in row]
+    assert not any("interval" in label.lower() for label in labels)
 
 
 async def test_preset_button_applies_to_the_chosen_country(runner):
@@ -229,7 +288,7 @@ async def test_a_button_for_a_country_that_is_gone_says_so(runner):
     """Buttons live in chat history; the owner can tap one long after the
     country was removed, and that must not raise.
     """
-    query = _Query("otp:cint:7:5", await _owner_id(runner))
+    query = _Query("otp:cthr:7:500", await _owner_id(runner))
     await _handler(runner)(query)
 
     assert query.acks[-1]["alert"] is True
@@ -290,24 +349,24 @@ async def test_threshold_button_sets_the_restock_point(runner):
 
 async def test_a_custom_interval_is_asked_for_then_applied(runner):
     """The listed values are shortcuts - without a custom path the owner
-    cannot pick 7 or 90 minutes from Telegram at all.
+    cannot pick 7 or 90 minutes from Telegram at all. The answer sets the
+    ONE global interval.
     """
-    from app.agent import conversation
-
     entry = await _queue_one()
     await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
 
-    query = _Query("otp:cintc:0", await _owner_id(runner))
+    query = _Query("otp:intc:", await _owner_id(runner))
     await _handler(runner)(query)
     pending = await otp_bot.get_pending_input()
     assert pending["field"] == "interval_minutes"
-    assert pending["country"] == "Bangladesh"
+    assert pending.get("country") is None
+    assert "all countries" in query.message.answers[-1]["text"]
 
     # The next message in the OTP thread is the answer.
     reply = await otp_bot.handle_pending_input("7")
     assert "7" in reply
-    settings = await otp_schedule.get_country_settings("Bangladesh")
-    assert settings["interval_minutes"] == 7
+    assert (await otp_bot.get_config())["interval_minutes"] == 7
+    assert "interval_minutes" not in await otp_schedule.get_country_settings("Bangladesh")
     assert not (await otp_bot.get_pending_input() or {}).get("field")
 
 
@@ -328,7 +387,7 @@ async def test_a_bad_custom_value_keeps_the_question_open(runner):
     """
     entry = await _queue_one()
     await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
-    await _handler(runner)(_Query("otp:cintc:0", await _owner_id(runner)))
+    await _handler(runner)(_Query("otp:intc:", await _owner_id(runner)))
 
     reply = await otp_bot.handle_pending_input("onek tara tari")
     assert "\u274c" in reply.lower() or "number" in reply.lower()
@@ -398,17 +457,31 @@ async def test_otpset_changes_a_global_setting(runner):
 
 
 async def test_otpset_handles_a_multi_word_country(runner):
-    """"Central African Republic interval_minutes 5" - the country name has
+    """"Central African Republic quota_threshold 500" - the country name has
     spaces, so the key has to be located rather than assumed to be word two.
     """
+    await otp_bot.learn_countries({"Central African Republic": 1})
+    message = _PlainMessage(await _owner_id(runner))
+    await _command_handler(runner, "_otpset")(
+        message, _Command("Central African Republic quota_threshold 500")
+    )
+
+    settings = await otp_schedule.get_country_settings("Central African Republic")
+    assert settings["quota_threshold"] == 500
+
+
+async def test_otpset_refuses_a_per_country_interval(runner):
+    """The interval is global: "/otpset <country> interval_minutes 5" must
+    say so, not store an override nothing reads."""
     await otp_bot.learn_countries({"Central African Republic": 1})
     message = _PlainMessage(await _owner_id(runner))
     await _command_handler(runner, "_otpset")(
         message, _Command("Central African Republic interval_minutes 5")
     )
 
+    assert "❌" in message.answers[-1]["text"]
     settings = await otp_schedule.get_country_settings("Central African Republic")
-    assert settings["interval_minutes"] == 5
+    assert "interval_minutes" not in settings
 
 
 async def test_otpset_reports_a_bad_value_instead_of_storing_it(runner):
@@ -426,13 +499,25 @@ async def test_otppreset_saves_a_custom_threshold(runner):
     """
     message = _PlainMessage(await _owner_id(runner))
     await _command_handler(runner, "_otppreset")(
-        message, _Command("save My limit quota_threshold=500 interval_minutes=20 limit=6")
+        message, _Command("save My limit quota_threshold=500 limit=6")
     )
 
     presets = await otp_schedule.get_presets()
     assert presets["My limit"]["quota_threshold"] == 500
-    assert presets["My limit"]["interval_minutes"] == 20
     assert presets["My limit"]["limit"] == 6
+
+
+async def test_otppreset_lists_presets_without_an_interval(runner):
+    """Presets cannot carry an interval any more (it is global), so the list
+    and the usage text must not suggest one."""
+    message = _PlainMessage(await _owner_id(runner))
+    await _command_handler(runner, "_otppreset")(message, _Command(""))
+
+    import re
+
+    text = message.answers[-1]["text"]
+    assert "interval_minutes" not in text
+    assert not re.search(r"every \d+m", text)
 
 
 async def test_a_preset_threshold_of_zero_survives(runner):
@@ -456,7 +541,10 @@ async def test_otppreset_applies_to_a_multi_word_country(runner):
     )
 
     settings = await otp_schedule.get_country_settings("Central African Republic")
-    assert settings["interval_minutes"] == 5
+    preset = (await otp_schedule.get_presets())["Fast burn"]
+    assert settings["limit"] == preset["limit"]
+    assert settings["quota_threshold"] == preset["quota_threshold"]
+    assert "interval_minutes" not in settings
 
 
 async def test_otppreset_rejects_a_field_that_is_not_per_country(runner):

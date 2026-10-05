@@ -334,6 +334,75 @@ def test_otpbot_config_and_status(client):
     assert status.json()["last_result"] is None
 
 
+def test_otpbot_global_interval_is_settable_and_bounded(client):
+    headers = {"X-API-Token": "test-api-token"}
+
+    ok = client.post("/api/otpbot/config", json={"interval_minutes": 1}, headers=headers)
+    assert ok.status_code == 200
+    assert ok.json()["interval_minutes"] == 1
+
+    # Below one minute is not an interval.
+    bad = client.post("/api/otpbot/config", json={"interval_minutes": 0}, headers=headers)
+    assert bad.status_code == 422
+    assert client.get("/api/otpbot/config", headers=headers).json()["interval_minutes"] == 1
+
+
+def test_otpbot_config_ignores_the_removed_cleanup_field(client):
+    """A dashboard page cached from before still sends it: the save works,
+    and nothing about it is stored or reported back."""
+    headers = {"X-API-Token": "test-api-token"}
+    removed = "cleanup" + "_command"
+
+    response = client.post(
+        "/api/otpbot/config", json={removed: "/useddelete", "quota_threshold": 7}, headers=headers
+    )
+    assert response.status_code == 200
+    assert response.json()["quota_threshold"] == 7
+    assert removed not in response.json()
+    assert "useddelete" not in str(client.get("/api/otpbot/config", headers=headers).json())
+
+
+def test_otpbot_per_country_interval_is_refused(client):
+    """One /st checks every country, so the interval is global only."""
+    from app.telegram.otp_panel import INTERVAL_IS_GLOBAL
+
+    headers = {"X-API-Token": "test-api-token"}
+    for body in ({"interval_minutes": 5}, {"interval_minutes": 5, "quota_threshold": 9},
+                 {"interval_minutes": None}, {"interval_minutes": "abc"}):
+        response = client.post(
+            "/api/otpbot/country/Senegal/settings", json=body, headers=headers
+        )
+        assert response.status_code == 400, body
+        assert response.json()["detail"] == INTERVAL_IS_GLOBAL
+
+    # Without it, the same endpoint still works - and the refused request
+    # above (which also carried quota_threshold) was not half-applied.
+    fine = client.post(
+        "/api/otpbot/country/Senegal/settings", json={"limit": 3}, headers=headers
+    )
+    assert fine.status_code == 200
+    settings = fine.json()["settings"]
+    assert settings["limit"] == 3
+    assert "quota_threshold" not in settings
+    assert "interval_minutes" not in settings
+
+
+def test_otpbot_preset_with_an_interval_is_refused(client):
+    from app.telegram.otp_panel import INTERVAL_IS_GLOBAL
+
+    headers = {"X-API-Token": "test-api-token"}
+    refused = client.post(
+        "/api/otpbot/presets/Night", json={"interval_minutes": 5, "limit": 3}, headers=headers
+    )
+    assert refused.status_code == 400
+    assert refused.json()["detail"] == INTERVAL_IS_GLOBAL
+    assert "Night" not in client.get("/api/otpbot/presets", headers=headers).json()["presets"]
+
+    saved = client.post("/api/otpbot/presets/Night", json={"limit": 3}, headers=headers)
+    assert saved.status_code == 200
+    assert saved.json()["preset"] == {"limit": 3}
+
+
 def test_otpbot_requires_auth(client):
     assert client.get("/api/otpbot/config").status_code == 401
     assert client.post("/api/otpbot/config", json={}).status_code == 401

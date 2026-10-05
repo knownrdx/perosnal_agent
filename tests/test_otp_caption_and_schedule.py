@@ -307,8 +307,11 @@ async def test_a_scheduled_country_is_skipped_by_the_due_check(environment):
     future = (datetime.now(otp_schedule.DUBAI_TZ) + timedelta(hours=4)).strftime("%H:%M")
     await otp_schedule.set_country_settings("Bangladesh", {"start_at": future})
     await otp_schedule.begin_run("Bangladesh", start_at=future)
-    # Due immediately, were it not waiting to start.
-    await otp_schedule.arm_country("Bangladesh", 1)
+    # The shared check is due right now - it would fire, were the country
+    # not waiting to start.
+    await otp_schedule.arm_shared_check(
+        at=datetime.now(timezone.utc) - timedelta(minutes=1)
+    )
 
     due = await otp_schedule.due_countries(["Bangladesh"], cfg)
     assert due == []

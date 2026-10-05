@@ -198,7 +198,11 @@ class OtpCountryRequest(BaseModel):
     send null to clear the override and fall back to the global config.
     """
 
-    interval_minutes: int | None = Field(default=None, ge=1, le=1440)
+    # Not settable: one /st checks every country, so the check interval is
+    # global (POST /api/otpbot/config). Declared only so an explicit value
+    # can be refused with a clear 400 instead of being silently dropped;
+    # Any, so a non-number gets that same 400 rather than a 422.
+    interval_minutes: Any = None
     quota_threshold: int | None = Field(default=None, ge=0)
     limit: int | None = Field(default=None, ge=1, le=10000)
     count: int | None = Field(default=None, ge=1, le=10000)
@@ -215,6 +219,18 @@ class OtpCountryRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+def _refuse_country_interval(payload: OtpCountryRequest) -> None:
+    """400 when a per-country (or preset) request sends interval_minutes.
+
+    Same English message as the Telegram panel gives for its old per-country
+    interval buttons, so both say the same thing.
+    """
+    if "interval_minutes" in payload.model_fields_set:
+        from app.telegram.otp_panel import INTERVAL_IS_GLOBAL
+
+        raise HTTPException(status_code=400, detail=INTERVAL_IS_GLOBAL)
+
+
 class OtpPauseRequest(BaseModel):
     paused: bool
 
@@ -224,6 +240,8 @@ class OtpPresetApplyRequest(BaseModel):
 
 
 class OtpBotConfigRequest(BaseModel):
+    # Unknown fields are ignored (pydantic's default), so a dashboard page
+    # cached from before a setting was removed still saves without an error.
     enabled: bool | None = None
     target_bot: str | None = None
     add_command_template: str | None = None
@@ -231,7 +249,6 @@ class OtpBotConfigRequest(BaseModel):
     count: int | None = None
     quota_command: str | None = None
     quota_threshold: int | None = None
-    cleanup_command: str | None = None
     force_delete_command: str | None = None
     force_delete_before_add: bool | None = None
     force_delete_uid: str | None = None
@@ -246,7 +263,8 @@ class OtpBotConfigRequest(BaseModel):
     start_at: str | None = Field(default=None, max_length=5)
     default_run_minutes: int | None = Field(default=None, ge=0, le=100000)
     ask_run_time: bool | None = None
-    interval_minutes: int | None = None
+    # The one check interval shared by every country.
+    interval_minutes: int | None = Field(default=None, ge=1, le=1440)
     default_tag: str | None = None
 
 
@@ -1112,7 +1130,9 @@ def create_app() -> FastAPI:
         """
         from app.automation import otp_bot, otp_schedule
 
+        _refuse_country_interval(payload)
         values = payload.model_dump(exclude_unset=True)
+        values.pop("interval_minutes", None)
         # Clock fields arrive as free text from a form; validate them the same
         # way the chat command does rather than storing "9pm" and never firing.
         for field in ("stop_at", "start_at"):
@@ -1130,8 +1150,6 @@ def create_app() -> FastAPI:
             applied = await otp_schedule.set_paused(country, bool(paused))
             if paused is None:
                 applied = await otp_schedule.set_country_settings(country, {"paused": None})
-        if "interval_minutes" in values and values["interval_minutes"]:
-            await otp_schedule.arm_country(country, int(values["interval_minutes"]))
         cfg = await otp_bot.get_config()
         return {
             "country": country,
@@ -1163,8 +1181,12 @@ def create_app() -> FastAPI:
     async def otpbot_save_preset(name: str, payload: OtpCountryRequest) -> dict[str, Any]:
         from app.automation import otp_schedule
 
+        # A preset is a bundle of per-country settings, so the same rule.
+        _refuse_country_interval(payload)
+        values = payload.model_dump(exclude_unset=True)
+        values.pop("interval_minutes", None)
         try:
-            saved = await otp_schedule.save_preset(name, payload.model_dump(exclude_unset=True))
+            saved = await otp_schedule.save_preset(name, values)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"name": name, "preset": saved}

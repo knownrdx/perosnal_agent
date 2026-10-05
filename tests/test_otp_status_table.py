@@ -22,9 +22,10 @@ from app.telegram import otp_panel
 pytestmark = pytest.mark.asyncio
 
 # Column boundaries of the <pre> table: state(4) country(14) file(7)
-# stock(7) every(6) ends(6) next. A space sits at each of these offsets on
-# every line when the columns are aligned.
-GAPS = (4, 19, 27, 35, 42, 49)
+# stock(7) ends. A space sits at each of these offsets on every line when the
+# columns are aligned. There is no per-country "Every"/"Next" column: one /st
+# checks every country, so the timing is shown once, in the summary.
+GAPS = (4, 19, 27, 35)
 
 
 def _entry(i: int, country: str, **extra) -> dict:
@@ -63,7 +64,9 @@ def _table(text: str) -> list[str]:
 
 
 def _row(text: str, country_prefix: str) -> str:
-    return next(line for line in _table(text) if line[5:].startswith(country_prefix))
+    # By content, not offset: a waiting row's state ("WAIT 21:00") widens the
+    # state column for the whole table.
+    return next(line for line in _table(text) if country_prefix in line)
 
 
 async def test_columns_line_up_for_every_row(environment):
@@ -77,7 +80,7 @@ async def test_columns_line_up_for_every_row(environment):
 
     lines = _table(await otp_panel.status_text())
 
-    assert lines[0].split() == ["St", "Country", "File", "Stock", "Every", "Ends", "Next"]
+    assert lines[0].split() == ["St", "Country", "File", "Stock", "Ends"]
     assert len(lines) == 5
     for line in lines:
         for gap in GAPS:
@@ -113,8 +116,14 @@ async def test_each_state_gets_its_own_code(environment):
     assert _row(text, "Finished Lan").startswith("DONE")
     assert _row(text, "Spent Land").startswith("USED")
     assert _row(text, "Held Land").startswith("HELD")
+    # The start time stays with the country, in its state column.
     waiting = _row(text, "Waiting Land")
-    assert waiting.startswith("WAIT") and waiting.endswith(start)
+    assert waiting.startswith(f"WAIT {start}")
+    # And the columns still line up around the wider state.
+    lines = _table(text)
+    country_at = lines[0].index("Country")
+    assert all(line[country_at - 1] == " " for line in lines)
+    assert _row(text, "Running Land")[country_at:].startswith("Running Land")
     # The legend explains exactly the codes in use.
     for code in ("RUN", "OFF", "DONE", "USED", "HELD", "WAIT"):
         assert f"{code} {otp_panel.STATE_LEGEND[code]}" in html.unescape(text)
@@ -170,12 +179,50 @@ async def test_a_huge_run_still_fits_one_message(environment):
 
 async def test_the_summary_lines_are_there(environment):
     await otp_bot.set_cleanup_mode("force")
-    await otp_bot.save_config({"quota_threshold": 200})
+    await otp_bot.save_config({"quota_threshold": 200, "interval_minutes": 2})
     await _last_stock({"Sudan": 1})
 
     text = otp_panel.html_to_plain(await otp_panel.status_text())
 
+    wipe = dict(otp_bot.CLEANUP_CHOICES)["force"]
     for label in ("Running:", "Target bot:", "Restock point: 200 left",
-                  "Cleanup mode: wipe country first (/frcd)", "Last check: OK"):
+                  f"Cleanup mode: {wipe}", "Checks: every 2 min (all countries)",
+                  "Last check: OK"):
         assert label in text
     assert "Nothing queued or running" in text
+    assert "useddelete" not in text
+
+
+async def test_the_next_check_is_shown_once_for_all_countries(environment, monkeypatch):
+    """One /st checks every country, so the next check and the interval are
+    said once in the summary - never repeated per row."""
+    await _run([_entry(1, "Sudan"), _entry(2, "Nigeria"), _entry(3, "Laos")])
+    await otp_bot.save_config({"interval_minutes": 5})
+    real_overview = otp_schedule.schedule_overview
+
+    async def _one_global_due(countries, base):
+        # The automation's single timer: the same due time for every row.
+        rows = await real_overview(countries, base)
+        return [{**row, "due_in_seconds": 150} for row in rows]
+
+    monkeypatch.setattr(otp_schedule, "schedule_overview", _one_global_due)
+
+    text = otp_panel.html_to_plain(await otp_panel.status_text())
+
+    assert text.count("Next check:") == 1
+    assert text.count("every 5 min (all countries)") == 1
+    assert "Next check: in 3m · every 5 min (all countries)" in text
+    # No timing column in the table itself.
+    lines = _table(await otp_panel.status_text())
+    assert "Every" not in lines[0] and "Next" not in lines[0]
+    assert all(line.startswith("RUN ") for line in lines[1:])
+
+
+async def test_a_stopped_automation_shows_the_interval_but_no_next_check(environment):
+    await _run([_entry(1, "Sudan")])
+    await otp_bot.save_config({"enabled": False, "interval_minutes": 10})
+
+    text = otp_panel.html_to_plain(await otp_panel.status_text())
+
+    assert "Checks: every 10 min (all countries)" in text
+    assert "Next check" not in text

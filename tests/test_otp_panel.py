@@ -73,6 +73,39 @@ def test_interval_keyboard_ticks_the_current_value():
     assert sum(1 for label in labels if label.startswith("\u2705")) == 1
 
 
+def test_interval_keyboard_offers_every_global_choice_plus_custom():
+    markup = otp_panel.interval_keyboard(1)
+    data = _all_callback_data(markup)
+    for minutes in otp_bot.INTERVAL_CHOICES:
+        assert f"otp:int:{minutes}" in data
+    assert "otp:intc:" in data
+    # Global only: nothing in it names a country.
+    assert not any(d.startswith(("otp:cint", "otp:pickc")) for d in data)
+
+
+def test_a_typed_interval_shows_on_the_custom_button():
+    """7 has no button of its own - without this the current value is
+    nowhere on the keyboard."""
+    labels = [b.text for row in otp_panel.interval_keyboard(7).inline_keyboard for b in row]
+    assert any(label.startswith("\u2705") and "7 min" in label and "Custom" in label
+               for label in labels)
+    assert sum(1 for label in labels if label.startswith("\u2705")) == 1
+
+
+def test_the_country_panel_has_no_interval_button():
+    markup = otp_panel.country_field_keyboard(otp_panel.country_key("Bangladesh"), "Bangladesh")
+    labels = [b.text for row in markup.inline_keyboard for b in row]
+    assert not any("interval" in label.lower() for label in labels)
+    assert not any(d.split(":")[1] in {"pickc", "cint", "cintc"}
+                   for d in _all_callback_data(markup))
+    assert not hasattr(otp_panel, "country_interval_keyboard")
+
+
+def test_the_main_panel_keeps_a_global_interval_button():
+    data = _all_callback_data(otp_panel.control_keyboard(True))
+    assert "otp:ask_int:" in data
+
+
 def test_control_keyboard_toggles_between_start_and_stop():
     running = [b.text for row in otp_panel.control_keyboard(True).inline_keyboard for b in row]
     stopped = [b.text for row in otp_panel.control_keyboard(False).inline_keyboard for b in row]
@@ -108,23 +141,40 @@ def test_removal_keyboard_is_none_when_there_is_nothing_to_remove():
 @asyncio_test
 async def test_status_text_reports_the_settings_the_buttons_change(environment):
     await _queue_one(environment)
-    text = await otp_panel.status_text()
+    text = otp_panel.html_to_plain(await otp_panel.status_text())
 
-    # Intervals are per-country now and shown against RUNNING countries, so
-    # the global header carries what is still global.
     assert "/st" in text
     assert "Bangladesh" in text
-    # No cleanup command by default since config version 2 (the owner
-    # asked for /useddelete to stop), and the panel says so plainly.
-    assert "nothing deleted before adding" in text
+    # The wipe choice is shown in the same words as the Cleanup buttons.
+    labels = dict(otp_bot.CLEANUP_CHOICES)
+    assert labels["used"] in text
 
     await otp_bot.set_cleanup_mode("force")
-    assert "/frcd" in await otp_panel.status_text()
+    text = otp_panel.html_to_plain(await otp_panel.status_text())
+    assert labels["force"] in text and "/frcd" in text
 
 
 @asyncio_test
-async def test_status_text_shows_each_running_country_on_its_own_schedule(environment):
-    """The whole point of per-country timers is being able to SEE them."""
+async def test_no_panel_text_mentions_useddelete(environment):
+    """The cleanup command is gone entirely - nothing the panel shows may
+    still offer or promise it."""
+    await _queue_one(environment)
+    texts = [await otp_panel.status_text()]
+    for force in (False, True):
+        texts += [b.text for row in otp_panel.cleanup_keyboard(force).inline_keyboard
+                  for b in row]
+    texts += [b.text for row in otp_panel.control_keyboard(True).inline_keyboard for b in row]
+    await otp_bot.set_cleanup_mode("used")
+    texts.append(await otp_panel.status_text())
+
+    assert not any("useddelete" in text.lower() for text in texts)
+    assert not any("cleanup_command" in text for text in texts)
+
+
+@asyncio_test
+async def test_status_text_shows_one_interval_for_every_country(environment):
+    """One /st checks every country: the interval is said once, for all of
+    them, and a country with settings of its own is still marked."""
     from app.automation import otp_schedule
     from app.integrations.telegram_user import set_userbot
 
@@ -149,14 +199,14 @@ async def test_status_text_shows_each_running_country_on_its_own_schedule(enviro
 
     set_userbot(_Bot())
     await otp_bot.start_automation()
-    await otp_schedule.set_country_settings("Bangladesh", {"interval_minutes": 5})
+    await otp_bot.save_config({"interval_minutes": 2})
+    await otp_schedule.set_country_settings("Bangladesh", {"quota_threshold": 500})
 
-    text = await otp_panel.status_text()
-    assert "Bangladesh" in text
-    # The status is a table now: the "Every" column carries 5m, starred as
-    # a per-country setting.
-    assert "5m*" in text
-    assert "*" in text  # marked as customised
+    text = otp_panel.html_to_plain(await otp_panel.status_text())
+    assert "Bangladesh*" in text  # marked as customised
+    assert "* custom settings" in text
+    assert text.count("every 2 min (all countries)") == 1
+    assert "Every" not in text
 
 
 @asyncio_test

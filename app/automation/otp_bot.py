@@ -17,14 +17,15 @@ Workflow (matches how the owner actually uses it):
        files often mean different countries/campaigns - so start() refuses to
        run until every queued file has one; the caller is expected to collect
        missing tags (one prompt per untagged file) before calling start().
-    3. start() sends the cleanup command once, then for every queued file:
-       sends the file, replies to that file's message with the add-numbers
-       command carrying its own tag. Successful files move from the queue
-       into ACTIVE_FILES and the periodic monitor turns on.
-    4. The scheduler (see app/workers/scheduler_worker.py) checks quota on
-       its own timer while enabled=True; when the bot reports quota <=
-       threshold, it re-runs cleanup + re-add for every active file (same
-       tags, no new prompts needed - they were already collected at start).
+    3. start() sends, for every queued file: the file, then a reply to that
+       file's message with the add-numbers command carrying its own tag.
+       Successful files move from the queue into ACTIVE_FILES and the
+       periodic monitor turns on. No cleanup command is ever sent.
+    4. The scheduler (see app/workers/scheduler_worker.py) checks stock on
+       ONE shared timer (interval_minutes, every country at once - a single
+       /st answers for all of them) while enabled=True; a country at or
+       below its threshold is re-added (same tags, no new prompts needed -
+       they were already collected at start).
     5. "stop" just turns the periodic monitor off. Queue and active-files
        history are left alone, so restarting later is a fresh decision, not
        a silent resume of possibly-stale state.
@@ -73,17 +74,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # interval this traffic otherwise buries the chat the owner reads.
     "tidy_stock_messages": True,
     "quota_threshold": 0,        # refill when active quota <= this
-    # Sent once before adding. Blank = send nothing, which is the default:
-    # the owner does not want /useddelete recycling used numbers back into
-    # stock, so nothing is sent unless a command is configured explicitly.
-    "cleanup_command": "",
-    # Force-delete (Owner-level "/frcd <country> <uid>"). /useddelete only
-    # clears used/expired numbers; when a country's stock must be wiped
-    # outright before re-adding, this is the command that does it.
+    # No cleanup command exists any more: the owner does not want /useddelete
+    # recycling used numbers back into stock, so nothing like it is sent.
+    # Force-delete (Owner-level "/frcd <country> <uid>") is the one way to
+    # wipe a country's stock outright before re-adding, and it is opt-in.
     "force_delete_command": "/frcd {country} {uid}",
     "force_delete_before_add": False,
     "force_delete_uid": "",      # owner's own uid; blank disables force-delete
-    "interval_minutes": 10,
+    # ONE check interval for every country. A single /st reports stock for
+    # all of them at once, so there is one shared timer, not one per country.
+    "interval_minutes": 1,
     "default_tag": "",           # if set, every new file auto-tags with this, never asks
     # Lifecycle limits. 0 = no limit, which is the old behaviour: run until
     # the owner says stop.
@@ -122,10 +122,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "awaiting_tag_entry_id": None,  # set while a "what tag for X" prompt is pending
     # Bumped when a stored config needs a one-off correction on load; see
     # get_config(). A fresh install starts at the current version.
-    "config_version": 2,
+    "config_version": 3,
 }
 
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 # Seeded as the dedicated thread's first message so it gets a recognisable
 # title in the thread list (list_threads titles a thread from its first user
@@ -303,6 +303,12 @@ def _added_for(text: str, country: str | None) -> int | None:
 
 KNOWN_COUNTRIES_KEY = "otp_bot_known_countries"
 
+# Shown whenever something tries to give one country its own interval.
+INTERVAL_IS_GLOBAL = (
+    "The check interval is the same for every country. "
+    "Change it with: /otpset interval_minutes <minutes>"
+)
+
 
 # Everything the owner can change from a chat, with the validation each
 # needs. Kept as data rather than a wall of if/elif so Telegram, the web UI
@@ -317,11 +323,6 @@ SETTABLE_FIELDS: dict[str, dict[str, Any]] = {
         "type": "str",
         "label": "Stock-check command",
         "example": "/st",
-    },
-    "cleanup_command": {
-        "type": "str",
-        "label": "Cleanup command sent before adding (none = send nothing)",
-        "example": "none",
     },
     "add_command_template": {
         "type": "str",
@@ -345,10 +346,10 @@ SETTABLE_FIELDS: dict[str, dict[str, Any]] = {
     },
     "interval_minutes": {
         "type": "int",
-        "label": "Default check interval (minutes)",
+        "label": "Check interval for all countries (minutes)",
         "min": 1,
         "max": 1440,
-        "example": "10",
+        "example": "1",
     },
     "quota_threshold": {
         "type": "int",
@@ -488,10 +489,6 @@ def coerce_setting(key: str, raw: str) -> Any:
             raise ValueError(f"{key}: must be between {low:,} and {high:,}.")
         return number
 
-    # "none" is how a blank is typed in a chat: no cleanup command at all.
-    if key == "cleanup_command" and value.casefold() in {"", "none", "off", "no", "-", "na"}:
-        return ""
-
     # Strings: a template that loses its placeholders silently stops working,
     # so check the ones the sender actually substitutes.
     if key == "add_command_template" and "{tag}" not in value:
@@ -596,7 +593,8 @@ async def describe_settings() -> str:
         "     /otpset force_delete_before_add on",
         "",
         "Just for one country: /otpset <country> <key> <value>",
-        "e.g. /otpset Bangladesh interval_minutes 5",
+        "e.g. /otpset Bangladesh quota_threshold 200",
+        "(The check interval is shared by every country.)",
     ]
     return "\n".join(lines)
 
@@ -605,6 +603,10 @@ async def set_country_setting_from_chat(country: str, key: str, raw: str) -> str
     """Per-country override of the same fields."""
     from app.automation import otp_schedule
 
+    if key == "interval_minutes":
+        # One /st answers for every country, so there is one shared check
+        # timer - a per-country interval no longer means anything.
+        raise ValueError(INTERVAL_IS_GLOBAL)
     if key not in otp_schedule.OVERRIDABLE:
         allowed = ", ".join(otp_schedule.OVERRIDABLE)
         raise ValueError(f"'{key}' can't be set per country. These can: {allowed}")
@@ -618,9 +620,7 @@ async def set_country_setting_from_chat(country: str, key: str, raw: str) -> str
         await otp_schedule.set_paused(canonical, bool(value))
     else:
         await otp_schedule.set_country_settings(canonical, {key: value})
-    if key == "interval_minutes":
-        await otp_schedule.arm_country(canonical, int(value))
-    shown = "on" if value is True else "off" if value is False else value
+    shown ="on" if value is True else "off" if value is False else value
     return f"\u2705 Saved for {canonical}: {key} = {shown}"
 
 
@@ -669,6 +669,12 @@ async def handle_pending_input(text: str) -> str | None:
         else:
             reply = await set_setting_from_chat(field, text)
     except ValueError as exc:
+        if country and field == "interval_minutes":
+            # A per-country interval question left over from before the
+            # interval became global: no answer can ever satisfy it, so
+            # close it instead of asking again forever.
+            await set_pending_input(None)
+            return f"\u274C {exc}"
         # Keep the question open: the owner meant to answer it, they just
         # typed something unusable, and dropping it would lose the context.
         return f"\u274C {exc}\n\nPlease try again, or say \"skip\" to cancel."
@@ -840,6 +846,8 @@ async def get_config() -> dict[str, Any]:
     merged = dict(DEFAULT_CONFIG)
     if stored:
         merged.update(stored)
+        # Not a setting any more (config v3): no cleanup command is ever sent.
+        merged.pop("cleanup_command", None)
         # A stored "" for start_at predates this setting existing: the field
         # was written on every save, so an install that never chose a start
         # time still holds an empty string, and that empty string would mask
@@ -849,28 +857,46 @@ async def get_config() -> dict[str, Any]:
         if stored.get("start_at", START_NOW) == "":
             merged["start_at"] = DEFAULT_CONFIG["start_at"]
 
-        if int(stored.get("config_version") or 1) < 2:
-            # Version 2: the owner asked for two things to stop for good.
-            #   - /useddelete before every add. It put used numbers back
-            #     into stock; blank now means "send no cleanup command".
-            #   - Wiping a country off the bot when its run ends. A finished
-            #     run is now HELD (file kept, country paused) instead.
-            # Applied once and persisted, so either can still be turned
-            # back on deliberately afterwards.
-            if merged.get("cleanup_command") == "/useddelete":
-                merged["cleanup_command"] = ""
-            merged["delete_when_done"] = False
+        version = int(stored.get("config_version") or 1)
+        if version < CONFIG_VERSION:
+            if version < 2:
+                # Version 2: the owner asked for two things to stop for good.
+                #   - /useddelete before every add. It put used numbers back
+                #     into stock. (Version 3 removed the setting entirely.)
+                #   - Wiping a country off the bot when its run ends. A
+                #     finished run is now HELD (file kept, country paused).
+                # Applied once and persisted, so the wipe can still be turned
+                # back on deliberately afterwards.
+                merged["delete_when_done"] = False
+            if version < 3:
+                # Version 3: ONE check for every country. A single /st
+                # reports stock for all of them, so the old per-country
+                # intervals (and the 10/60-minute defaults behind them) only
+                # left countries waiting on stale timers. The cleanup
+                # command is gone too (popped above), so nothing like
+                # /useddelete can ever be sent again.
+                merged["interval_minutes"] = 1
             merged["config_version"] = CONFIG_VERSION
+            # Persisted once, BEFORE the per-country fixes below: those call
+            # back into code that reads the config, which must already see
+            # the new version rather than migrate a second time.
             async with session_scope() as session:
                 await repo.set_setting(session, SETTING_KEY, merged)
-            # The same goes for a country's own override (e.g. left by the
-            # "One-shot burst" preset): turning only the global flag off
-            # still had that country /frcd'd at the end of its run.
-            for key, overrides in (await otp_schedule.get_all_country_settings()).items():
-                if overrides.get("delete_when_done") is True:
-                    await otp_schedule.set_country_settings(
-                        str(overrides.get("display_name") or key), {"delete_when_done": False}
-                    )
+            if version < 2:
+                # The same goes for a country's own override (e.g. left by
+                # the "One-shot burst" preset): turning only the global flag
+                # off still had that country /frcd'd at the end of its run.
+                for key, overrides in (await otp_schedule.get_all_country_settings()).items():
+                    if overrides.get("delete_when_done") is True:
+                        await otp_schedule.set_country_settings(
+                            str(overrides.get("display_name") or key),
+                            {"delete_when_done": False},
+                        )
+            if version < 3:
+                # Every per-country interval goes, the old staggered due
+                # times go with them, and the shared check is due right now
+                # so nothing keeps waiting out an old 60-minute timer.
+                await otp_schedule.migrate_to_shared_timer()
             log.info("otp_bot_config_migrated", extra={"version": CONFIG_VERSION})
     return merged
 
@@ -880,6 +906,11 @@ async def save_config(patch: dict[str, Any]) -> dict[str, Any]:
     current.update({k: v for k, v in patch.items() if k in DEFAULT_CONFIG})
     async with session_scope() as session:
         await repo.set_setting(session, SETTING_KEY, current)
+    if "interval_minutes" in patch:
+        # A shorter interval takes effect now: the shared check is pulled in
+        # to one new interval from now instead of waiting out the old one.
+        # (A longer one applies from the next check; nothing is postponed.)
+        await otp_schedule.arm_country("", otp_schedule.interval_of(current))
     if "start_at" in patch:
         # Runs still waiting on the old default follow the new one; runs
         # already going are never paused by it.
@@ -1568,10 +1599,11 @@ def _add_wait_seconds(entry: dict[str, Any]) -> float:
 async def _force_delete_country(target: str, country: str, cfg: dict[str, Any]) -> str:
     """Owner-level /frcd for one country, when configured.
 
-    /useddelete only removes used/expired numbers. Re-adding a country whose
-    stock is still live would just pile duplicates on top (the bot reports
-    them as "dup"), so when the owner wants a genuine replace rather than a
-    top-up, this wipes that country's numbers first.
+    Re-adding a country whose stock is still live would just pile duplicates
+    on top (the bot reports them as "dup"), so when the owner wants a genuine
+    replace rather than a top-up, this wipes that country's numbers first.
+    It is the only "clean-up" this module ever sends, and only when
+    force_delete_before_add is on.
     """
     uid = str(cfg.get("force_delete_uid") or "").strip()
     if not uid:
@@ -1726,7 +1758,6 @@ async def _start_scheduled(
     if not entries:
         return started, held
 
-    cleaned_up = False
     for entry in entries:
         country = entry.get("country") or entry["name"]
         entry_cfg = await otp_schedule.effective_config(country, cfg)
@@ -1753,9 +1784,6 @@ async def _start_scheduled(
             "error": "",
         }
         try:
-            if not cleaned_up:
-                await _send_cleanup(target, cfg)
-                cleaned_up = True
             outcome["reply"] = (await _add_one_file(target, entry, entry_cfg))[:300]
             outcome["added"] = True
         except (UserbotError, AddRejected, FileNotFoundError) as exc:
@@ -1776,25 +1804,6 @@ async def _start_scheduled(
             entry.pop("waiting_start", None)
 
     return started, held
-
-
-async def _send_cleanup(target: str, cfg: dict[str, Any]) -> None:
-    """Send the configured cleanup command, if there is one.
-
-    Blank (the default) sends nothing: the owner does not want /useddelete
-    putting used numbers back into stock. Best-effort - a failed cleanup
-    must not stop the add that follows it.
-    """
-    command = str(cfg.get("cleanup_command") or "").strip()
-    if not command:
-        return
-    try:
-        await _bot_call(get_userbot().send_message(target, command), _BOT_CALL_TIMEOUT_S)
-        await _sleep(2)
-    except UserbotError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - cleanup is best-effort
-        log.warning("otp_bot_cleanup_failed", extra={"error": str(exc)[:200]})
 
 
 async def _add_one_file(target: str, entry: dict[str, Any], cfg: dict[str, Any]) -> str:
@@ -2037,7 +2046,7 @@ async def _start_automation_locked(*, respect_schedule: bool) -> dict[str, Any]:
                     "country": entry.get("country"),
                     "count": entry.get("count"),
                     "tag": entry["tag"],
-                    "interval_minutes": entry_cfg.get("interval_minutes"),
+                    "interval_minutes": cfg.get("interval_minutes"),  # shared by every country
                     "added": False,
                     "waiting_start": start_at,
                     "starts_at": begins.isoformat() if begins else None,
@@ -2060,7 +2069,7 @@ async def _start_automation_locked(*, respect_schedule: bool) -> dict[str, Any]:
                     "country": entry.get("country"),
                     "count": entry.get("count"),
                     "tag": entry["tag"],
-                    "interval_minutes": entry_cfg.get("interval_minutes"),
+                    "interval_minutes": cfg.get("interval_minutes"),  # shared by every country
                     "added": False,
                     "stock": have,
                     "reply": f"bot already has {have:,} — kept until stock runs low",
@@ -2070,11 +2079,6 @@ async def _start_automation_locked(*, respect_schedule: bool) -> dict[str, Any]:
                 entry.pop("skipped_add", None)
                 entry.pop("held", None)
                 needs_add.append(entry)
-
-        # Only tidy up if something is actually going to be added; otherwise
-        # this is a pointless command in a chat the owner reads.
-        if needs_add:
-            await _send_cleanup(target, cfg)
 
         for entry in needs_add:
             country = entry.get("country") or entry["name"]
@@ -2095,7 +2099,7 @@ async def _start_automation_locked(*, respect_schedule: bool) -> dict[str, Any]:
                 "country": entry.get("country"),
                 "count": entry.get("count"),
                 "tag": entry["tag"],
-                "interval_minutes": entry_cfg.get("interval_minutes"),
+                "interval_minutes": cfg.get("interval_minutes"),  # shared by every country
                 "added": True,
                 "stock": _stock_for(stock, country) if stock else None,
                 "reply": reply,
@@ -2124,15 +2128,14 @@ async def _start_automation_locked(*, respect_schedule: bool) -> dict[str, Any]:
 
     for entry in started:
         country = entry.get("country") or entry["name"]
-        entry_cfg = await otp_schedule.effective_config(country, cfg)
         # A country whose last run finished is paused (held). A new file
         # for it is the owner asking for a new run, so it comes off hold.
         was_finished = bool((await otp_schedule.get_run_state(country)).get("finished_at"))
-        # Arm every started country, added or not: the whole point of
-        # holding a file is that monitoring still runs and adds it later.
-        await otp_schedule.arm_country(
-            country, int(entry_cfg.get("interval_minutes", 10))
-        )
+        # Make sure the shared check is armed, added or not: the whole point
+        # of holding a file is that monitoring still runs and adds it later.
+        # This never pushes the shared check later for countries already
+        # running - it only arms it if nothing is due sooner.
+        await otp_schedule.arm_country(country, int(cfg.get("interval_minutes") or 1))
         # Fresh run: the refill count and the time limit both start now,
         # not from whenever this country last ran. For a country waiting
         # on a start time the clock is re-based when that time actually
@@ -2229,12 +2232,11 @@ async def maybe_auto_start() -> dict[str, Any] | None:
 
 
 async def set_cleanup_mode(mode: str) -> dict[str, Any]:
-    """Pick between "tidy up" and "wipe and replace" as one decision.
+    """Pick between "add on top" ("used") and "wipe and replace" ("force").
 
-    Exposed as a single choice because that is how the owner thinks about it;
-    the two config flags underneath (which command, and whether /frcd runs at
-    all) always have to move together, and letting them drift apart is how
-    you end up with force-delete "enabled" but silently inert.
+    Exposed as a single choice because that is how the owner thinks about it.
+    "used" keeps its old key for compatibility but sends nothing at all - no
+    cleanup command exists any more; "force" turns /frcd on before each add.
     """
     if mode == "force":
         return await save_config({"force_delete_before_add": True})
@@ -2354,15 +2356,18 @@ _SKIP_WORDS = {
 # The owner can still type anything else - these are shortcuts, not a
 # closed list.
 SERVICE_CHOICES = ("WhatsApp", "Telegram", "Facebook", "Google", "Instagram", "Signal")
-INTERVAL_CHOICES = (5, 10, 15, 30, 60)
+# One shared check interval for every country (minutes).
+INTERVAL_CHOICES = (1, 2, 5, 10, 15, 30)
 # Restock points offered as buttons. 0 means "wait until it is actually
 # empty"; anything above refills while numbers are still left, so the
 # country never goes dead between checks.
 THRESHOLD_CHOICES = (0, 100, 200, 500, 1000, 5000)
-# Cleanup style, phrased as the decision rather than the command: "just tidy
-# up" vs "wipe and replace". The second needs /frcd, which needs the uid.
+# What happens to a country's stock before its file is added, phrased as the
+# decision rather than the command: leave it alone, or wipe and replace. Only
+# the second sends anything (/frcd, which needs the uid); there is no
+# "/useddelete" option - no cleanup command is ever sent.
 CLEANUP_CHOICES = (
-    ("used", "\U0001F9F9 Used/expired only (/useddelete)"),
+    ("used", "\U0001F9F9 Don't wipe before adding"),
     ("force", "\U0001F5D1 Wipe country first (/frcd)"),
 )
 _CLEAR_PHRASES = ("sob bad", "sob remove", "clear queue", "queue clear",
@@ -2829,14 +2834,16 @@ async def run_cycle(config: dict[str, Any] | None = None, *, force: bool = False
     """One stock-check-and-refill pass over the ACTIVE files. Never raises -
     always returns a result, even on failure.
 
-    Countries share the target bot's single chat, so stock is read once per
-    pass; what differs per country is the settings used to re-add it (limit,
-    count, tag, cleanup mode), which come from otp_schedule.
+    ONE check for every country: a single /st reports stock for all of them,
+    so there is one shared timer (interval_minutes) and, when it comes up,
+    every started, unpaused country is looked at from that one reading. What
+    still differs per country is what happens next - hold, refill or finish,
+    with its own threshold/limit/count/tag/wipe mode from otp_schedule.
 
-    force=True ignores the per-country timers. The scheduler leaves it False
-    so each country keeps its own pace, but a human pressing "Check now" is
-    asking for a check right now - answering "not due yet" would make the
-    button look broken.
+    force=True ignores the shared timer (and re-arms it from now). The
+    scheduler leaves it False, but a human pressing "Check now" is asking
+    for a check right now - answering "not due yet" would make the button
+    look broken.
 
     The wait for the conversation is bounded (_CYCLE_LOCK_WAIT_S): if some
     other operation still holds it, this round reports "busy" and the next
@@ -2871,26 +2878,24 @@ async def _run_cycle_locked(config: dict[str, Any] | None, *, force: bool) -> Cy
         await _save_last_result(result)
         return result
 
-    # Only look at the countries whose own timer has come up. With a single
-    # shared interval a slow country was being re-added on the fast one's
-    # clock, which is pure noise for the target bot. A finished (held)
-    # country is paused, so due_countries already leaves it out.
-    countries = [e.get("country") or e["name"] for e in active_files]
+    # One shared timer for every country: when it comes up, every started,
+    # unpaused country is due together (one /st answers for all of them).
+    # Per-country timers left countries staggered - one checked now, the
+    # next an hour later - for no benefit. A finished (held) country is
+    # paused, so due_countries leaves it out.
+    countries = list(dict.fromkeys(e.get("country") or e["name"] for e in active_files))
     if force:
-        # A manual check looks at everything, and still re-arms the timers so
-        # the next automatic pass is measured from now. A country still
-        # waiting for its start time is exempt: "Check now" means check what
-        # is running, not "override the schedule I just set".
+        # A manual check looks at everything, and still re-arms the shared
+        # timer so the next automatic pass is measured from now. A country
+        # still waiting for its start time is exempt: "Check now" means check
+        # what is running, not "override the schedule I just set".
         ready = [
             c for c in countries
             if await otp_schedule.has_started(c, cfg)
             and not await otp_schedule.is_paused(c)
         ]
-        for country in ready:
-            entry_cfg = await otp_schedule.effective_config(country, cfg)
-            await otp_schedule.arm_country(
-                country, int(entry_cfg.get("interval_minutes", 10))
-            )
+        if ready:
+            await otp_schedule.arm_shared_check(int(cfg.get("interval_minutes") or 1))
     else:
         ready = await otp_schedule.due_countries(countries, cfg)
     if not ready:
@@ -3025,11 +3030,8 @@ async def _run_cycle_locked(config: dict[str, Any] | None, *, force: bool) -> Cy
             await _save_last_result(result)
             return result
 
-        # Clean up once (only if a cleanup command is configured), then
-        # re-add the countries that ran low - each with its OWN
-        # limit/count/tag/wipe mode.
-        await _send_cleanup(target, cfg)
-
+        # Re-add the countries that ran low - each with its OWN
+        # limit/count/tag/wipe mode. No cleanup command is sent first.
         replies: list[str] = []
         for entry in refill:
             country = entry.get("country") or entry["name"]

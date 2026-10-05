@@ -612,7 +612,7 @@ class AgentBot:
                 cfg = await otp_bot.save_config({"enabled": True})
                 await message.answer(
                     f"\u2705 Automation enabled - checking {cfg['target_bot']} every "
-                    f"{cfg['interval_minutes']} min."
+                    f"{cfg['interval_minutes']} min (all countries)."
                 )
                 return
             if arg in {"off", "disable", "disabled"}:
@@ -742,10 +742,17 @@ class AgentBot:
                 return
 
             if action == "int":
+                # The ONE interval every country shares - there is no
+                # per-country interval (one /st checks them all at once).
                 minutes = int(rest)
+                if not 1 <= minutes <= 1440:
+                    await query.answer("Pick 1 to 1440 minutes.", show_alert=True)
+                    return
                 await otp_bot.save_config({"interval_minutes": minutes})
                 await query.answer(f"Every {minutes} min")
-                await refresh_panel(f"\u23F1 Checking every {minutes} minutes.")
+                await refresh_panel(
+                    f"\u23F1 Checking every {minutes} min (all countries)."
+                )
                 return
 
             if action == "clean":
@@ -773,9 +780,10 @@ class AgentBot:
                     await query.message.answer(
                         "\u23F1 How often should I check the stock?\n"
                         "\n"
-                        "\u2022 Applies to every country without its own setting\n"
+                        f"\u2022 Now: every {cfg['interval_minutes']} min\n"
+                        "\u2022 One interval for all countries - one check covers them all\n"
                         "\n"
-                        "Pick an interval below.",
+                        "Pick an interval below, or Custom to type one.",
                         reply_markup=otp_panel.interval_keyboard(cfg["interval_minutes"]),
                     )
                 return
@@ -811,7 +819,7 @@ class AgentBot:
                 await otp_bot.set_pending_input(field, None)
                 await query.answer()
                 prompt = (
-                    "\u23F1 How often should I check?\n"
+                    "\u23F1 How often should I check? (all countries)\n"
                     "\n"
                     "\u2022 Type the minutes (1-1440)\n"
                     if field == "interval_minutes"
@@ -828,7 +836,9 @@ class AgentBot:
                 await query.answer()
                 with contextlib.suppress(Exception):
                     await query.message.answer(
-                        "\U0001F9F9 What should I clean up before adding numbers?",
+                        "\U0001F9F9 Should I wipe a country before adding its numbers?\n"
+                        "\n"
+                        "• Wiping uses /frcd and needs your bot user id",
                         reply_markup=otp_panel.cleanup_keyboard(
                             bool(cfg.get("force_delete_before_add"))
                         ),
@@ -1298,10 +1308,10 @@ class AgentBot:
                 current = await otp_schedule.effective_config(country, cfg)
                 threshold = current.get("quota_threshold")
                 await query.answer()
+                # No per-country interval line: the check interval is global.
                 lines = [
                     f"\U0001F30D {country}",
                     "",
-                    f"\u2022 Checks every {current.get('interval_minutes')} min",
                     "\u2022 Restocks when empty"
                     if not threshold
                     else f"\u2022 Restocks when {int(threshold):,} are left",
@@ -1319,21 +1329,11 @@ class AgentBot:
                     )
                 return
 
-            if action == "pickc":
-                country = await pick_country(rest)
-                if country is None:
-                    await query.answer("That country is gone.", show_alert=True)
-                    return
-                cfg = await otp_bot.get_config()
-                current = await otp_schedule.effective_config(country, cfg)
-                await query.answer()
-                with contextlib.suppress(Exception):
-                    await query.message.answer(
-                        f"\u23F1 How often should I check {country}?",
-                        reply_markup=otp_panel.country_interval_keyboard(
-                            otp_panel.country_key(country), current.get("interval_minutes")
-                        ),
-                    )
+            if action in {"pickc", "cint", "cintc"}:
+                # Per-country "Check interval" buttons from before the
+                # interval became global. They still sit in chat history, so
+                # a tap is answered rather than erroring - and changes nothing.
+                await query.answer(otp_panel.INTERVAL_IS_GLOBAL, show_alert=False)
                 return
 
             if action == "pickt":
@@ -1376,7 +1376,7 @@ class AgentBot:
                 await refresh_panel(note)
                 return
 
-            if action in {"cintc", "cthrc"}:
+            if action == "cthrc":
                 # Custom value: ask for it and consume the owner's next
                 # message (handled in conversation.py, so it works from the
                 # web chat too).
@@ -1384,35 +1384,15 @@ class AgentBot:
                 if country is None:
                     await query.answer("That country is gone.", show_alert=True)
                     return
-                field = "interval_minutes" if action == "cintc" else "quota_threshold"
-                await otp_bot.set_pending_input(field, country)
+                await otp_bot.set_pending_input("quota_threshold", country)
                 await query.answer()
-                prompt = (
-                    f"\u23F1 How often should I check {country}?\n"
-                    "\n"
-                    "\u2022 Type the minutes (1-1440)\n"
-                    if field == "interval_minutes"
-                    else f"\U0001F4E6 Restock {country} when how many numbers are left?\n"
-                    "\n"
-                    "\u2022 Type a number (0 = when empty)\n"
-                )
                 with contextlib.suppress(Exception):
-                    await query.message.answer(prompt + _SKIP_HINT)
-                return
-
-            if action == "cint":
-                index_raw, minutes_raw = rest.split(":", 1)
-                country = await pick_country(index_raw)
-                if country is None:
-                    await query.answer("That country is gone.", show_alert=True)
-                    return
-                minutes = int(minutes_raw)
-                await otp_schedule.set_country_settings(
-                    country, {"interval_minutes": minutes}
-                )
-                await otp_schedule.arm_country(country, minutes)
-                await query.answer(f"{country}: every {minutes} min")
-                await refresh_panel(f"\u23F1 {country} is now checked every {minutes} min.")
+                    await query.message.answer(
+                        f"\U0001F4E6 Restock {country} when how many numbers are left?\n"
+                        "\n"
+                        "\u2022 Type a number (0 = when empty)\n"
+                        + _SKIP_HINT
+                    )
                 return
 
             if action == "ask_preset":
@@ -1439,9 +1419,9 @@ class AgentBot:
                 await query.answer()
                 lines = [f"\U0001F4D0 Pick a preset for {country}", ""]
                 for name in preset_names:
+                    # No interval here: presets cannot set one (it is global).
                     note = presets[name].get("_note", "")
-                    every = presets[name].get("interval_minutes")
-                    lines.append(f"\u2022 {name} ({every}m) - {note}" if note else f"\u2022 {name} ({every}m)")
+                    lines.append(f"\u2022 {name} - {note}" if note else f"\u2022 {name}")
                 with contextlib.suppress(Exception):
                     await query.message.answer(
                         "\n".join(lines),
@@ -1549,7 +1529,7 @@ class AgentBot:
             try:
                 # A known key in first position means global; anything else is
                 # read as a country name, which can be several words
-                # ("Central African Republic interval_minutes 5").
+                # ("Central African Republic quota_threshold 500").
                 if parts[0] in otp_bot.SETTABLE_FIELDS:
                     if len(parts) < 2:
                         spec = otp_bot.SETTABLE_FIELDS[parts[0]]
@@ -1605,8 +1585,6 @@ class AgentBot:
                 for name in sorted(presets):
                     preset = presets[name]
                     bits = []
-                    if preset.get("interval_minutes") is not None:
-                        bits.append(f"every {preset['interval_minutes']}m")
                     if preset.get("quota_threshold") is not None:
                         bits.append(
                             f"refill at {preset['quota_threshold']}"
@@ -1621,7 +1599,7 @@ class AgentBot:
                         lines.append(f"    {preset['_note']}")
                 lines += [
                     "",
-                    "Create: /otppreset save <name> quota_threshold=200 interval_minutes=10",
+                    "Create: /otppreset save <name> quota_threshold=200 limit=4",
                     "Apply:  /otppreset use <name> for <country>",
                     "Delete: /otppreset delete <name>",
                 ]
@@ -1677,7 +1655,7 @@ class AgentBot:
                 first_pair = next((i for i, p in enumerate(rest) if "=" in p), None)
                 if first_pair is None or first_pair == 0:
                     await message.answer(
-                        "Usage: /otppreset save <name> quota_threshold=200 interval_minutes=10\n"
+                        "Usage: /otppreset save <name> quota_threshold=200 limit=4\n"
                         "\n"
                         f"Fields you can set: {', '.join(otp_schedule.OVERRIDABLE)}"
                     )

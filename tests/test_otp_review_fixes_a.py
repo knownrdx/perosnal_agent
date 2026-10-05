@@ -360,7 +360,7 @@ async def _store_v1_config() -> None:
 async def test_the_v2_migration_turns_off_per_country_delete_when_done(environment):
     await _store_v1_config()
     await otp_schedule.apply_preset("One-shot burst", "Senegal")
-    await otp_schedule.set_country_settings("Kenya", {"interval_minutes": 5})
+    await otp_schedule.set_country_settings("Kenya", {"limit": 5})
     assert (await otp_schedule.get_country_settings("Senegal"))["delete_when_done"] is True
 
     cfg = await otp_bot.get_config()

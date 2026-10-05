@@ -254,7 +254,7 @@ async def test_every_country_keyboard_fits_the_64_byte_limit_with_long_names():
         otp_panel.removal_keyboard(entries),
         otp_panel.file_delete_keyboard(entries, entries),
         otp_panel.country_field_keyboard(key, LONG_NAMES[0]),
-        otp_panel.country_interval_keyboard(key, 10),
+        otp_panel.interval_keyboard(7),
         otp_panel.country_threshold_keyboard(key, 0),
         otp_panel.stop_time_keyboard(key, "06:00"),
         otp_panel.start_time_keyboard(key, "06:00"),
@@ -354,6 +354,15 @@ async def test_the_wipe_mode_warning_no_longer_promises_useddelete(runner):
     query = await _tap(runner, "otp:clean:force")
     assert query.message.answers
     assert "/useddelete" not in query.message.answers[-1]["text"]
+
+
+async def test_the_cleanup_picker_never_mentions_useddelete(runner):
+    query = await _tap(runner, "otp:ask_clean:")
+    answer = query.message.answers[-1]
+    labels = [b.text.removeprefix("✅ ") for row in answer["markup"].inline_keyboard
+              for b in row]
+    assert labels == [label for _, label in otp_bot.CLEANUP_CHOICES]
+    assert "useddelete" not in (answer["text"] + " ".join(labels)).lower()
 
 
 # --------------------------------------------------------------------------- #

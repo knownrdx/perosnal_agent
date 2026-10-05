@@ -23,10 +23,11 @@ from app.scheduler.timeparse import TimeParseError, next_cron
 
 log = get_logger(__name__)
 
-# How often the OTP automation is LOOKED at. Per-country due times live in
-# otp_schedule and run_cycle() answers "not due yet" cheaply, so looking every
-# minute costs nothing - whereas pacing on the shortest country interval made
-# a 30-minute install wait up to 30 minutes after every boot or setting change.
+# How often the OTP automation is LOOKED at. The one shared check time (every
+# country at once) lives in otp_schedule and run_cycle() answers "not due yet"
+# cheaply, so looking every minute costs nothing - whereas pacing on the
+# interval made a 30-minute install wait up to 30 minutes after every boot or
+# setting change.
 OTP_LOOK_EVERY = timedelta(seconds=60)
 
 # Upper bound for one run_cycle(). A cycle legitimately waits up to ~90 s per
@@ -299,12 +300,13 @@ class SchedulerRunner:
         Automation panel / /otpbot Telegram command; no code change needed to
         turn it on, change the interval, or point it at a different bot.
 
-        The per-country due times live in otp_schedule, so this only paces
+        The one shared check time (every country together - a single /st
+        answers for all of them) lives in otp_schedule, so this only paces
         how often we LOOK: every OTP_LOOK_EVERY, starting on the first tick
-        after boot. run_cycle() itself is a cheap no-op ("not due yet") when
-        nothing has come up, and a country seen for the first time is armed
-        rather than fired (otp_schedule.due_countries), so looking straight
-        away on boot does not trigger a burst of refills.
+        after boot. run_cycle() itself is a cheap no-op ("not due yet") until
+        that time comes up, and a timer never armed before is armed rather
+        than fired (otp_schedule.due_countries), so looking straight away on
+        a fresh install does not trigger a burst of refills.
 
         Every owner-facing message here is plain English with one layout:
         an emoji header, a blank line, one "\u2022" bullet per country, and a

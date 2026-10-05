@@ -876,11 +876,12 @@
             <div class="panel-section">
               <h3>Per country</h3>
               <p class="small">
-                Each country runs on its own clock, because they drain at
-                different rates - one stock check (<code>/st</code>) reports
-                every country at once, and only the empty ones get refilled.
+                One stock check (<code>/st</code>) reports every country at
+                once, so every country is checked together on the one interval
+                set under Settings; only the ones that are low get refilled.
                 Blank fields fall back to the global settings below.
               </p>
+              <p class="small" id="otpbot-next-check">&nbsp;</p>
               <p class="small" id="otpbot-clock">&nbsp;</p>
               <p class="small" id="otpbot-llm-health">&nbsp;</p>
               <div id="otpbot-schedule-list">Loading...</div>
@@ -901,10 +902,6 @@
                 <div>
                   <label for="otpbot-preset-name">New preset name</label>
                   <input type="text" id="otpbot-preset-name" placeholder="e.g. Night shift">
-                </div>
-                <div>
-                  <label for="otpbot-preset-interval">Every (min)</label>
-                  <input type="number" id="otpbot-preset-interval" min="1" value="10">
                 </div>
                 <div>
                   <label for="otpbot-preset-threshold">Refill at (stock left)</label>
@@ -942,8 +939,10 @@
 
               <div class="row mt8">
                 <div>
-                  <label for="otpbot-interval">Check every (minutes)</label>
-                  <input type="number" id="otpbot-interval" min="1">
+                  <label for="otpbot-interval">Check every (minutes, all countries)</label>
+                  <input type="number" id="otpbot-interval" min="1" max="1440" value="1"
+                         title="One check covers every country, so this one interval applies to all of them.">
+
                 </div>
                 <div>
                   <label for="otpbot-threshold">Refill when active quota &le;</label>
@@ -997,12 +996,6 @@
                   <label for="otpbot-quota-cmd">Stock-check command</label>
                   <input type="text" id="otpbot-quota-cmd">
                 </div>
-                <div>
-                  <label for="otpbot-cleanup-cmd">Cleanup command</label>
-                  <input type="text" id="otpbot-cleanup-cmd"
-                         placeholder="Blank = no cleanup command"
-                         title="Sent before each add. Leave blank to send no cleanup command at all.">
-                </div>
               </div>
 
               <label class="small" style="margin-top:10px; display:flex; align-items:center; gap:6px;">
@@ -1010,7 +1003,7 @@
                 Force-delete each country before re-adding it (/frcd)
               </label>
               <p class="small" style="color:var(--text-dim); margin:-2px 0 6px;">
-                A cleanup command (if set) only clears used/expired numbers. Turn this on to wipe a
+                Off: numbers are only added - nothing is deleted first. Turn this on to wipe a
                 country's stock outright first - a true replace instead of a
                 top-up, which otherwise just piles up duplicates.
               </p>
@@ -2285,11 +2278,9 @@
         if (quiet && isEditing) return;
         qs("#otpbot-enabled").checked = !!cfg.enabled;
         qs("#otpbot-target").value = cfg.target_bot || "";
-        qs("#otpbot-interval").value = cfg.interval_minutes != null ? cfg.interval_minutes : 10;
+        qs("#otpbot-interval").value = cfg.interval_minutes != null ? cfg.interval_minutes : 1;
         qs("#otpbot-threshold").value = cfg.quota_threshold != null ? cfg.quota_threshold : 0;
         qs("#otpbot-quota-cmd").value = cfg.quota_command || "/myquota";
-        // Blank is a real choice ("send no cleanup command"), so no fallback.
-        qs("#otpbot-cleanup-cmd").value = cfg.cleanup_command || "";
         qs("#otpbot-max-refills").value = cfg.max_refills != null ? cfg.max_refills : 0;
         qs("#otpbot-run-minutes").value = cfg.run_minutes != null ? cfg.run_minutes : 0;
         qs("#otpbot-stop-at").value = cfg.stop_at || "";
@@ -2318,6 +2309,7 @@
           .then(function (sched) {
             var presetNames = Object.keys(sched.presets || {}).sort();
             renderOtpBotSchedule(sched.countries, presetNames, data.active_files || []);
+            renderOtpBotNextCheck(sched.countries, cfg);
             renderOtpBotPresets(sched.presets);
           })
           .catch(function () {
@@ -2515,12 +2507,10 @@
     var body = {
       enabled: qs("#otpbot-enabled").checked,
       target_bot: qs("#otpbot-target").value.trim(),
-      interval_minutes: parseInt(qs("#otpbot-interval").value, 10) || 10,
+      // The one interval every country shares: 1-1440 minutes.
+      interval_minutes: Math.min(1440, Math.max(1, parseInt(qs("#otpbot-interval").value, 10) || 1)),
       quota_threshold: parseInt(qs("#otpbot-threshold").value, 10) || 0,
       quota_command: qs("#otpbot-quota-cmd").value.trim() || "/myquota",
-      // Blank means blank - substituting a default here would re-enable the
-      // cleanup command every time the dashboard saves.
-      cleanup_command: qs("#otpbot-cleanup-cmd").value.trim(),
       max_refills: isNaN(parseInt(qs("#otpbot-max-refills").value, 10))
         ? 0 : parseInt(qs("#otpbot-max-refills").value, 10),
       run_minutes: isNaN(parseInt(qs("#otpbot-run-minutes").value, 10))
@@ -2607,16 +2597,11 @@
 
       var label = document.createElement("span");
       label.style.flex = "1";
-      var when = row.due_in_seconds == null
-        ? "not scheduled"
-        : (row.due_in_seconds <= 0 ? "due now" : "in " + Math.max(1, Math.floor(row.due_in_seconds / 60)) + "m");
-      if (row.waiting_to_start) {
-        // Saying "due in 5m" for a country that will not touch the bot
-        // until 21:00 is simply false.
-        when = "waiting for " + row.start_at;
-      }
+      // No per-country interval or next check: one /st checks every
+      // country, so both are shown once, above the list.
       label.textContent = (row.paused ? "OFF " : (row.waiting_to_start ? "WAIT " : ""))
-        + row.country + " - every " + row.interval_minutes + "m, next " + when
+        + row.country
+        + (row.waiting_to_start && row.start_at ? " - starts " + row.start_at : "")
         + (row.stop_at ? ", off at " + row.stop_at : "")
         + (row.run_minutes ? ", runs " + row.run_minutes + "m" : "")
         + (row.customised && row.customised.length ? " *" : "");
@@ -2639,14 +2624,6 @@
         }).catch(function () { showConfirm("Failed to change " + row.country + "."); });
       });
       box.appendChild(onOffBtn);
-
-      var every = document.createElement("input");
-      every.type = "number";
-      every.min = "1";
-      every.value = row.interval_minutes;
-      every.title = "Check this country every N minutes";
-      every.style.width = "70px";
-      box.appendChild(every);
 
       var thresh = document.createElement("input");
       thresh.type = "number";
@@ -2695,7 +2672,6 @@
         apiFetchJson("/api/otpbot/country/" + encodeURIComponent(row.country) + "/settings", {
           method: "POST",
           body: {
-            interval_minutes: parseInt(every.value, 10) || row.interval_minutes,
             // 0 is meaningful ("wait until empty"), so NaN is the only fallback.
             quota_threshold: isNaN(t) ? row.quota_threshold : t,
             limit: parseInt(limit.value, 10) || row.limit,
@@ -2735,6 +2711,24 @@
     });
   }
 
+  function renderOtpBotNextCheck(rows, cfg) {
+    // One check covers every country, so the interval and the next check
+    // are the same for all of them - said once here.
+    var el = qs("#otpbot-next-check");
+    var interval = (cfg && cfg.interval_minutes) || 1;
+    var text = "Checks every " + interval + " min (all countries)";
+    var dues = (rows || []).filter(function (row) {
+      return row && !row.paused && !row.waiting_to_start && row.due_in_seconds != null;
+    }).map(function (row) { return row.due_in_seconds; });
+    if (cfg && cfg.enabled && dues.length) {
+      var due = Math.min.apply(null, dues);
+      var when = due <= 0 ? "now"
+        : (due < 60 ? "in " + due + "s" : "in " + Math.ceil(due / 60) + "m");
+      text = "Next check " + when + " - every " + interval + " min (all countries)";
+    }
+    el.textContent = text;
+  }
+
   function renderOtpBotPresets(presets) {
     var el = qs("#otpbot-preset-list");
     el.textContent = "";
@@ -2753,7 +2747,6 @@
       var label = document.createElement("span");
       label.style.flex = "1";
       var bits = [];
-      if (preset.interval_minutes != null) bits.push("every " + preset.interval_minutes + "m");
       if (preset.quota_threshold != null) {
         bits.push(preset.quota_threshold > 0
           ? "refill at " + preset.quota_threshold
@@ -2843,7 +2836,6 @@
     apiFetchJson("/api/otpbot/presets/" + encodeURIComponent(name), {
       method: "POST",
       body: {
-        interval_minutes: parseInt(qs("#otpbot-preset-interval").value, 10) || 10,
         // parseInt, then an explicit NaN check: 0 is a legitimate value here
         // ("wait until empty") and `|| 200` would silently rewrite it.
         quota_threshold: isNaN(parseInt(qs("#otpbot-preset-threshold").value, 10))

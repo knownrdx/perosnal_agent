@@ -807,12 +807,37 @@ async def test_per_country_setting_uses_the_bots_spelling(environment):
 
     await otp_bot.learn_countries({"Central African Republic": 5})
     reply = await otp_bot.set_country_setting_from_chat(
-        "central african republic", "interval_minutes", "5"
+        "central african republic", "quota_threshold", "200"
     )
 
     assert "Central African Republic" in reply
     settings = await otp_schedule.get_country_settings("Central African Republic")
-    assert settings["interval_minutes"] == 5
+    assert settings["quota_threshold"] == 200
+
+
+async def test_the_interval_cannot_be_set_per_country(environment):
+    """One check for every country: a per-country interval is refused with
+    directions to the global setting, and nothing is stored."""
+    from app.automation import otp_schedule
+
+    with pytest.raises(ValueError) as caught:
+        await otp_bot.set_country_setting_from_chat("Bangladesh", "interval_minutes", "5")
+    assert str(caught.value) == (
+        "The check interval is the same for every country. "
+        "Change it with: /otpset interval_minutes <minutes>"
+    )
+    assert "interval_minutes" not in await otp_schedule.get_country_settings("Bangladesh")
+
+
+async def test_a_leftover_per_country_interval_question_is_closed(environment):
+    """A pending "interval for Bangladesh?" from before the interval became
+    global can never be answered - it must not keep asking forever."""
+    await otp_bot.set_pending_input("interval_minutes", "Bangladesh")
+
+    reply = await otp_bot.handle_pending_input("5")
+
+    assert "same for every country" in reply
+    assert await otp_bot.get_pending_input() in (None, {})
 
 
 async def test_a_global_only_field_is_rejected_per_country(environment):
@@ -1632,13 +1657,14 @@ async def test_start_asks_for_missing_tags_before_running(environment):
     assert "missing_tags" in result and len(result["missing_tags"]) == 1
 
 
-async def test_start_sends_cleanup_then_reply_based_add_per_file(environment):
-    # This test is about the add mechanics (cleanup first, then file + reply
-    # command), so the stock pre-check is turned off - with it on, the first
-    # message sent is /st and the sequence under test starts one later.
-    # A cleanup command is only sent when one is configured (the default is
-    # none - the owner does not want /useddelete), so configure one here.
+async def test_start_sends_reply_based_add_per_file_and_no_cleanup(environment):
+    # This test is about the add mechanics (file + reply command, nothing
+    # before them), so the stock pre-check is turned off - with it on, the
+    # first message sent is /st and the sequence under test starts one later.
+    # cleanup_command is not a setting any more: even a stale attempt to
+    # store one is ignored, and nothing like /useddelete is ever sent.
     await otp_bot.save_config({"skip_add_if_stocked": False, "cleanup_command": "/cleanup"})
+    assert "cleanup_command" not in await otp_bot.get_config()
     rel = await _write_numbers_file("numbers_BD.txt")
     entry = await _enqueue_single(rel, "numbers_BD.txt")
     assert entry["tag"] == "BD"  # inferred, start() should proceed with no prompt
@@ -1650,11 +1676,12 @@ async def test_start_sends_cleanup_then_reply_based_add_per_file(environment):
     assert result["ok"] is True
     assert result["files"][0]["tag"] == "BD"
 
-    # cleanup command sent first
-    assert fake.sent_messages[0][1] == "/cleanup"
-    # file sent, then add-command sent as a REPLY to that file's message
+    # No cleanup command: the only message is the add command, sent as a
+    # REPLY to the file's message.
     assert len(fake.sent_files) == 1
-    add_reply_to = fake.sent_messages[1][2]
+    assert len(fake.sent_messages) == 1
+    assert fake.sent_messages[0][1].startswith("/fan ")
+    add_reply_to = fake.sent_messages[0][2]
     assert add_reply_to is not None
 
     # Queue is now empty, file moved to active, monitor turned on.
@@ -1946,7 +1973,7 @@ async def _start_with_one_active_file() -> FakeUserbot:
     fake = FakeUserbot([{"text": "Added.", "out": False}])
     set_userbot(fake)
     await otp_bot.start_automation()
-    # start_automation arms each country's own timer, so a cycle run
+    # start_automation arms the shared check timer, so a cycle run
     # immediately afterwards would correctly report "not due yet". These
     # tests are about what a cycle DOES when it fires, so make it due.
     await _make_everything_due()
@@ -1954,7 +1981,7 @@ async def _start_with_one_active_file() -> FakeUserbot:
 
 
 async def _make_everything_due() -> None:
-    """Backdate every country's next-check time so the next cycle fires."""
+    """Backdate the shared next-check time so the next cycle fires."""
     from app.automation import otp_schedule
 
     due = await otp_schedule._get_due_map()

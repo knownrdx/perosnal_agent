@@ -29,6 +29,11 @@ PREFIX = "otp"
 # where every emoji here is two, hence the margin below the real limit.
 MESSAGE_LIMIT = 4000
 
+# One /st reports every country at once, so there is ONE check interval for
+# all of them. Buttons rendered before that (per-country "Check interval")
+# still sit in chat history; tapping one answers with this instead of failing.
+INTERVAL_IS_GLOBAL = "The check interval is now the same for all countries"
+
 
 def country_key(country: str) -> str:
     """A short, stable id for one country, for use in callback_data.
@@ -142,6 +147,7 @@ def service_keyboard(entry_id: str) -> InlineKeyboardMarkup:
 
 
 def interval_keyboard(current: int | None = None) -> InlineKeyboardMarkup:
+    """The ONE check interval, shared by every country."""
     buttons = [
         InlineKeyboardButton(
             # A tick on the active one, so the current setting is visible
@@ -152,9 +158,15 @@ def interval_keyboard(current: int | None = None) -> InlineKeyboardMarkup:
         for minutes in otp_bot.INTERVAL_CHOICES
     ]
     rows = _rows(buttons, per_row=3)
+    # A typed value (7 min, say) has no button of its own to tick, so the
+    # Custom button carries it - otherwise the current setting is invisible.
+    custom = current is not None and current not in otp_bot.INTERVAL_CHOICES
     rows.append([
         InlineKeyboardButton(
-            text="\u270F\uFE0F Custom", callback_data=f"{PREFIX}:intc:"
+            text=(
+                f"\u2705 Custom ({current} min)" if custom else "\u270F\uFE0F Custom"
+            ),
+            callback_data=f"{PREFIX}:intc:",
         )
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -204,7 +216,9 @@ def control_keyboard(enabled: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [toggle, InlineKeyboardButton(text="\U0001F504 Check now", callback_data=f"{PREFIX}:run:")],
         [
-            InlineKeyboardButton(text="\u23F1 Interval", callback_data=f"{PREFIX}:ask_int:"),
+            InlineKeyboardButton(
+                text="\u23F1 Check interval", callback_data=f"{PREFIX}:ask_int:"
+            ),
             InlineKeyboardButton(text="\U0001F4E6 Restock at", callback_data=f"{PREFIX}:ask_thr:"),
         ],
         [
@@ -281,26 +295,6 @@ def preset_keyboard(names: list[str], country_index: int | str) -> InlineKeyboar
     return InlineKeyboardMarkup(inline_keyboard=_rows(buttons, per_row=2))
 
 
-def country_interval_keyboard(country_index: int | str, current: int | None) -> InlineKeyboardMarkup:
-    buttons = [
-        InlineKeyboardButton(
-            text=(f"\u2705 {m} min" if m == current else f"{m} min"),
-            callback_data=f"{PREFIX}:cint:{country_index}:{m}",
-        )
-        for m in otp_bot.INTERVAL_CHOICES
-    ]
-    rows = _rows(buttons, per_row=3)
-    # The listed values are shortcuts, not the whole range - without this the
-    # owner cannot pick 7 or 90 minutes from Telegram at all.
-    rows.append([
-        InlineKeyboardButton(
-            text="\u270F\uFE0F Custom",
-            callback_data=f"{PREFIX}:cintc:{country_index}",
-        )
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
 def country_threshold_keyboard(country_index: int | str, current: int | None) -> InlineKeyboardMarkup:
     """When to restock this country - by numbers left, not only at zero."""
     buttons = [
@@ -324,7 +318,11 @@ def country_threshold_keyboard(country_index: int | str, current: int | None) ->
 
 
 def country_field_keyboard(country_index: int | str, country: str, paused: bool = False) -> InlineKeyboardMarkup:
-    """What about this country do you want to change?"""
+    """What about this country do you want to change?
+
+    No check interval here: one /st covers every country, so the interval
+    is global (main panel -> Check interval).
+    """
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
@@ -333,12 +331,6 @@ def country_field_keyboard(country_index: int | str, country: str, paused: bool 
             ),
             InlineKeyboardButton(
                 text="\U0001F5D1 Remove", callback_data=f"{PREFIX}:rmc2:{country_index}"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text="\u23F1 Check interval",
-                callback_data=f"{PREFIX}:pickc:{country_index}",
             ),
         ],
         [
@@ -554,9 +546,16 @@ STATE_LEGEND = {
 _COUNTRY_WIDTH = 14
 
 
-def _short_country(name: str) -> str:
+_STATE_WIDTH = 4
+
+
+def _short_country(name: str, marked: bool = False) -> str:
+    """The name cut to its column; a trailing '*' (inside the width) marks a
+    country with settings of its own."""
     flat = " ".join(name.split())
-    return flat if len(flat) <= _COUNTRY_WIDTH else flat[: _COUNTRY_WIDTH - 1] + "."
+    width = _COUNTRY_WIDTH - (1 if marked else 0)
+    short = flat if len(flat) <= width else flat[: width - 1] + "."
+    return short + ("*" if marked else "")
 
 
 def _number(value: Any) -> str:
@@ -594,8 +593,15 @@ def html_to_plain(text: str) -> str:
 
 async def _country_rows(
     active: list[dict[str, Any]], config: dict[str, Any], stock: dict[str, int]
-) -> list[tuple[str, ...]]:
-    """One table row per running country: state, name, sizes, timing."""
+) -> tuple[list[tuple[str, ...]], int | None]:
+    """One table row per running country - state, name, sizes, end - plus
+    the seconds until the next check (None when nothing is running).
+
+    There is no per-country timing column: one /st checks every country, so
+    the next check is the same for all of them and is shown once, in the
+    summary. What stays per country is its STATE, including when a waiting
+    country begins ("WAIT 21:00").
+    """
     from app.automation import otp_schedule
 
     overview = {
@@ -605,47 +611,54 @@ async def _country_rows(
         )
     }
     rows: list[tuple[str, ...]] = []
+    dues: list[int] = []
     for entry in active:
         country = entry.get("country") or entry["name"]
         row = overview.get(country, {})
         # A finished country is also paused, so finished is checked first -
         # "DONE" says more than "OFF" about why nothing is happening.
         if entry.get("finished_at"):
-            state, upcoming = "DONE", "done"
+            state = "DONE"
         elif entry.get("exhausted_at"):
-            state, upcoming = "USED", "new file"
+            state = "USED"
         elif row.get("paused"):
-            state, upcoming = "OFF", "paused"
+            state = "OFF"
         elif not await otp_schedule.has_started(country, config):
-            # Not running yet - "next in 5m" for a country that will not
-            # touch the bot until 21:00 would simply be false.
             begins = await otp_schedule.pending_start_at(country, config)
-            state = "WAIT"
-            upcoming = _dubai_hhmm(begins) if begins else str(row.get("start_at") or "?")
+            state = "WAIT " + (
+                _dubai_hhmm(begins) if begins else str(row.get("start_at") or "?")
+            )
         elif entry.get("held"):
-            state, upcoming = "HELD", "held"
+            state = "HELD"
         else:
-            due = row.get("due_in_seconds")
             state = "RUN"
-            upcoming = "now" if due is None or due <= 0 else _span(max(1, due // 60))
-        every = _span(row.get("interval_minutes") or config.get("interval_minutes"))
-        if row.get("customised"):
-            every += "*"
+            if row.get("due_in_seconds") is not None:
+                dues.append(int(row["due_in_seconds"]))
         ends = str(row.get("stop_at") or "") or _span(row.get("run_minutes"))
         have = otp_bot._stock_for(stock, country) if stock else None
         rows.append((
-            state, _short_country(country), _number(entry.get("count") or 0),
-            _number(have), every, ends, upcoming,
+            state, _short_country(country, bool(row.get("customised"))),
+            _number(entry.get("count") or 0), _number(have), ends,
         ))
-    return rows
+    # The global timer gives every running country the same due time; min()
+    # only matters while an older per-country timer is still winding down.
+    return rows, (min(dues) if dues else None)
 
 
-def _table_line(cells: tuple[str, ...]) -> str:
-    state, country, size, have, every, ends, upcoming = cells
+def _table_line(cells: tuple[str, ...], state_width: int = _STATE_WIDTH) -> str:
+    state, country, size, have, ends = cells
     return (
-        f"{state:<4} {country:<{_COUNTRY_WIDTH}} {size:>7} {have:>7} "
-        f"{every:<6} {ends:<6} {upcoming}"
+        f"{state:<{state_width}} {country:<{_COUNTRY_WIDTH}} {size:>7} {have:>7} {ends}"
     ).rstrip()
+
+
+def _next_check(seconds: int) -> str:
+    """'now', 'in 45s', 'in 3m' - for the one shared next check."""
+    if seconds <= 0:
+        return "now"
+    if seconds < 60:
+        return f"in {seconds}s"
+    return f"in {_span(-(-seconds // 60))}"
 
 
 async def status_text() -> str:
@@ -667,13 +680,11 @@ async def status_text() -> str:
 
     threshold = int(config.get("quota_threshold") or 0)
     restock = f"{threshold:,} left" if threshold else "when empty"
-    cleanup_command = str(config.get("cleanup_command") or "").strip()
-    if config.get("force_delete_before_add"):
-        cleanup = "wipe country first (/frcd)"
-    elif cleanup_command:
-        cleanup = f"used/expired only ({cleanup_command})"
-    else:
-        cleanup = "nothing deleted before adding"
+    # Same wording as the Cleanup buttons, so the panel and the picker agree.
+    cleanup = dict(otp_bot.CLEANUP_CHOICES).get(
+        "force" if config.get("force_delete_before_add") else "used", ""
+    )
+    interval = max(1, int(config.get("interval_minutes") or 1))
     if last:
         last_check = (
             f"{'OK' if last.get('ok') else 'FAILED'} - {last.get('action') or '?'}"
@@ -691,17 +702,25 @@ async def status_text() -> str:
         f"<b>Stock command:</b> {esc(str(config.get('quota_command') or ''))}",
         f"<b>Restock point:</b> {esc(restock)}",
         f"<b>Cleanup mode:</b> {esc(cleanup)}",
-        f"<b>Last check:</b> {esc(last_check)}",
     ]
+    stock = dict((last or {}).get("country_stock") or {})
+    rows, due = await _country_rows(active, config, stock) if active else ([], None)
+    # One /st checks every country, so the interval and the next check are
+    # the same for all of them - said once here, not repeated per row.
+    every = f"every {interval} min (all countries)"
+    if config.get("enabled") and due is not None:
+        head.append(f"<b>Next check:</b> {esc(_next_check(due))} · {esc(every)}")
+    else:
+        head.append(f"<b>Checks:</b> {esc(every)}")
+    head.append(f"<b>Last check:</b> {esc(last_check)}")
     if last and last.get("error"):
         head.append(f"<b>Error:</b> {esc(str(last['error'])[:200])}")
 
-    stock = dict((last or {}).get("country_stock") or {})
-    rows = await _country_rows(active, config, stock) if active else []
-    header = ("St", "Country", "File", "Stock", "Every", "Ends", "Next")
+    header = ("St", "Country", "File", "Stock", "Ends")
+    state_width = max([_STATE_WIDTH] + [len(r[0]) for r in rows])
     legend = [f"{code} {meaning}" for code, meaning in STATE_LEGEND.items()
-              if any(r[0] == code for r in rows)]
-    if any(r[4].endswith("*") for r in rows):
+              if any(r[0].split()[0] == code for r in rows)]
+    if any(r[1].endswith("*") for r in rows):
         legend.append("* custom settings")
     queue_lines = [
         f"\u2022 {esc(e.get('country') or e['name'])} "
@@ -712,7 +731,9 @@ async def status_text() -> str:
     def render(shown_rows: int, shown_queue: int) -> str:
         out = list(head)
         if rows:
-            body = [_table_line(header)] + [_table_line(r) for r in rows[:shown_rows]]
+            body = [_table_line(header, state_width)] + [
+                _table_line(r, state_width) for r in rows[:shown_rows]
+            ]
             if shown_rows < len(rows):
                 body.append(f"+{len(rows) - shown_rows} more")
             # Padded on the raw text, escaped afterwards: escaping first

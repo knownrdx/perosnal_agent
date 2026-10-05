@@ -1,17 +1,16 @@
-"""Per-country settings, independent timers, and reusable presets.
+"""Per-country settings, the shared check timer, and reusable presets.
 
-Why this exists as its own module: the base automation in otp_bot.py treats
-the active set as one batch on one timer, which is wrong as soon as the owner
-runs several countries at once. Bangladesh might burn through its stock every
-10 minutes while a Central African Republic batch lasts hours; refilling both
-on the same clock either hammers the bot for nothing or starves the fast one.
+Every country is checked on ONE shared timer (the global interval_minutes):
+a single /st reports stock for all of them at once, so per-country timers
+only staggered the checks - one country looked at now, the next an hour
+later - for no benefit. The next-check time is persisted, so a restart does
+not reset the clock to "now".
 
-So each country gets:
-  - its own interval, threshold, limit, count, service and cleanup mode,
-  - its own next-due timestamp, persisted so a restart does not reset every
-    country's clock to "now" and cause a thundering-herd refill,
-  - all of it optional: anything not set falls back to the global config, so
-    a country the owner never touches keeps behaving exactly as before.
+What a country can still have of its own (all optional - anything not set
+falls back to the global config, so a country the owner never touches keeps
+behaving exactly as before):
+  - threshold, limit, count, service and wipe-before-add mode,
+  - its lifecycle: pause, start/stop time, run length, re-add limit.
 
 Presets are the same settings under a name. The target bot has genuinely
 per-country knobs (/setlimit <country> <tag> <N>, /setcooldown, and
@@ -36,9 +35,9 @@ PRESET_KEY = "otp_bot_presets"
 
 # The fields a country (or a preset) may override. Everything else stays
 # global - target bot, command templates and so on are properties of the
-# bot being driven, not of one country.
+# bot being driven, not of one country. The check interval is deliberately
+# NOT here: it is one shared timer for every country.
 OVERRIDABLE = (
-    "interval_minutes",
     "quota_threshold",
     "limit",
     "count",
@@ -207,35 +206,31 @@ def starts_at(start_at: str, armed_at: str | None) -> datetime | None:
 
 # Starting points, not a closed list - the owner edits these or adds their
 # own. Chosen to span the range actually seen in practice: a country that
-# drains in minutes, a slow one worth checking rarely, and a "replace the
-# stock wholesale" profile that needs /frcd.
+# drains fast, a large batch, and a "replace the stock wholesale" profile
+# that needs /frcd. None sets an interval: every country shares one check.
 BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
     "Fast burn": {
-        "interval_minutes": 5,
         "quota_threshold": 0,
         "limit": 4,
         "count": 4,
         "force_delete_before_add": False,
-        "_note": "High-demand country: check often, top up the moment it empties.",
+        "_note": "High-demand country: top up the moment it empties.",
     },
     "Steady": {
-        "interval_minutes": 15,
         "quota_threshold": 0,
         "limit": 4,
         "count": 4,
         "force_delete_before_add": False,
-        "_note": "Default-ish pace for a country with normal turnover.",
+        "_note": "Default-ish settings for a country with normal turnover.",
     },
     "Slow / large stock": {
-        "interval_minutes": 60,
         "quota_threshold": 0,
         "limit": 10,
         "count": 10,
         "force_delete_before_add": False,
-        "_note": "Big batch that lasts - checking every few minutes is wasted work.",
+        "_note": "Big batch that lasts - adds 10 at a time.",
     },
     "Low-stock refill": {
-        "interval_minutes": 10,
         "quota_threshold": 200,
         "limit": 4,
         "count": 4,
@@ -246,7 +241,6 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         ),
     },
     "One-shot burst": {
-        "interval_minutes": 5,
         "quota_threshold": 200,
         "limit": 4,
         "count": 4,
@@ -259,7 +253,6 @@ BUILTIN_PRESETS: dict[str, dict[str, Any]] = {
         ),
     },
     "Replace stock": {
-        "interval_minutes": 30,
         "quota_threshold": 0,
         "limit": 4,
         "count": 4,
@@ -305,6 +298,8 @@ async def set_country_settings(country: str, values: dict[str, Any]) -> dict[str
     key = _key(country)
     current = dict(all_settings.get(key, {}))
     current["display_name"] = country.strip()
+    # Left over from per-country intervals; the interval is global now.
+    current.pop("interval_minutes", None)
 
     for field in OVERRIDABLE:
         if field not in values:
@@ -361,11 +356,9 @@ async def _regate_if_waiting(country: str, start_at: str | None) -> bool:
     await _save_run_state(state)
 
     if _is_now(new_gate):
-        # Due on the very next pass, not one interval from whenever it was
-        # first armed.
-        due = await _get_due_map()
-        due[key] = now_iso
-        await _save_due_map(due)
+        # The shared check is due on the very next pass, not one interval
+        # from whenever it was last armed.
+        await arm_shared_check(at=_now())
     return True
 
 
@@ -408,8 +401,28 @@ async def effective_config(country: str, base: dict[str, Any]) -> dict[str, Any]
 
 
 # --------------------------------------------------------------------------- #
-# Independent timers
+# The shared check timer
 # --------------------------------------------------------------------------- #
+# The one next-check time, stored in the due map under a key no real country
+# name produces. Older versions kept one entry per country in this same map;
+# migrate_to_shared_timer() removes those.
+SHARED_DUE = "__all__"
+
+
+def interval_of(base: dict[str, Any]) -> int:
+    """The one check interval, in minutes, from the GLOBAL config."""
+    try:
+        return max(1, int(base.get("interval_minutes") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+async def _global_interval() -> int:
+    from app.automation import otp_bot
+
+    return interval_of(await otp_bot.get_config())
+
+
 async def _get_due_map() -> dict[str, str]:
     async with session_scope() as session:
         stored = await repo.get_setting(session, DUE_KEY)
@@ -421,81 +434,131 @@ async def _save_due_map(due: dict[str, str]) -> None:
         await repo.set_setting(session, DUE_KEY, due)
 
 
-async def arm_country(country: str, minutes: int) -> datetime:
-    """Set (or reset) when this country is next due."""
-    when = _now() + timedelta(minutes=max(1, int(minutes)))
-    due = await _get_due_map()
-    due[_key(country)] = when.isoformat()
-    await _save_due_map(due)
-    return when
-
-
-async def get_due_at(country: str) -> datetime | None:
-    raw = (await _get_due_map()).get(_key(country))
+def _parse_due(raw: Any) -> datetime | None:
     if not raw:
         return None
     try:
-        return datetime.fromisoformat(raw)
+        return datetime.fromisoformat(str(raw))
     except ValueError:
         return None
 
 
-async def forget_country(country: str) -> None:
+async def get_next_check_at() -> datetime | None:
+    """When the shared check (every country at once) is next due."""
+    return _parse_due((await _get_due_map()).get(SHARED_DUE))
+
+
+async def arm_shared_check(
+    minutes: int | None = None, *, at: datetime | None = None
+) -> datetime:
+    """Set the shared check to ``at``, or ``minutes`` from now (default: the
+    global interval). Unconditional - use arm_country() to arm without ever
+    pushing an earlier check later."""
+    if at is None:
+        if minutes is None:
+            minutes = await _global_interval()
+        at = _now() + timedelta(minutes=max(1, int(minutes)))
     due = await _get_due_map()
-    if due.pop(_key(country), None) is not None:
+    due[SHARED_DUE] = at.isoformat()
+    await _save_due_map(due)
+    return at
+
+
+async def arm_country(country: str, minutes: int | None = None) -> datetime:
+    """Compatibility shim: make sure the SHARED check is armed.
+
+    There are no per-country timers any more. Arms the shared check for
+    ``minutes`` from now (default: the global interval) unless it is already
+    due sooner - starting or resuming one country must never postpone the
+    check every other country is waiting on. Returns the shared due time.
+    ``country`` is accepted for compatibility and not used.
+    """
+    del country
+    if minutes is None:
+        minutes = await _global_interval()
+    wanted = _now() + timedelta(minutes=max(1, int(minutes)))
+    current = await get_next_check_at()
+    if current is not None and current <= wanted:
+        return current
+    return await arm_shared_check(at=wanted)
+
+
+async def get_due_at(country: str) -> datetime | None:
+    """Compatibility shim: the shared next-check time, the same for every
+    country. ``country`` is accepted and not used."""
+    del country
+    return await get_next_check_at()
+
+
+async def forget_country(country: str) -> None:
+    """Drop a country's own settings (and any leftover per-country due time
+    from before the shared timer). The shared timer itself is untouched -
+    the other countries still run on it."""
+    due = await _get_due_map()
+    key = _key(country)
+    if key != SHARED_DUE and due.pop(key, None) is not None:
         await _save_due_map(due)
     await clear_country_settings(country)
 
 
-async def due_countries(countries: list[str], base: dict[str, Any]) -> list[str]:
-    """Which of these countries are due for a check right now.
+async def migrate_to_shared_timer() -> int:
+    """One-off (config v3): from per-country timers to the shared one.
 
-    A country with no recorded due time is armed rather than fired: a fresh
-    start (or a restart) must not trigger an immediate refill for everything
-    at once.
+    Removes every country's own interval_minutes override and every
+    per-country due time, and makes the shared check due NOW, so countries
+    that were sitting on an old 60-minute timer are all checked on the very
+    next pass. Returns how many interval overrides were removed.
     """
-    due_map = await _get_due_map()
+    settings = await get_all_country_settings()
+    removed = 0
+    for entry in settings.values():
+        if isinstance(entry, dict) and "interval_minutes" in entry:
+            entry.pop("interval_minutes")
+            removed += 1
+    if removed:
+        async with session_scope() as session:
+            await repo.set_setting(session, COUNTRY_KEY, settings)
+    await _save_due_map({SHARED_DUE: _now().isoformat()})
+    return removed
+
+
+async def due_countries(countries: list[str], base: dict[str, Any]) -> list[str]:
+    """Which of these countries the shared check covers right now.
+
+    One timer for all: when it is due, EVERY started, unpaused country is
+    returned (a single /st answers for all of them) and the timer is
+    re-armed for one global interval from now. Otherwise nothing is.
+
+    With no recorded due time the timer is armed rather than fired: a fresh
+    install must not trigger an immediate refill for everything at once.
+    When it is due but no country is eligible (all paused or still waiting
+    for a start time) it is left due, so a start time arriving is picked up
+    on the next look instead of one interval later.
+    """
+    interval = interval_of(base)
     now = _now()
+    when = await get_next_check_at()
+    if when is None:
+        await arm_shared_check(at=now + timedelta(minutes=interval))
+        return []
+    if now < when:
+        return []
+
     ready: list[str] = []
-    dirty = False
-
-    for country in countries:
-        key = _key(country)
-        cfg = await effective_config(country, base)
-
+    for country in dict.fromkeys(countries):
         # A paused country keeps its settings, its file and its place - it
-        # is simply skipped until resumed. Its timer is NOT advanced, so
-        # resuming does not have to wait out an interval it spent paused.
-        if cfg.get("paused"):
+        # is simply skipped until resumed.
+        if (await effective_config(country, base)).get("paused"):
             continue
-
         # Not started yet: the owner asked for this country to begin at a
         # wall-clock time. It sits in the active set, visible and countable,
         # but nothing is sent to the target bot until that time arrives.
         if not await has_started(country, base):
             continue
+        ready.append(country)
 
-        interval = max(1, int(cfg.get("interval_minutes", 10)))
-
-        raw = due_map.get(key)
-        if not raw:
-            due_map[key] = (now + timedelta(minutes=interval)).isoformat()
-            dirty = True
-            continue
-        try:
-            when = datetime.fromisoformat(raw)
-        except ValueError:
-            due_map[key] = (now + timedelta(minutes=interval)).isoformat()
-            dirty = True
-            continue
-
-        if now >= when:
-            ready.append(country)
-            due_map[key] = (now + timedelta(minutes=interval)).isoformat()
-            dirty = True
-
-    if dirty:
-        await _save_due_map(due_map)
+    if ready:
+        await arm_shared_check(at=now + timedelta(minutes=interval))
     return ready
 
 
@@ -704,14 +767,14 @@ async def set_paused(country: str, paused: bool) -> dict[str, Any]:
     """
     applied = await set_country_settings(country, {"paused": bool(paused)})
     if not paused:
-        # Resume from now, so a country paused for hours does not fire the
-        # instant it comes back just because its old due time went by.
-        cfg = await get_country_settings(country)
-        await arm_country(country, int(cfg.get("interval_minutes") or 10))
         from app.automation import otp_bot
 
-        state = await get_run_state(country)
         base = await otp_bot.get_config()
+        # Back on the shared timer: it joins the next check every country
+        # gets (arming it only if nothing is due sooner - resuming one
+        # country never postpones the others).
+        await arm_country(country, interval_of(base))
+        state = await get_run_state(country)
         # A run that went past its limit while paused was never marked
         # finished (the due pass skips paused countries), yet resuming it
         # as-is would have the next pass finish and re-pause it at once.
@@ -744,35 +807,30 @@ async def is_paused(country: str) -> bool:
 
 
 async def shortest_interval_minutes(base: dict[str, Any]) -> int:
-    """The tightest interval any country asks for.
-
-    The scheduler paces itself by this: polling on the GLOBAL interval would
-    silently cap a 5-minute country at whatever the global value happens to
-    be, which is exactly the bug per-country timers exist to avoid.
-    """
-    intervals = [int(base.get("interval_minutes", 10) or 10)]
-    for settings in (await get_all_country_settings()).values():
-        if "interval_minutes" in settings:
-            with_override = int(settings["interval_minutes"] or 0)
-            if with_override > 0:
-                intervals.append(with_override)
-    return max(1, min(intervals))
+    """The check interval. Kept for compatibility: there is one interval for
+    every country now, so this is simply the global value."""
+    return interval_of(base)
 
 
 async def schedule_overview(
     countries: list[str], base: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    """Per-country view for the UIs: what settings apply and when it fires."""
+    """Per-country view for the UIs: what settings apply and when it fires.
+
+    ``interval_minutes`` and ``next_check_at``/``due_in_seconds`` are the
+    SHARED values, identical on every row - every country is checked
+    together."""
     now = _now()
+    interval = interval_of(base)
+    when = await get_next_check_at()
     rows: list[dict[str, Any]] = []
     for country in sorted(set(countries)):
         cfg = await effective_config(country, base)
         overrides = await get_country_settings(country)
-        when = await get_due_at(country)
         begins = await pending_start_at(country, base)
         rows.append({
             "country": country,
-            "interval_minutes": cfg.get("interval_minutes"),
+            "interval_minutes": interval,
             "quota_threshold": cfg.get("quota_threshold"),
             "limit": cfg.get("limit"),
             "count": cfg.get("count"),
@@ -805,7 +863,13 @@ async def get_presets() -> dict[str, dict[str, Any]]:
     async with session_scope() as session:
         stored = await repo.get_setting(session, PRESET_KEY)
     presets = dict(BUILTIN_PRESETS)
-    presets.update(dict(stored or {}))
+    for name, entry in dict(stored or {}).items():
+        # A preset saved before the interval became global may still carry
+        # one; it would be ignored on apply, so do not show it either.
+        presets[name] = (
+            {k: v for k, v in entry.items() if k != "interval_minutes"}
+            if isinstance(entry, dict) else entry
+        )
     return presets
 
 
@@ -844,10 +908,7 @@ async def apply_preset(name: str, country: str) -> dict[str, Any] | None:
     preset = presets.get(name)
     if preset is None:
         return None
+    # OVERRIDABLE has no interval: an old saved preset's interval_minutes is
+    # dropped here rather than giving one country its own timer.
     values = {f: preset[f] for f in OVERRIDABLE if f in preset}
-    applied = await set_country_settings(country, values)
-    # Re-arm immediately: a preset that changes the interval should take
-    # effect from now, not whenever the old interval happened to expire.
-    if "interval_minutes" in values:
-        await arm_country(country, int(values["interval_minutes"]))
-    return applied
+    return await set_country_settings(country, values)

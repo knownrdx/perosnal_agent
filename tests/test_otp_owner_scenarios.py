@@ -33,7 +33,7 @@ FAST_ADD = "⚡ Fast Add Complete!\n\nBangladesh: 3501 added (16499 dup)"
 SPENT_ADD = "⚡ Fast Add Complete!\n\nBangladesh: 0 added (20000 dup)"
 
 STOCKED = 1234          # comfortably above the default quota_threshold of 0
-NEXT_CHECK = 11         # minutes: one past the default 10-minute interval
+NEXT_CHECK = 11         # minutes: well past the shared check interval (default 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -242,17 +242,54 @@ def _countries(items: Any) -> list[str]:
 
 def _assert_no_cleanup_sent(bot: PBDxBot, since: int = 0) -> None:
     sent = [text.strip() for text in bot.messages(since)]
-    assert not any(text.startswith("/useddelete") for text in sent), sent
-    # Blank cleanup_command means "send nothing", not "send an empty message".
+    assert not any(
+        text == "/useddelete" or text.startswith("/useddelete") for text in sent
+    ), sent
+    # No cleanup means "send nothing", not "send an empty message".
     assert all(sent), f"a blank message was sent to the bot: {sent}"
 
 
 # --------------------------------------------------------------------------- #
 # 1. No cleanup command
 # --------------------------------------------------------------------------- #
-async def test_cleanup_command_defaults_to_blank(environment):
-    assert otp_bot.DEFAULT_CONFIG["cleanup_command"] == ""
-    assert (await otp_bot.get_config())["cleanup_command"] == ""
+async def test_there_is_no_cleanup_command_at_all(environment):
+    """Not a setting, not a default, not something that can be switched on."""
+    assert "cleanup_command" not in otp_bot.DEFAULT_CONFIG
+    assert "cleanup_command" not in otp_bot.SETTABLE_FIELDS
+    assert "cleanup_command" not in await otp_bot.get_config()
+    assert not hasattr(otp_bot, "_send_cleanup")
+    with pytest.raises(ValueError, match="isn't a setting"):
+        otp_bot.coerce_setting("cleanup_command", "/useddelete")
+    # The "don't wipe" choice keeps its key but names no command to send.
+    labels = dict(otp_bot.CLEANUP_CHOICES)
+    assert set(labels) == {"used", "force"}
+    assert "/useddelete" not in labels["used"]
+
+
+async def test_a_stale_stored_cleanup_command_is_never_sent(clock):
+    """Even a /useddelete left in a stored config by an old version (already
+    at the current config version, so no migration runs) reaches nothing:
+    not a start, a scheduled start or a refill."""
+    from app.db import repo
+    from app.db.base import session_scope
+
+    stored = dict(await otp_bot.get_config(), cleanup_command="/useddelete")
+    async with session_scope() as session:
+        await repo.set_setting(session, otp_bot.SETTING_KEY, stored)
+
+    bot = PBDxBot(bangladesh=0)
+    set_userbot(bot)
+    await _upload_and_auto_start()                  # waits for 04:00
+    clock.set(dubai(6, 4, 0))
+    await otp_bot.run_cycle()                       # scheduled start
+    assert bot.files() == ["bd.txt"], "precondition: the scheduled start added"
+    clock.advance(NEXT_CHECK)
+    await otp_bot.run_cycle()                       # refill
+    assert bot.files() == ["bd.txt", "bd.txt"], "precondition: the refill added"
+    await _upload_and_start_now("bd2.txt")          # start
+    assert bot.files()[-1] == "bd2.txt", "precondition: the start added"
+
+    _assert_no_cleanup_sent(bot)
 
 
 async def test_start_automation_sends_no_cleanup_command(clock):
@@ -520,11 +557,10 @@ async def test_a_new_file_for_a_running_country_replaces_the_old_one_and_waits_f
 # 7. Run length: finish on time, and a finish HOLDS the country
 # --------------------------------------------------------------------------- #
 async def _start_sixty_minute_run() -> None:
-    """Bangladesh, started now (T), run_minutes=60, checked every minute."""
+    """Bangladesh, started now (T), run_minutes=60, checked every minute
+    (the default shared interval - there is no per-country one)."""
     await _upload("bd.txt")
-    await otp_schedule.set_country_settings(
-        "Bangladesh", {"run_minutes": 60, "interval_minutes": 1}
-    )
+    await otp_schedule.set_country_settings("Bangladesh", {"run_minutes": 60})
     result = await otp_bot.start_automation()
     assert result["ok"], result
 
@@ -606,10 +642,10 @@ async def test_finishing_never_sends_frcd_by_default(clock, stock_at_end):
 # 9. An exhausted file is not re-sent every cycle
 # --------------------------------------------------------------------------- #
 async def _exhaust_bangladesh(bot: PBDxBot, clock: Clock) -> None:
-    """Start Bangladesh on a 1-minute interval, then let a refill report
-    "0 added" so its file is known to be spent."""
+    """Start Bangladesh on the default 1-minute shared interval, then let a
+    refill report "0 added" so its file is known to be spent."""
     await _upload("bd.txt")
-    await otp_schedule.set_country_settings("Bangladesh", {"interval_minutes": 1})
+    assert (await otp_bot.get_config())["interval_minutes"] == 1
     result = await otp_bot.start_automation()
     assert result["ok"], result
 
@@ -746,3 +782,141 @@ async def test_concurrent_cycles_never_interleave_their_sends(clock):
         assert block[0] == "ST" and block[-1] == "ADD" and block.count("FILE") == 1, (
             f"sends interleaved: {tokens}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# 12. ONE check for every country (config v3)
+# --------------------------------------------------------------------------- #
+class MultiCountryBot(PBDxBot):
+    """PBDxBot holding several countries, answering each add for the country
+    whose file was just sent (files are named "<Country>.txt")."""
+
+    def __init__(self, stock: dict[str, int]) -> None:
+        super().__init__()
+        self.stock = dict(stock)
+        self._last_country = ""
+
+    async def send_file(self, target: str, path: str, caption: str = "", reply_to: int | None = None) -> dict[str, Any]:
+        self._last_country = Path(path).stem
+        return await super().send_file(target, path, caption, reply_to)
+
+    def _answer(self, text: str, reply_to: int | None) -> str:
+        if reply_to is not None:
+            return f"⚡ Fast Add Complete!\n\n{self._last_country}: 3 added (0 dup)"
+        return super()._answer(text, reply_to)
+
+
+THREE = ("Bangladesh", "Nigeria", "Kenya")
+
+
+async def _three_countries_on_old_staggered_timers(clock: Clock) -> None:
+    """The state an install upgraded from per-country timers is in: three
+    countries started at different times, each with its own 60-minute
+    interval and its own due time, none of them due now, and a v2 config
+    (60-minute interval, /useddelete as the cleanup command)."""
+    from app.config import get_settings
+    from app.db import repo
+    from app.db.base import session_scope
+    from app.security import rel_path
+
+    uploads = get_settings().workspace / "uploads"
+    uploads.mkdir(parents=True, exist_ok=True)
+    entries = []
+    start = clock.now
+    for offset, country in zip((50, 30, 10), THREE):
+        path = uploads / f"{country}.txt"
+        path.write_text("+10000000001\n+10000000002\n+10000000003\n", encoding="utf-8")
+        entries.append({
+            "id": country[:4].lower(), "name": f"{country}.txt", "path": rel_path(path),
+            "country": country, "count": 3, "tag": "WhatsApp",
+        })
+        clock.set(start - timedelta(minutes=offset))
+        await otp_schedule.begin_run(country)
+    clock.set(start)
+    await otp_bot._save_files(otp_bot.ACTIVE_KEY, entries)
+
+    async with session_scope() as session:
+        await repo.set_setting(session, otp_bot.SETTING_KEY, {
+            "enabled": True, "interval_minutes": 60, "cleanup_command": "/useddelete",
+            "config_version": 2,
+        })
+        await repo.set_setting(session, otp_schedule.COUNTRY_KEY, {
+            c.casefold(): {"display_name": c, "interval_minutes": 60} for c in THREE
+        })
+        await repo.set_setting(session, otp_schedule.DUE_KEY, {
+            c.casefold(): (start + timedelta(minutes=due)).isoformat()
+            for c, due in zip(THREE, (5, 25, 45))
+        })
+
+
+async def test_the_v3_migration_moves_everyone_to_one_check(clock):
+    from app.db import repo
+    from app.db.base import session_scope
+
+    await _three_countries_on_old_staggered_timers(clock)
+
+    cfg = await otp_bot.get_config()
+
+    assert cfg["interval_minutes"] == 1
+    assert cfg["config_version"] == 3
+    assert "cleanup_command" not in cfg
+    async with session_scope() as session:
+        stored = await repo.get_setting(session, otp_bot.SETTING_KEY)
+    assert stored["config_version"] == 3 and "cleanup_command" not in stored
+    for country in THREE:
+        assert "interval_minutes" not in await otp_schedule.get_country_settings(country)
+    # The staggered per-country timers are gone; one shared check, due now.
+    assert list(await otp_schedule._get_due_map()) == [otp_schedule.SHARED_DUE]
+    assert await otp_schedule.get_next_check_at() <= clock.now
+
+    # Migrated once: a later change sticks.
+    await otp_bot.save_config({"interval_minutes": 5})
+    assert (await otp_bot.get_config())["interval_minutes"] == 5
+
+
+async def test_after_migration_one_cycle_checks_all_three_with_one_st(clock):
+    await _three_countries_on_old_staggered_timers(clock)
+    await otp_bot.get_config()                      # runs the migration
+    bot = MultiCountryBot({c: 0 for c in THREE})
+    set_userbot(bot)
+
+    result = await otp_bot.run_cycle()
+
+    quota = await _quota_command()
+    assert [m for m in bot.messages() if m.strip() == quota] == [quota], bot.messages()
+    assert sorted(bot.files()) == sorted(f"{c}.txt" for c in THREE), (result.action, result.error)
+    _assert_no_cleanup_sent(bot)
+    # And the next check is one shared minute away for everybody.
+    nxt = {await otp_schedule.get_due_at(c) for c in THREE}
+    assert nxt == {clock.now + timedelta(minutes=1)}
+
+    clock.advance(0.5)
+    assert (await otp_bot.run_cycle()).action == "not due yet"
+
+
+async def test_an_old_per_country_interval_never_delays_a_country(clock):
+    """A per-country interval still sitting in stored settings - as before
+    the migration removes them, or written back by something old - is
+    ignored: the shared global interval is what every country is checked on."""
+    from app.db import repo
+    from app.db.base import session_scope
+
+    await _three_countries_on_old_staggered_timers(clock)
+    await otp_bot.get_config()
+    # An override written back by something old after the migration.
+    async with session_scope() as session:
+        await repo.set_setting(session, otp_schedule.COUNTRY_KEY, {
+            "kenya": {"display_name": "Kenya", "interval_minutes": 60},
+        })
+    bot = MultiCountryBot({c: STOCKED for c in THREE})
+    set_userbot(bot)
+
+    await otp_bot.run_cycle()
+    clock.advance(1)
+    await otp_bot.run_cycle()
+
+    quota = await _quota_command()
+    assert [m.strip() for m in bot.messages()].count(quota) == 2
+    rows = await otp_schedule.schedule_overview(list(THREE), await otp_bot.get_config())
+    assert {r["interval_minutes"] for r in rows} == {1}
+    assert len({r["next_check_at"] for r in rows}) == 1
