@@ -976,6 +976,23 @@
                   <input type="number" id="otpbot-default-run" min="0" value="1200"
                          title="Offered as the default when a new upload does not say how long it should run. 0 = no limit.">
                 </div>
+                <div>
+                  <label for="otpbot-default-rate">Default rate</label>
+                  <input type="text" id="otpbot-default-rate" placeholder="default"
+                         title="The rate a country gets when it has none of its own: 0, a number like 0.0005, or blank for the bot's default.">
+                </div>
+              </div>
+              <div class="row mt8">
+                <label class="small" style="margin:0; display:flex; align-items:center; gap:6px;">
+                  <input type="checkbox" id="otpbot-ask-rate">
+                  Ask the rate after each upload (countries with a remembered rate are not asked)
+                </label>
+              </div>
+              <div class="row mt8">
+                <label class="small" style="margin:0; display:flex; align-items:center; gap:6px;">
+                  <input type="checkbox" id="otpbot-ask-start">
+                  Ask the start time after each upload
+                </label>
               </div>
               <p class="small" id="otpbot-limit-warning" style="display:none;"></p>
               <div class="row mt8">
@@ -1597,6 +1614,10 @@
         }
         if (data.caption_note) {
           showConfirm(data.caption_note);
+        } else if (data.needs_rate) {
+          showConfirm(data.needs_rate.question);
+        } else if (data.needs_start) {
+          showConfirm(data.needs_start.question);
         } else if (data.needs_run_time) {
           showConfirm(data.needs_run_time.question);
         } else if (data.auto_started && data.auto_started.ok) {
@@ -2287,6 +2308,9 @@
         qs("#otpbot-start-at").value = cfg.start_at || "";
         qs("#otpbot-default-run").value =
           cfg.default_run_minutes != null ? cfg.default_run_minutes : 1200;
+        qs("#otpbot-default-rate").value = cfg.default_rate || "";
+        qs("#otpbot-ask-rate").checked = !!cfg.ask_rate;
+        qs("#otpbot-ask-start").checked = !!cfg.ask_start_time;
         qs("#otpbot-delete-when-done").checked = !!cfg.delete_when_done;
         qs("#otpbot-tidy-stock").checked = cfg.tidy_stock_messages !== false;
         renderOtpBotLimitWarning();
@@ -2519,6 +2543,9 @@
       start_at: qs("#otpbot-start-at").value || "",
       default_run_minutes: isNaN(parseInt(qs("#otpbot-default-run").value, 10))
         ? 1200 : parseInt(qs("#otpbot-default-run").value, 10),
+      default_rate: qs("#otpbot-default-rate").value.trim(),
+      ask_rate: qs("#otpbot-ask-rate").checked,
+      ask_start_time: qs("#otpbot-ask-start").checked,
       delete_when_done: qs("#otpbot-delete-when-done").checked,
       tidy_stock_messages: qs("#otpbot-tidy-stock").checked,
       force_delete_before_add: qs("#otpbot-frcd-enabled").checked,
@@ -2604,6 +2631,7 @@
         + (row.waiting_to_start && row.start_at ? " - starts " + row.start_at : "")
         + (row.stop_at ? ", off at " + row.stop_at : "")
         + (row.run_minutes ? ", runs " + row.run_minutes + "m" : "")
+        + (row.rate ? ", rate " + row.rate : "")
         + (row.customised && row.customised.length ? " *" : "");
       if (row.paused) label.style.opacity = "0.6";
       // The row already says WAIT / "waiting for HH:MM", so no second clock badge.
@@ -2663,6 +2691,14 @@
       runFor.style.width = "80px";
       box.appendChild(runFor);
 
+      var rate = document.createElement("input");
+      rate.type = "text";
+      rate.value = row.rate || "";
+      rate.placeholder = "rate";
+      rate.title = "Rate for this country: 0, a number like 0.0005, or blank for the default.";
+      rate.style.width = "70px";
+      box.appendChild(rate);
+
       var saveBtn = document.createElement("button");
       saveBtn.type = "button";
       saveBtn.textContent = "Save";
@@ -2678,7 +2714,9 @@
             stop_at: stopAt.value || "",
             start_at: startAt.value || "",
             // 0 is meaningful here too ("no limit").
-            run_minutes: isNaN(r) ? (row.run_minutes || 0) : r
+            run_minutes: isNaN(r) ? (row.run_minutes || 0) : r,
+            // Blank drops the country's own rate; it then takes the default.
+            rate: rate.value.trim() || null
           }
         }).then(function () { showConfirm(row.country + " updated."); loadOtpBot(); })
           .catch(function () { showConfirm("Failed to save " + row.country + "."); });

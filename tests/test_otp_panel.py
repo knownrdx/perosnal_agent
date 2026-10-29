@@ -222,3 +222,75 @@ async def test_cleanup_mode_flips_the_force_delete_flag(environment):
 
     await otp_bot.set_cleanup_mode("used")
     assert (await otp_bot.get_config())["force_delete_before_add"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Rate and start-time keyboards
+# --------------------------------------------------------------------------- #
+RATE_CHOICES = ("0", "0.0001", "0.0005", "0.001", "default")
+START_CHOICES = ("now", "21:00", "00:00", "04:00", "default")
+
+
+@pytest.fixture
+def choices(monkeypatch):
+    """The core's choice tuples, as the contract fixes them - stubbed so the
+    keyboard shape is tested on its own (and before the core lands)."""
+    monkeypatch.setattr(otp_bot, "RATE_CHOICES", RATE_CHOICES, raising=False)
+    monkeypatch.setattr(otp_bot, "START_CHOICES", START_CHOICES, raising=False)
+
+
+def test_rate_keyboard_offers_every_rate_plus_custom(choices):
+    data = _all_callback_data(otp_panel.rate_keyboard())
+    for choice in RATE_CHOICES:
+        assert f"otp:rate:{choice}" in data
+    assert "otp:ratec:" in data
+    labels = [b.text for row in otp_panel.rate_keyboard().inline_keyboard for b in row]
+    assert any("Custom" in label for label in labels)
+    # Free and default are spelled out, not left as bare tokens.
+    assert any("free" in label for label in labels)
+    assert any(label.lower().endswith("default") for label in labels)
+
+
+def test_rate_keyboard_ticks_the_current_rate(choices):
+    labels = [b.text for row in otp_panel.rate_keyboard("0.0005").inline_keyboard for b in row]
+    assert any(label.startswith("✅") and "0.0005" in label for label in labels)
+    assert sum(label.startswith("✅") for label in labels) == 1
+
+
+def test_start_keyboard_offers_every_start_plus_custom(choices):
+    data = _all_callback_data(otp_panel.start_at_keyboard())
+    for choice in START_CHOICES:
+        assert f"otp:startat:{choice}" in data
+    assert "otp:startatc:" in data
+    labels = [b.text for row in otp_panel.start_at_keyboard().inline_keyboard for b in row]
+    assert any("Now" in label for label in labels)
+    assert any("Custom" in label for label in labels)
+
+
+def test_country_rate_keyboard_names_the_country_and_fits(choices):
+    key = otp_panel.country_key("Saint Vincent And The Grenadines")
+    markup = otp_panel.country_rate_keyboard(key, "0")
+    data = _all_callback_data(markup)
+    for choice in RATE_CHOICES:
+        assert f"otp:crate:{key}:{choice}" in data
+    assert f"otp:cratec:{key}" in data
+    for payload in data:
+        assert len(payload.encode("utf-8")) <= 64, payload
+    labels = [b.text for row in markup.inline_keyboard for b in row]
+    assert any(label.startswith("✅") and "0" in label for label in labels)
+
+
+def test_the_country_panel_has_a_rate_button():
+    key = otp_panel.country_key("Bangladesh")
+    markup = otp_panel.country_field_keyboard(key, "Bangladesh")
+    labels = [b.text for row in markup.inline_keyboard for b in row]
+    assert any("Rate" in label for label in labels)
+    assert f"otp:pickrate:{key}" in _all_callback_data(markup)
+
+
+def test_rate_label_reads_as_the_owner_would():
+    assert otp_panel.rate_label("") == "default"
+    assert otp_panel.rate_label(None) == "default"
+    assert otp_panel.rate_label("default") == "default"
+    assert otp_panel.rate_label("0") == "0 (free)"
+    assert otp_panel.rate_label("0.0005") == "0.0005"

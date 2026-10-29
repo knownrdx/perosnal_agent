@@ -78,3 +78,56 @@ def test_a_spreadsheet_outside_the_otp_thread_is_still_just_saved(client):
     )
     assert up.status_code == 200
     assert up.json()["queued_for_otpbot"] is False
+
+
+def test_an_upload_reports_which_question_is_open(client, monkeypatch):
+    """The web upload asks the same questions in the same order as Telegram:
+    rate, then start time, then run length - and only the first open one.
+    """
+    from app.automation import otp_bot
+
+    state: dict = {"rate": None, "start": None}
+
+    async def _no_auto_start():
+        return None
+
+    async def needing_rate(entries):
+        return ["Bangladesh"]
+
+    async def needing_start(entries):
+        return ["Bangladesh"]
+
+    async def set_rate(countries):
+        state["rate"] = list(countries)
+
+    async def set_start(countries):
+        state["start"] = list(countries)
+
+    monkeypatch.setattr(otp_bot, "maybe_auto_start", _no_auto_start)
+    monkeypatch.setattr(otp_bot, "countries_needing_rate", needing_rate, raising=False)
+    monkeypatch.setattr(otp_bot, "countries_needing_start", needing_start, raising=False)
+    monkeypatch.setattr(otp_bot, "set_awaiting_rate", set_rate, raising=False)
+    monkeypatch.setattr(otp_bot, "set_awaiting_start", set_start, raising=False)
+    monkeypatch.setattr(
+        otp_bot, "rate_question",
+        lambda countries, default: f"What rate for {', '.join(countries)}?", raising=False,
+    )
+    monkeypatch.setattr(
+        otp_bot, "start_question",
+        lambda countries, default: f"When should {', '.join(countries)} start?", raising=False,
+    )
+
+    _open_thread(client)
+    up = client.post(
+        "/api/chat/upload",
+        files={"file": ("bd.txt", b"+8801711000001\n+8801711000002\n", "text/plain")},
+        data={"caption": "whatsapp 20h"},
+        headers=HEADERS,
+    )
+    assert up.status_code == 200
+    body = up.json()
+    assert body["needs_rate"]["countries"] == ["Bangladesh"]
+    assert "What rate" in body["needs_rate"]["question"]
+    assert body["needs_start"] is None
+    assert body["needs_run_time"] is None
+    assert state == {"rate": ["Bangladesh"], "start": None}

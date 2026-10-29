@@ -212,6 +212,8 @@ class OtpCountryRequest(BaseModel):
     paused: bool | None = None
     stop_at: str | None = Field(default=None, max_length=5)
     start_at: str | None = Field(default=None, max_length=5)
+    # "0", a number, or "default"; null (or "") drops the override.
+    rate: str | None = Field(default=None, max_length=20)
     tag: str | None = Field(default=None, max_length=60)
     force_delete_before_add: bool | None = None
     note: str | None = Field(default=None, max_length=200, alias="_note")
@@ -263,6 +265,11 @@ class OtpBotConfigRequest(BaseModel):
     start_at: str | None = Field(default=None, max_length=5)
     default_run_minutes: int | None = Field(default=None, ge=0, le=100000)
     ask_run_time: bool | None = None
+    # The rate a new upload gets when its country has none of its own, and
+    # whether each upload is asked about its rate / start time.
+    default_rate: str | None = Field(default=None, max_length=20)
+    ask_rate: bool | None = None
+    ask_start_time: bool | None = None
     # The one check interval shared by every country.
     interval_minutes: int | None = Field(default=None, ge=1, le=1440)
     default_tag: str | None = None
@@ -882,6 +889,8 @@ def create_app() -> FastAPI:
         queued = False
         countries: dict[str, int] = {}
         caption_note = ""
+        needs_rate: dict[str, Any] | None = None
+        needs_start: dict[str, Any] | None = None
         needs_run_time: dict[str, Any] | None = None
         auto_started: dict[str, Any] | None = None
         if in_otp_thread:
@@ -901,19 +910,44 @@ def create_app() -> FastAPI:
                     ),
                 }
             else:
-                needing = await otp_bot.countries_needing_runtime(
-                    await otp_bot.get_queue()
+                # Same order as the Telegram upload: rate, then start time,
+                # then run length. Only the first open question is asked;
+                # the chat answer moves on to the next one by itself.
+                queue_now = await otp_bot.get_queue()
+                cfg = await otp_bot.get_config()
+                needing_rate = await otp_bot.countries_needing_rate(queue_now)
+                needing_start = (
+                    [] if needing_rate else await otp_bot.countries_needing_start(queue_now)
                 )
-                if needing:
-                    cfg = await otp_bot.get_config()
-                    await otp_bot.set_awaiting_runtime(needing)
-                    needs_run_time = {
-                        "countries": needing,
-                        "default_minutes": int(cfg.get("default_run_minutes") or 0),
-                        "question": otp_bot.runtime_question(
-                            needing, int(cfg.get("default_run_minutes") or 0)
+                if needing_rate:
+                    await otp_bot.set_awaiting_rate(needing_rate)
+                    needs_rate = {
+                        "countries": needing_rate,
+                        "default_rate": str(cfg.get("default_rate") or ""),
+                        "question": otp_bot.rate_question(
+                            needing_rate, str(cfg.get("default_rate") or "")
                         ),
                     }
+                elif needing_start:
+                    await otp_bot.set_awaiting_start(needing_start)
+                    needs_start = {
+                        "countries": needing_start,
+                        "default_start_at": str(cfg.get("start_at") or ""),
+                        "question": otp_bot.start_question(
+                            needing_start, str(cfg.get("start_at") or "")
+                        ),
+                    }
+                else:
+                    needing = await otp_bot.countries_needing_runtime(queue_now)
+                    if needing:
+                        await otp_bot.set_awaiting_runtime(needing)
+                        needs_run_time = {
+                            "countries": needing,
+                            "default_minutes": int(cfg.get("default_run_minutes") or 0),
+                            "question": otp_bot.runtime_question(
+                                needing, int(cfg.get("default_run_minutes") or 0)
+                            ),
+                        }
 
         return {
             "saved": True,
@@ -922,6 +956,8 @@ def create_app() -> FastAPI:
             "queued_for_otpbot": queued,
             "countries": countries,
             "caption_note": caption_note,
+            "needs_rate": needs_rate,
+            "needs_start": needs_start,
             "needs_run_time": needs_run_time,
             "auto_started": auto_started,
         }
@@ -973,7 +1009,32 @@ def create_app() -> FastAPI:
                     patch[field] = otp_schedule.parse_stop_time(patch[field])
                 except ValueError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # The default rate too: "0", a number or "default" - "" clears it.
+        if patch.get("default_rate"):
+            try:
+                patch["default_rate"] = otp_bot.parse_rate(patch["default_rate"])
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         return await otp_bot.save_config(patch)
+
+    @app.get("/api/otpbot/rates", dependencies=[Depends(require_api_access)])
+    async def otpbot_rates() -> dict[str, Any]:
+        """Every country's rate (queued or running), plus the default."""
+        from app.automation import otp_bot, otp_schedule
+
+        cfg = await otp_bot.get_config()
+        queue = await otp_bot.get_queue()
+        active = await otp_bot.get_active_files()
+        countries = [e.get("country") or e["name"] for e in queue + active]
+        rows = await otp_schedule.schedule_overview(countries, cfg)
+        return {
+            "default_rate": str(cfg.get("default_rate") or ""),
+            "countries": [
+                {"country": row["country"], "rate": str(row.get("rate") or "")}
+                for row in rows
+            ],
+            "text": await otp_bot.handle_rate_list(),
+        }
 
     @app.get("/api/otpbot/status", dependencies=[Depends(require_api_access)])
     async def otpbot_status() -> dict[str, Any]:
@@ -1139,6 +1200,16 @@ def create_app() -> FastAPI:
             if values.get(field) is not None:
                 try:
                     values[field] = otp_schedule.parse_stop_time(values[field])
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # A rate is "0", a number or "default"; an empty one from the form
+        # means "no override", the same as null.
+        if "rate" in values:
+            if values["rate"] is None or not str(values["rate"]).strip():
+                values["rate"] = None
+            else:
+                try:
+                    values["rate"] = otp_bot.parse_rate(str(values["rate"]))
                 except ValueError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
         # Pausing goes through set_paused so resuming does its bookkeeping

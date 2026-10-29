@@ -22,10 +22,11 @@ from app.telegram import otp_panel
 pytestmark = pytest.mark.asyncio
 
 # Column boundaries of the <pre> table: state(4) country(14) file(7)
-# stock(7) ends. A space sits at each of these offsets on every line when the
-# columns are aligned. There is no per-country "Every"/"Next" column: one /st
-# checks every country, so the timing is shown once, in the summary.
-GAPS = (4, 19, 27, 35)
+# stock(7) rate(7) ends. A space sits at each of these offsets on every line
+# when the columns are aligned. There is no per-country "Every"/"Next"
+# column: one /st checks every country, so the timing is shown once, in the
+# summary.
+GAPS = (4, 19, 27, 35, 43)
 
 
 def _entry(i: int, country: str, **extra) -> dict:
@@ -80,7 +81,7 @@ async def test_columns_line_up_for_every_row(environment):
 
     lines = _table(await otp_panel.status_text())
 
-    assert lines[0].split() == ["St", "Country", "File", "Stock", "Ends"]
+    assert lines[0].split() == ["St", "Country", "File", "Stock", "Rate", "Ends"]
     assert len(lines) == 5
     for line in lines:
         for gap in GAPS:
@@ -226,3 +227,41 @@ async def test_a_stopped_automation_shows_the_interval_but_no_next_check(environ
 
     assert "Checks: every 10 min (all countries)" in text
     assert "Next check" not in text
+
+
+# --------------------------------------------------------------------------- #
+# The Rate column
+# --------------------------------------------------------------------------- #
+def test_the_rate_cell_is_short_and_says_def_for_the_default():
+    assert otp_panel.rate_cell(None) == "def"
+    assert otp_panel.rate_cell("") == "def"
+    assert otp_panel.rate_cell("default") == "def"
+    assert otp_panel.rate_cell("0") == "0"
+    assert otp_panel.rate_cell("0.0005") == "0.0005"
+    # Never wider than its column, whatever gets stored.
+    assert len(otp_panel.rate_cell("0.000123456789")) <= otp_panel._RATE_WIDTH
+
+
+async def test_a_country_without_a_rate_shows_def(environment):
+    await _run([_entry(1, "Sudan")])
+
+    sudan = _row(await otp_panel.status_text(), "Sudan")
+
+    rate_at = _table(await otp_panel.status_text())[0].index("Rate")
+    assert sudan[rate_at:rate_at + 4].strip() == "def"
+    for gap in GAPS:
+        assert sudan[gap] == " ", (gap, sudan)
+
+
+async def test_a_country_with_its_own_rate_shows_it(environment):
+    """schedule_overview rows carry "rate"; the table shows it as typed."""
+    await _run([_entry(1, "Sudan"), _entry(2, "Chad")])
+    await otp_schedule.set_country_settings("Sudan", {"rate": "0.0005"})
+
+    text = await otp_panel.status_text()
+
+    assert "0.0005" in _row(text, "Sudan")
+    assert "def" in _row(text, "Chad")
+    for line in _table(text):
+        for gap in GAPS:
+            assert line[gap] == " ", (gap, line)

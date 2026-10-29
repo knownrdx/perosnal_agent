@@ -60,12 +60,31 @@ LAST_TAG_KEY = f"{SETTING_KEY}_last_tag"
 # left behind by an older version that wrote start_at on every save.
 START_NOW = "now"
 
+# The add command before rates existed (config v3 and earlier). A stored
+# template that still reads exactly like this is swapped for the new default
+# on load, so the "-r" flag reaches the bot without the owner editing it.
+_OLD_ADD_COMMAND_TEMPLATE = "/fan -t {tag} -l {limit} -c {count}"
+# {rate_flag} becomes " -r 0.0005" when a rate applies and "" when the bot's
+# own default rate should be used. {rate} (the bare value) is available too.
+DEFAULT_ADD_COMMAND_TEMPLATE = "/fan -t {tag} -l {limit} -c {count}{rate_flag}"
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": False,            # periodic quota-monitor/refill loop on/off
     "target_bot": "@PBDxbot",
-    "add_command_template": "/fan -t {tag} -l {limit} -c {count}",
+    "add_command_template": DEFAULT_ADD_COMMAND_TEMPLATE,
     "limit": 4,
     "count": 4,
+    # Rate per OTP ("-r"), used for a country that has no remembered rate of
+    # its own. "" = the bot's own default (no -r flag). The bot does NOT
+    # remember a rate per country - it falls back to its global default
+    # whenever -r is omitted - so the agent has to remember it here.
+    "default_rate": "",
+    # Ask "what rate for <country>?" the first time a country is uploaded.
+    # Off = never ask, always use default_rate.
+    "ask_rate": True,
+    # Ask "when should <country> be added? now or a time" on every upload
+    # whose caption did not say. Off = the start_at default applies silently.
+    "ask_start_time": True,
     # /st ("/stats") over /myquota: it reports live stock PER COUNTRY in one
     # reply, so a single round-trip answers for every country being run
     # instead of needing one check each.
@@ -122,10 +141,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "awaiting_tag_entry_id": None,  # set while a "what tag for X" prompt is pending
     # Bumped when a stored config needs a one-off correction on load; see
     # get_config(). A fresh install starts at the current version.
-    "config_version": 3,
+    "config_version": 4,
 }
 
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 
 # Seeded as the dedicated thread's first message so it gets a recognisable
 # title in the thread list (list_threads titles a thread from its first user
@@ -326,8 +345,23 @@ SETTABLE_FIELDS: dict[str, dict[str, Any]] = {
     },
     "add_command_template": {
         "type": "str",
-        "label": "Add command ({tag}, {limit}, {count}, {country})",
-        "example": "/fan -t {tag} -l {limit} -c {count}",
+        "label": "Add command ({tag}, {limit}, {count}, {rate_flag}, {rate}, {country})",
+        "example": DEFAULT_ADD_COMMAND_TEMPLATE,
+    },
+    "default_rate": {
+        "type": "rate",
+        "label": "Default rate per OTP ('' = bot default)",
+        "example": "0.0005",
+    },
+    "ask_rate": {
+        "type": "bool",
+        "label": "Ask the rate the first time a country is uploaded",
+        "example": "on / off",
+    },
+    "ask_start_time": {
+        "type": "bool",
+        "label": "Ask when a new upload should be added (now or a time)",
+        "example": "on / off",
     },
     "force_delete_command": {
         "type": "str",
@@ -458,11 +492,19 @@ def coerce_setting(key: str, raw: str) -> Any:
     """Parse and validate one setting. Raises ValueError with a message meant
     to be shown straight to the owner.
     """
+    if key == "rate":
+        # Per-country only (otp_schedule.OVERRIDABLE); the global one is
+        # default_rate. Same validation either way.
+        return parse_rate(raw)
+
     spec = SETTABLE_FIELDS.get(key)
     if spec is None:
         raise ValueError(f"'{key}' isn't a setting. Send /otpset to see the full list.")
 
     value = raw.strip()
+    if spec["type"] == "rate":
+        return parse_rate(value)
+
     if spec["type"] == "time":
         from app.automation import otp_schedule
 
@@ -523,7 +565,10 @@ async def set_setting_from_chat(key: str, raw: str) -> str:
     """Apply one setting and describe the result in one line."""
     value = coerce_setting(key, raw)
     await save_config({key: value})
-    shown = "on" if value is True else "off" if value is False else (value or "(blank)")
+    if key == "default_rate":
+        shown = otp_schedule.rate_label(value)
+    else:
+        shown = "on" if value is True else "off" if value is False else (value or "(blank)")
     line = f"\u2705 Saved: {key} = {shown}"
     notes: list[str] = []
 
@@ -549,8 +594,6 @@ async def set_setting_from_chat(key: str, raw: str) -> str:
             "will be DELETED from the bot."
         )
     if key == "stop_at":
-        from app.automation import otp_schedule
-
         clock = otp_schedule.clock_now()
         if value:
             notes += [
@@ -620,7 +663,10 @@ async def set_country_setting_from_chat(country: str, key: str, raw: str) -> str
         await otp_schedule.set_paused(canonical, bool(value))
     else:
         await otp_schedule.set_country_settings(canonical, {key: value})
-    shown ="on" if value is True else "off" if value is False else value
+    if key == "rate":
+        shown = otp_schedule.rate_label(value)
+    else:
+        shown = "on" if value is True else "off" if value is False else value
     return f"\u2705 Saved for {canonical}: {key} = {shown}"
 
 
@@ -876,6 +922,13 @@ async def get_config() -> dict[str, Any]:
                 # command is gone too (popped above), so nothing like
                 # /useddelete can ever be sent again.
                 merged["interval_minutes"] = 1
+            if version < 4:
+                # Version 4: the rate per OTP ("-r") rides on the add
+                # command. An untouched old template is swapped for the new
+                # default so the flag actually reaches the bot; a template
+                # the owner customised is theirs and is left alone.
+                if merged.get("add_command_template") == _OLD_ADD_COMMAND_TEMPLATE:
+                    merged["add_command_template"] = DEFAULT_ADD_COMMAND_TEMPLATE
             merged["config_version"] = CONFIG_VERSION
             # Persisted once, BEFORE the per-country fixes below: those call
             # back into code that reads the config, which must already see
@@ -1176,6 +1229,10 @@ async def enqueue_file(
         }
         if caption.strip():
             entry["caption"] = caption.strip()[:300]
+        if "start_at" in stated:
+            # The caption answered "when should this be added?", so the
+            # start-time question is not asked for this entry.
+            entry["start_choice"] = stated["start_at"] or START_NOW
         queue.append(entry)
         created.append(entry)
 
@@ -1197,6 +1254,11 @@ async def enqueue_file(
             timing["stop_at"] = stated["stop_at"]
         if "run_minutes" in stated:
             timing["run_minutes"] = int(stated["run_minutes"])
+        # Unlike a start time, a rate IS a standing property of the country:
+        # stated once, it is remembered for every later file. Not stated,
+        # the remembered one stays (or the rate question is asked).
+        if "rate" in stated:
+            timing["rate"] = stated["rate"]
         await otp_schedule.set_country_settings(country, timing)
         if stated.get("tag"):
             await _set_last_tag(stated["tag"], country)
@@ -1298,6 +1360,10 @@ async def clear_queue() -> int:
     if queue:
         await _save_files(QUEUE_KEY, [])
         await set_awaiting_tag_entry(None)
+        # Questions about files that no longer exist would hang the thread.
+        await set_awaiting_rate(None)
+        await set_awaiting_start(None)
+        await set_awaiting_runtime(None)
     return len(queue)
 
 
@@ -1463,6 +1529,352 @@ async def apply_runtime_answer(countries: list[str], minutes: int) -> str:
     if minutes <= 0:
         return f"\u267E\uFE0F {who}: no time limit \u2014 runs until you say \"stop\"."
     return f"\u23F3 {who}: runs for {format_run_minutes(minutes)}, then stops by itself."
+
+
+# --------------------------------------------------------------------------- #
+# "What rate for <country>?" - asked ONCE per country, then remembered.
+#
+# The target bot pays a revenue per OTP ("-r" on /fan). It does not remember
+# a rate per country: leave -r off and it silently uses its global default.
+# Some countries need a different rate, so the agent keeps one per country
+# and asks the first time a country is seen. A remembered rate is reused
+# without asking; the caption ("rate 0.0005") answers it in advance.
+# --------------------------------------------------------------------------- #
+RATE_ASK_KEY = f"{SETTING_KEY}_awaiting_rate"
+
+# Offered as buttons. "default" means the bot's own rate (no -r flag).
+RATE_CHOICES = ("0", "0.0001", "0.0005", "0.001", "default")
+
+
+def parse_rate(text: str) -> str:
+    """Read a rate from free text. Raises ValueError with a message.
+
+    Accepts "0", "0.0005", ".0005", a leading "-r"/"rate", and
+    "default" / "bot default" / "skip" for the bot's own rate (-> "", so no
+    -r flag is sent). Returned as a normalised string ("0.0005", "0", "").
+    """
+    from app.automation import otp_caption
+
+    raw = " ".join(str(text or "").strip().split())
+    if not raw:
+        raise ValueError(
+            "What rate should it be? Reply 0 for zero, a number like 0.0005, "
+            "or 'default' for the bot's own rate."
+        )
+    lowered = raw.casefold()
+    if lowered in {"skip", "default", "bot default", "bot's default", "bots default"}:
+        return ""
+    # "-r 0.0005" / "rate: 0" - the owner may well type the flag itself.
+    stripped = re.sub(r"^(?:rate|-r|r)\s*[:=]?\s*", "", raw, flags=re.IGNORECASE)
+    return otp_caption.normalise_rate(stripped)
+
+
+async def get_awaiting_rate() -> dict[str, Any] | None:
+    """The upload batch currently being asked for a rate, if that prompt is open."""
+    async with session_scope() as session:
+        stored = await repo.get_setting(session, RATE_ASK_KEY)
+    return dict(stored) if stored else None
+
+
+async def set_awaiting_rate(countries: list[str] | None) -> None:
+    async with session_scope() as session:
+        await repo.set_setting(
+            session,
+            RATE_ASK_KEY,
+            {"countries": list(countries)} if countries else {},
+        )
+
+
+async def countries_needing_rate(entries: list[dict[str, Any]]) -> list[str]:
+    """Which of these countries have no remembered rate yet.
+
+    A country with a rate of its own - from an earlier answer, the caption,
+    /otprate or the panel - is never asked again; an explicit "bot default"
+    ("") counts as an answer. Nothing is asked when ask_rate is off.
+    """
+    cfg = await get_config()
+    if not cfg.get("ask_rate", True):
+        return []
+
+    needing: list[str] = []
+    for entry in entries:
+        country = entry.get("country") or entry.get("name") or ""
+        if not country or country in needing:
+            continue
+        own = await otp_schedule.get_country_settings(country)
+        if "rate" in own:
+            continue
+        needing.append(country)
+    return needing
+
+
+def rate_question(countries: list[str], default_rate: str) -> str:
+    """Ask what rate per OTP this country (or batch) should get."""
+    who = ", ".join(countries[:4]) + (" ..." if len(countries) > 4 else "")
+    lines = [
+        f"\U0001F4B5 What rate for {who}?",
+        "",
+        "Reply 0 for zero, a number like 0.0005, or 'default' to use the "
+        "bot's default (no -r flag).",
+    ]
+    if str(default_rate or "").strip():
+        lines.append(f"Say \"skip\" to use your usual rate ({default_rate}).")
+    lines.append("I'll remember it for the next file from the same country.")
+    return "\n".join(lines)
+
+
+async def apply_rate_answer(countries: list[str], rate: str) -> str:
+    """Store the rate for every country in the batch and describe it."""
+    rate = str(rate or "").strip()
+    for country in countries:
+        await otp_schedule.set_country_settings(country, {"rate": rate})
+    await set_awaiting_rate(None)
+    who = ", ".join(countries[:4]) + (" ..." if len(countries) > 4 else "")
+    if rate:
+        return f"\U0001F4B5 {who}: rate {rate} per OTP — remembered."
+    return f"\U0001F4B5 {who}: the bot's default rate — remembered."
+
+
+async def handle_rate_answer(text: str) -> str:
+    """Owner answered the "what rate for X?" question."""
+    pending = await get_awaiting_rate()
+    countries = list((pending or {}).get("countries") or [])
+    if not countries:
+        return "There's no rate question open right now."
+
+    if is_skip_trigger(text):
+        # Skipping takes the configured default rate, exactly as the
+        # question promised - not an unanswered blank.
+        cfg = await get_config()
+        note = await apply_rate_answer(countries, str(cfg.get("default_rate") or ""))
+        return await _ask_or_start(f"{note} (default)")
+
+    try:
+        rate = parse_rate(text)
+    except ValueError as exc:
+        return f"❌ {exc}\n\nPlease try again — or say \"skip\" to use the default."
+
+    note = await apply_rate_answer(countries, rate)
+    return await _ask_or_start(note)
+
+
+async def handle_set_rate(country: str, text: str) -> str:
+    """Set (or clear to bot default) one country's remembered rate from a
+    command or a panel button. Raises ValueError with an owner-facing
+    message for an unreadable value."""
+    if not str(country or "").strip():
+        raise ValueError("Which country? e.g. /otprate Bangladesh 0.0005")
+    rate = parse_rate(text)
+    canonical = await canonical_country(country)
+    await otp_schedule.set_country_settings(canonical, {"rate": rate})
+    return (
+        f"✅ {canonical}: rate = {otp_schedule.rate_label(rate)}"
+        " — used for every file from this country from now on."
+    )
+
+
+async def handle_rate_list() -> str:
+    """Every country's remembered rate, plus the default, in one message."""
+    cfg = await get_config()
+    default_rate = str(cfg.get("default_rate") or "")
+    overrides = await otp_schedule.get_all_country_settings()
+
+    names: dict[str, str] = {}
+    for key, own in overrides.items():
+        if isinstance(own, dict) and "rate" in own:
+            names[key] = str(own.get("display_name") or key)
+    # Countries in play without a rate are listed too, so the owner can see
+    # what the next upload will be asked about.
+    for entry in await get_queue() + await get_active_files():
+        country = entry.get("country") or entry.get("name") or ""
+        key = " ".join(country.casefold().split())
+        if country and key not in names:
+            names[key] = country
+
+    lines = ["\U0001F4B5 Rates per OTP", ""]
+    for key in sorted(names, key=lambda k: names[k].casefold()):
+        own = overrides.get(key, {})
+        if "rate" in own:
+            lines.append(f"• {names[key]}: {otp_schedule.rate_label(own['rate'])}")
+        else:
+            lines.append(f"• {names[key]}: not set yet — I'll ask on the next upload")
+    if len(lines) == 2:
+        lines.append("No country has a rate yet — I ask the first time one is uploaded.")
+    lines += [
+        "",
+        f"Default for new countries: {otp_schedule.rate_label(default_rate)}",
+        "Asking: " + ("on" if cfg.get("ask_rate", True) else "off (default used silently)"),
+        "",
+        "Change one: /otprate <country> <rate>  (e.g. /otprate Bangladesh 0.0005, or 'default')",
+    ]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# "When should <country> be added?" - asked once per UPLOAD.
+#
+# A start time is an instruction about one file, not a property of the
+# country: "tonight at 21:00" for this batch says nothing about the next one.
+# So every new file is asked - a brand-new country and a replacement file for
+# a country already running alike - unless the caption already said.
+#
+# Replacement semantics (what the owner wants, kept simple): the new file
+# REPLACES the old one in the active set the moment the start goes through.
+#   - "now": the running country keeps going, nothing is re-gated; only the
+#     file changes (held if the bot still has stock, added otherwise).
+#   - a time: the country waits for that time before the NEW file is first
+#     added. The old file is gone, so refills in between are not attempted.
+#   - "default": the global start_at applies - but a country already running
+#     is never paused by the default (see start_automation).
+# --------------------------------------------------------------------------- #
+START_ASK_KEY = f"{SETTING_KEY}_awaiting_start"
+
+# Offered as buttons. "default" = whatever the global start_at says.
+START_CHOICES = ("now", "21:00", "00:00", "04:00", "default")
+
+_START_DEFAULT_WORDS = frozenset({"default", "skip", "same", "as usual", "usual"})
+
+
+def parse_start_time(text: str) -> str | None:
+    """Read a start answer: START_NOW, "HH:MM" (Dubai), or None for "default".
+
+    Accepts "now"/"ekhoni"/"ekhuni", "21:00", "9pm", "rat 9ta", "2100",
+    "21.00" and "default". Raises ValueError with a message otherwise.
+    """
+    from app.automation import otp_caption
+
+    raw = " ".join(str(text or "").strip().split())
+    if not raw:
+        raise ValueError(
+            "When should it be added? Say 'now', a time like 21:00, or 'default'."
+        )
+    lowered = raw.casefold()
+    if lowered in _START_DEFAULT_WORDS:
+        return None
+    if lowered in otp_schedule._START_NOW_WORDS or any(
+        phrase in lowered for phrase in otp_caption._NOW_PHRASES
+    ):
+        return START_NOW
+
+    # "9pm", "rat 9ta", "21:00" - the same reader the caption uses, so an
+    # answer may be phrased exactly like a caption would be.
+    clocks = otp_caption._clock_matches(raw)
+    if len(clocks) == 1:
+        return clocks[0][0]
+    try:
+        value = otp_schedule.parse_stop_time(raw)   # "2100", "21.00"
+    except ValueError:
+        raise ValueError(
+            "Sorry, I didn't catch that. Say 'now', a time like 21:00 or 9pm, "
+            "or 'default'."
+        ) from None
+    return START_NOW if otp_schedule._is_now(value) else value
+
+
+async def get_awaiting_start() -> dict[str, Any] | None:
+    """The upload batch currently being asked when to start, if that prompt is open."""
+    async with session_scope() as session:
+        stored = await repo.get_setting(session, START_ASK_KEY)
+    return dict(stored) if stored else None
+
+
+async def set_awaiting_start(countries: list[str] | None) -> None:
+    async with session_scope() as session:
+        await repo.set_setting(
+            session,
+            START_ASK_KEY,
+            {"countries": list(countries)} if countries else {},
+        )
+
+
+async def countries_needing_start(entries: list[dict[str, Any]]) -> list[str]:
+    """Which of these uploads have not been told when to begin.
+
+    An entry whose caption named a time (or "ekhoni"), or whose question was
+    already answered, carries ``start_choice`` and is not asked. Nothing is
+    asked when ask_start_time is off - the global start_at then applies.
+    """
+    cfg = await get_config()
+    if not cfg.get("ask_start_time", True):
+        return []
+
+    needing: list[str] = []
+    for entry in entries:
+        country = entry.get("country") or entry.get("name") or ""
+        if not country or country in needing or entry.get("start_choice"):
+            continue
+        needing.append(country)
+    return needing
+
+
+def start_question(countries: list[str], default_start_at: str) -> str:
+    """Ask when this upload should be added, stating the default plainly."""
+    who = ", ".join(countries[:4]) + (" ..." if len(countries) > 4 else "")
+    clock = otp_schedule.clock_now()
+    default = str(default_start_at or "").strip()
+    default_shown = "right away" if otp_schedule._is_now(default) else f"{default} Dubai"
+    return (
+        f"⏰ When should {who} be added?\n"
+        "\n"
+        "• Now — or a time (Dubai), e.g. 21:00 or 9pm\n"
+        f"• Default: {default_shown} (used if you skip this)\n"
+        f"• Time now: {clock['dubai']} Dubai\n"
+        "\n"
+        "Tap a button below, or type the time."
+    )
+
+
+async def apply_start_answer(countries: list[str], value: str | None) -> str:
+    """Store the start choice for every country in the batch and describe it.
+
+    ``value`` is START_NOW, "HH:MM", or None to follow the global default.
+    The queued entries are marked so the question is not asked twice.
+    """
+    for country in countries:
+        await otp_schedule.set_country_settings(country, {"start_at": value})
+
+    queue = await get_queue()
+    wanted = {" ".join(c.casefold().split()) for c in countries}
+    changed = False
+    for entry in queue:
+        name = " ".join((entry.get("country") or entry.get("name") or "").casefold().split())
+        if name in wanted:
+            entry["start_choice"] = value if value else "default"
+            changed = True
+    if changed:
+        await _save_files(QUEUE_KEY, queue)
+    await set_awaiting_start(None)
+
+    who = ", ".join(countries[:4]) + (" ..." if len(countries) > 4 else "")
+    if value is None:
+        cfg = await get_config()
+        default = str(cfg.get("start_at") or "").strip()
+        if otp_schedule._is_now(default):
+            return f"▶️ {who}: added right away (default)."
+        return f"⏰ {who}: added at {default} Dubai time (default)."
+    if otp_schedule._is_now(value):
+        return f"▶️ {who}: added right away."
+    return f"⏰ {who}: added at {value} Dubai time."
+
+
+async def handle_start_answer(text: str) -> str:
+    """Owner answered the "when should X be added?" question."""
+    pending = await get_awaiting_start()
+    countries = list((pending or {}).get("countries") or [])
+    if not countries:
+        return "There's no start-time question open right now."
+
+    if is_skip_trigger(text):
+        note = await apply_start_answer(countries, None)
+        return await _ask_or_start(note)
+
+    try:
+        value = parse_start_time(text)
+    except ValueError as exc:
+        return f"❌ {exc}\n\nPlease try again — or say \"skip\" to use the default."
+
+    note = await apply_start_answer(countries, value)
+    return await _ask_or_start(note)
 
 
 class AddRejected(Exception):
@@ -1829,11 +2241,16 @@ async def _add_one_file(target: str, entry: dict[str, Any], cfg: dict[str, Any])
     )
     await _sleep(2)
 
+    # The rate rides on the command: "-r 0.0005" for a country with one, no
+    # flag at all for "bot default" (the bot then uses ITS global rate).
+    rate = otp_schedule.effective_rate(cfg)
     command_text = cfg["add_command_template"].format(
         tag=entry.get("tag") or "General",
         limit=cfg["limit"],
         count=cfg["count"],
         country=entry.get("country") or "",
+        rate=rate,
+        rate_flag=f" -r {rate}" if rate else "",
     )
     await _bot_call(
         get_userbot().send_message(target, command_text, reply_to=sent_file.get("message_id")),
@@ -2194,11 +2611,13 @@ def _limits_of(entry_cfg: dict[str, Any]) -> dict[str, Any]:
     """The finish conditions that apply to one country, for the start
     message. Taken from the country's EFFECTIVE settings: reading only the
     global ones told the owner "no time limit" for a country whose own
-    20h limit was about to end it."""
+    20h limit was about to end it. The rate goes along for the same reason:
+    the owner should see what the add command will actually carry."""
     return {
         "run_minutes": int(entry_cfg.get("run_minutes") or 0),
         "max_refills": int(entry_cfg.get("max_refills") or 0),
         "stop_at": str(entry_cfg.get("stop_at") or ""),
+        "rate": otp_schedule.effective_rate(entry_cfg),
     }
 
 
@@ -2221,8 +2640,15 @@ async def maybe_auto_start() -> dict[str, Any] | None:
     # calls back in here once it lands.
     if any(not e.get("tag") for e in queue):
         return None
-    # Nor is one still waiting on "how long should this run?" - starting
-    # first and asking after would leave a gap where the run has no limit.
+    # Nor one still waiting on its rate (the add command needs it), on
+    # "when should this be added?", or on "how long should this run?" -
+    # starting first and asking after would send the wrong command or leave
+    # a gap where the run has no limit. An open question blocks the start
+    # even if its countries somehow got their answer another way.
+    if await get_awaiting_rate() or await get_awaiting_start():
+        return None
+    if await countries_needing_rate(queue) or await countries_needing_start(queue):
+        return None
     if await countries_needing_runtime(queue):
         return None
 
@@ -2306,6 +2732,7 @@ def help_text() -> str:
         "\u2022 telegram, kono stop nai \u2014 service, no time limit\n"
         "\u2022 nigeria 2 din \u2014 country + how many days\n"
         "\u2022 rat 9 ta porjonto \u2014 everyday phrasing works too\n"
+        "\u2022 rate 0.0005 \u2014 rate per OTP (remembered per country)\n"
         "\n"
         "Bengali script works exactly the same:\n"
         "\u2022 \u09ac\u09be\u0982\u09b2\u09be\u09a6\u09c7\u09b6 \u09b9\u09cb\u09df\u09be\u099f\u09b8\u0985\u09cd\u09af\u09be\u09aa \u09e8\u09e6 \u0998\u09a8\u09cd\u099f\u09be\n"
@@ -2316,6 +2743,8 @@ def help_text() -> str:
         "\u2022 start / shuru \u2014 start running\n"
         "\u2022 stop / bondho \u2014 stop\n"
         "\u2022 status \u2014 what's running right now\n"
+        "\u2022 0.0005 / 0 / default \u2014 rate (when I ask; asked once per country)\n"
+        "\u2022 now / 21:00 / 9pm \u2014 when to add a new file (when I ask)\n"
         "\u2022 20h / 90 min / limit nai \u2014 run time (when I ask)\n"
         "\u2022 <country> bad dao \u2014 drop that country\n"
         "\u2022 sob bad dao \u2014 empty the queue\n"
@@ -2326,6 +2755,7 @@ def help_text() -> str:
         "Commands:\n"
         "\u2022 /otpbot \u2014 button panel (everything is there)\n"
         "\u2022 /otpset \u2014 view / change settings\n"
+        "\u2022 /otprate \u2014 see or change each country's rate\n"
         "\u2022 /otppreset \u2014 list / save / apply presets\n"
         "\n"
         "The buttons cover interval, restock point, country on/off, start time,\n"
@@ -2500,6 +2930,14 @@ def _format_start_success(result: dict[str, Any]) -> str:
     else:
         head += f" \u2014 nothing sent to {target} yet"
 
+    def rate_note(f: dict[str, Any]) -> str:
+        # Results stored before rates existed have no "rate" key: say
+        # nothing rather than claim "bot default" for a command that may
+        # have carried something else.
+        if "rate" not in f:
+            return ""
+        return f" \u00B7 Rate: {otp_schedule.rate_label(str(f.get('rate') or ''))}"
+
     body: list[str] = []
     for f in added:
         line = f"\u2022 {f.get('country') or '?'} \u2014 {_numbers(f.get('count'))}"
@@ -2508,7 +2946,7 @@ def _format_start_success(result: dict[str, Any]) -> str:
         new = _parse_added_count(str(f.get("reply") or ""))
         if new is not None:
             line += f", {new:,} added"
-        body.append(line)
+        body.append(line + rate_note(f))
     # Files held back are not failures - the country already had numbers, so
     # sending them now would only produce duplicates. Say so plainly, or it
     # reads as "my file was ignored".
@@ -2517,6 +2955,7 @@ def _format_start_success(result: dict[str, Any]) -> str:
             f"\u23F8 Held: {f.get('country') or '?'} \u2014 {_numbers(f.get('count'))} kept "
             f"(bot still has {_num(f.get('stock', 0))}). "
             "It will be added automatically when stock runs low."
+            + rate_note(f)
         )
     # Scheduled countries have not been touched at all yet - saying so is the
     # difference between "waiting as asked" and "my file was ignored".
@@ -2525,6 +2964,7 @@ def _format_start_success(result: dict[str, Any]) -> str:
         body.append(
             f"\u23F0 Scheduled: {f.get('country') or '?'} \u2014 {_numbers(f.get('count'))}{tag}, "
             f"starts at {f['waiting_start']} Dubai time."
+            + rate_note(f)
         )
     if result.get("kept_running"):
         body.append(
@@ -2633,11 +3073,13 @@ async def handle_start_trigger() -> str:
             "Upload a number file first, then say \"start\"."
         )
 
-    needing = await countries_needing_runtime(queue)
-    if needing:
-        cfg = await get_config()
-        await set_awaiting_runtime(needing)
-        return runtime_question(needing, int(cfg.get("default_run_minutes") or 0))
+    # The same questions an upload gets, in the same order (rate, start
+    # time, run length). Only when none is left does the explicit "start"
+    # start right away - a start time the owner is asked for on the way is
+    # their answer, and is honoured.
+    question = await _next_question(queue)
+    if question is not None:
+        return question
 
     result = await start_automation()
     if result["ok"]:
@@ -2647,14 +3089,38 @@ async def handle_start_trigger() -> str:
     return f"\u274C Couldn't start: {result['error']}"
 
 
-def format_start_result(result: dict[str, Any]) -> str:
-    """Public wrapper: callers outside this module format a start result
-    through here rather than reaching for the private helper."""
-    return _format_start_success(result)
+async def _next_question(queue: list[dict[str, Any]]) -> str | None:
+    """Open the next unanswered question about the queue, or None if the
+    queue is ready to start. Order: rate -> start time -> run length
+    (the tag question is handled before this by the callers).
+    """
+    cfg = await get_config()
+    needing = await countries_needing_rate(queue)
+    if needing:
+        await set_awaiting_rate(needing)
+        return rate_question(needing, str(cfg.get("default_rate") or ""))
+
+    needing = await countries_needing_start(queue)
+    if needing:
+        await set_awaiting_start(needing)
+        return start_question(needing, str(cfg.get("start_at") or ""))
+
+    needing = await countries_needing_runtime(queue)
+    if needing:
+        await set_awaiting_runtime(needing)
+        return runtime_question(needing, int(cfg.get("default_run_minutes") or 0))
+    return None
 
 
-async def _continue_after_tagging(prefix: str) -> str:
-    """Either ask the next question or, if nothing is left to ask, start."""
+async def _ask_or_start(prefix: str, *, empty_text: str | None = None) -> str:
+    """One answer landed: ask the next question, or start if none is left.
+
+    Order: tag -> rate -> start time -> run length -> start. Shared by every
+    answer handler so the chain cannot differ depending on which question
+    was answered. The start that ends the chain honours the schedule: the
+    owner has just been asked when the file should go in (or took the
+    default), and that answer is the instruction.
+    """
     next_entry = await next_untagged_entry()
     if next_entry is not None:
         await set_awaiting_tag_entry(next_entry["id"])
@@ -2662,26 +3128,37 @@ async def _continue_after_tagging(prefix: str) -> str:
 
     queue = await get_queue()
     if not queue:
-        return f"{prefix}\n\nThe queue is empty now. Send a new file, then say \"start\"."
+        return f"{prefix}\n\n{empty_text or 'The queue is empty \u2014 send a new file.'}"
 
-    # Tags are settled; the remaining question is how long it should run.
-    # Asked once for the whole batch, and only for the countries that do not
-    # already have an answer from their caption or a previous run.
-    needing = await countries_needing_runtime(queue)
-    if needing:
-        cfg = await get_config()
-        await set_awaiting_runtime(needing)
-        return (
-            f"{prefix}\n\n"
-            + runtime_question(needing, int(cfg.get("default_run_minutes") or 0))
-        )
+    question = await _next_question(queue)
+    if question is not None:
+        return f"{prefix}\n\n{question}"
 
-    result = await start_automation()
+    result = await start_automation(respect_schedule=True)
     if result["ok"]:
         text_out = _format_start_success(result)
         await _notify_owner(f"\U0001F7E2 OTP-bot automation started.\n\n{text_out}")
         return f"{prefix}\n\n{text_out}"
     return f"{prefix}\n\n\u274C Couldn't start: {result['error']}"
+
+
+def format_start_result(result: dict[str, Any]) -> str:
+    """Public wrapper: callers outside this module format a start result
+    through here rather than reaching for the private helper."""
+    return _format_start_success(result)
+
+
+async def _continue_after_tagging(prefix: str) -> str:
+    """Either ask the next question or, if nothing is left to ask, start.
+
+    Tags are settled one file at a time; what follows (rate, start time,
+    run length) is asked once for the whole batch, and only for the
+    countries without an answer from their caption or an earlier run.
+    """
+    return await _ask_or_start(
+        prefix,
+        empty_text="The queue is empty now. Send a new file, then say \"start\".",
+    )
 
 
 async def handle_runtime_answer(text: str) -> str:
@@ -2711,20 +3188,7 @@ async def handle_runtime_answer(text: str) -> str:
 
 async def _continue_after_runtime(prefix: str) -> str:
     """The run length is settled - start, unless something else is pending."""
-    next_entry = await next_untagged_entry()
-    if next_entry is not None:
-        await set_awaiting_tag_entry(next_entry["id"])
-        return f"{prefix}\n\n{_tag_question(next_entry)}"
-
-    if not await get_queue():
-        return f"{prefix}\n\nThe queue is empty \u2014 send a new file."
-
-    result = await start_automation()
-    if result["ok"]:
-        text_out = _format_start_success(result)
-        await _notify_owner(f"\U0001F7E2 OTP-bot automation started.\n\n{text_out}")
-        return f"{prefix}\n\n{text_out}"
-    return f"{prefix}\n\n\u274C Couldn't start: {result['error']}"
+    return await _ask_or_start(prefix)
 
 
 async def handle_tag_answer(text: str) -> str:

@@ -180,6 +180,10 @@ async def test_cleanup_button_switches_mode(runner):
 
 
 async def test_service_button_tags_the_file_and_starts(runner):
+    # The tag is the only open question here: with the rate and start-time
+    # questions on, the service button would lead to the next question
+    # instead of the start.
+    await otp_bot.save_config({"ask_rate": False, "ask_start_time": False})
     entry = await _queue_one()
     set_userbot(_Bot())
 
@@ -564,4 +568,276 @@ async def test_otppreset_lists_presets_with_their_thresholds(runner):
     text = message.answers[-1]["text"]
     assert "Low-stock refill" in text
     assert "refill at 200" in text
+
+
+# --------------------------------------------------------------------------- #
+# Rate and start-time buttons, the per-country Rate button, /otprate
+# --------------------------------------------------------------------------- #
+def _stub_rate_core(monkeypatch, *, rate_open: bool = True, start_open: bool = False) -> dict:
+    """The otp_bot rate/start contract, stubbed (raising=False) so these test
+    the glue in bot.py whether or not the core has landed. Answering the
+    rate closes that question and opens the start one, as the core does.
+    """
+    state: dict[str, Any] = {"rate_open": rate_open, "start_open": start_open, "calls": []}
+
+    async def get_rate():
+        return {"countries": ["Bangladesh"]} if state["rate_open"] else None
+
+    async def get_start():
+        return {"countries": ["Bangladesh"]} if state["start_open"] else None
+
+    async def rate_answer(text):
+        state["calls"].append(("rate", text))
+        state["rate_open"] = False
+        state["start_open"] = True
+        return (
+            f"\U0001F4B5 Bangladesh: rate {text}\n"
+            "\n"
+            "▶️ When should Bangladesh start?"
+        )
+
+    async def start_answer(text):
+        state["calls"].append(("start", text))
+        state["start_open"] = False
+        return f"▶️ Bangladesh starts {text}."
+
+    async def set_rate(country, text):
+        state["calls"].append(("set", country, text))
+        return f"\U0001F4B5 {country}: rate {text}"
+
+    async def rate_list():
+        state["calls"].append(("list",))
+        return "\U0001F4B5 Rates\n\n• Bangladesh: 0.0005\n• Default: default"
+
+    for name, value in {
+        "get_awaiting_rate": get_rate,
+        "get_awaiting_start": get_start,
+        "handle_rate_answer": rate_answer,
+        "handle_start_answer": start_answer,
+        "handle_set_rate": set_rate,
+        "handle_rate_list": rate_list,
+        "RATE_CHOICES": ("0", "0.0001", "0.0005", "0.001", "default"),
+        "START_CHOICES": ("now", "21:00", "00:00", "04:00", "default"),
+    }.items():
+        monkeypatch.setattr(otp_bot, name, value, raising=False)
+    return state
+
+
+def _callback_data(markup: Any) -> list[str]:
+    return [b.callback_data for row in markup.inline_keyboard for b in row]
+
+
+async def test_rate_button_answers_the_open_rate_question(runner, monkeypatch):
+    state = _stub_rate_core(monkeypatch)
+    query = _Query("otp:rate:0.0005", await _owner_id(runner))
+
+    await _handler(runner)(query)
+
+    assert state["calls"] == [("rate", "0.0005")]
+    last = query.message.answers[-1]
+    assert "rate 0.0005" in last["text"]
+    # The reply asked the next question (start time), so its keyboard is under it.
+    assert "otp:startat:now" in _callback_data(last["markup"])
+
+
+async def test_rate_button_passes_default_through_as_a_word(runner, monkeypatch):
+    state = _stub_rate_core(monkeypatch)
+    await _handler(runner)(_Query("otp:rate:default", await _owner_id(runner)))
+    assert state["calls"] == [("rate", "default")]
+
+
+async def test_rate_button_on_a_closed_question_says_so(runner, monkeypatch):
+    state = _stub_rate_core(monkeypatch, rate_open=False)
+    query = _Query("otp:rate:0", await _owner_id(runner))
+
+    await _handler(runner)(query)
+
+    assert state["calls"] == []
+    assert query.acks[-1]["alert"] is True
+    assert query.message.answers == []
+
+
+async def test_custom_rate_button_waits_for_a_typed_rate(runner, monkeypatch):
+    _stub_rate_core(monkeypatch)
+    query = _Query("otp:ratec:", await _owner_id(runner))
+
+    await _handler(runner)(query)
+
+    assert await otp_bot.get_pending_input() == {"field": "rate", "country": None}
+    assert "rate" in query.message.answers[-1]["text"].lower()
+    assert "skip" in query.message.answers[-1]["text"].lower()
+
+
+async def test_start_button_answers_the_open_start_question(runner, monkeypatch):
+    state = _stub_rate_core(monkeypatch, rate_open=False, start_open=True)
+    query = _Query("otp:startat:21:00", await _owner_id(runner))
+
+    await _handler(runner)(query)
+
+    # "21:00" contains a colon of its own - it must reach the core whole.
+    assert state["calls"] == [("start", "21:00")]
+    assert "starts 21:00" in query.message.answers[-1]["text"]
+
+
+async def test_start_button_now_and_default_are_passed_as_words(runner, monkeypatch):
+    state = _stub_rate_core(monkeypatch, rate_open=False, start_open=True)
+    await _handler(runner)(_Query("otp:startat:now", await _owner_id(runner)))
+    state["start_open"] = True
+    await _handler(runner)(_Query("otp:startat:default", await _owner_id(runner)))
+    assert state["calls"] == [("start", "now"), ("start", "default")]
+
+
+async def test_start_button_on_a_closed_question_says_so(runner, monkeypatch):
+    state = _stub_rate_core(monkeypatch, rate_open=False, start_open=False)
+    query = _Query("otp:startat:04:00", await _owner_id(runner))
+
+    await _handler(runner)(query)
+
+    assert state["calls"] == []
+    assert query.acks[-1]["alert"] is True
+
+
+async def test_custom_start_button_leaves_the_question_open_for_typing(runner, monkeypatch):
+    _stub_rate_core(monkeypatch, rate_open=False, start_open=True)
+    query = _Query("otp:startatc:", await _owner_id(runner))
+
+    await _handler(runner)(query)
+
+    # No pending-input field: the start question itself is still open, so
+    # the next typed message reaches handle_start_answer by itself.
+    assert await otp_bot.get_pending_input() is None
+    assert "HH:MM" in query.message.answers[-1]["text"]
+
+
+async def test_the_country_panel_shows_the_rate_and_offers_to_change_it(runner, monkeypatch):
+    from app.telegram import otp_panel
+
+    _stub_rate_core(monkeypatch, rate_open=False)
+    entry = await _queue_one()
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    key = otp_panel.country_key("Bangladesh")
+
+    query = _Query(f"otp:fields:{key}", await _owner_id(runner))
+    await _handler(runner)(query)
+
+    last = query.message.answers[-1]
+    assert "Rate: bot default" in last["text"]
+    assert f"otp:pickrate:{key}" in _callback_data(last["markup"])
+
+
+async def test_the_country_panel_shows_its_own_rate_over_the_default(runner, monkeypatch):
+    from app.telegram import otp_panel
+
+    _stub_rate_core(monkeypatch, rate_open=False)
+    entry = await _queue_one()
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    await otp_bot.save_config({"default_rate": "0.001"})
+    key = otp_panel.country_key("Bangladesh")
+
+    query = _Query(f"otp:fields:{key}", await _owner_id(runner))
+    await _handler(runner)(query)
+    assert "Rate: 0.001 (default)" in query.message.answers[-1]["text"]
+
+    await otp_schedule.set_country_settings("Bangladesh", {"rate": "0"})
+    query = _Query(f"otp:fields:{key}", await _owner_id(runner))
+    await _handler(runner)(query)
+    assert "Rate: 0 (free)" in query.message.answers[-1]["text"]
+
+
+async def test_the_rate_picker_offers_every_rate_for_that_country(runner, monkeypatch):
+    from app.telegram import otp_panel
+
+    _stub_rate_core(monkeypatch, rate_open=False)
+    entry = await _queue_one()
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    key = otp_panel.country_key("Bangladesh")
+
+    query = _Query(f"otp:pickrate:{key}", await _owner_id(runner))
+    await _handler(runner)(query)
+
+    last = query.message.answers[-1]
+    assert "Bangladesh" in last["text"]
+    data = _callback_data(last["markup"])
+    assert f"otp:crate:{key}:0" in data
+    assert f"otp:crate:{key}:default" in data
+    assert f"otp:cratec:{key}" in data
+
+
+async def test_a_country_rate_button_sets_that_countrys_rate(runner, monkeypatch):
+    from app.telegram import otp_panel
+
+    state = _stub_rate_core(monkeypatch, rate_open=False)
+    entry = await _queue_one()
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    key = otp_panel.country_key("Bangladesh")
+
+    query = _Query(f"otp:crate:{key}:0.001", await _owner_id(runner))
+    await _handler(runner)(query)
+
+    assert state["calls"] == [("set", "Bangladesh", "0.001")]
+    assert query.message.edits, "the panel should be refreshed in place"
+    assert "Bangladesh: rate 0.001" in otp_panel.html_to_plain(query.message.edits[-1]["text"])
+
+
+async def test_a_country_rate_button_for_a_gone_country_says_so(runner, monkeypatch):
+    state = _stub_rate_core(monkeypatch, rate_open=False)
+    query = _Query("otp:crate:zzzzzzzz:0", await _owner_id(runner))
+
+    await _handler(runner)(query)
+
+    assert state["calls"] == []
+    assert query.acks[-1]["alert"] is True
+
+
+async def test_a_custom_country_rate_is_asked_for(runner, monkeypatch):
+    from app.telegram import otp_panel
+
+    _stub_rate_core(monkeypatch, rate_open=False)
+    entry = await _queue_one()
+    await otp_bot.set_queue_tag(entry["id"], "WhatsApp")
+    key = otp_panel.country_key("Bangladesh")
+
+    query = _Query(f"otp:cratec:{key}", await _owner_id(runner))
+    await _handler(runner)(query)
+
+    assert await otp_bot.get_pending_input() == {"field": "rate", "country": "Bangladesh"}
+    assert "Bangladesh" in query.message.answers[-1]["text"]
+
+
+async def test_otprate_lists_the_rates(runner, monkeypatch):
+    state = _stub_rate_core(monkeypatch, rate_open=False)
+    message = _PlainMessage(await _owner_id(runner))
+
+    await _command_handler(runner, "_otprate")(message, _Command(""))
+
+    assert state["calls"] == [("list",)]
+    assert "Rates" in message.answers[-1]["text"]
+
+
+async def test_otprate_sets_a_rate_for_a_multi_word_country(runner, monkeypatch):
+    state = _stub_rate_core(monkeypatch, rate_open=False)
+    message = _PlainMessage(await _owner_id(runner))
+
+    await _command_handler(runner, "_otprate")(
+        message, _Command("Central African Republic 0.0005")
+    )
+
+    assert state["calls"] == [("set", "Central African Republic", "0.0005")]
+    assert "rate 0.0005" in message.answers[-1]["text"]
+
+
+async def test_otprate_with_only_a_country_explains_itself(runner, monkeypatch):
+    state = _stub_rate_core(monkeypatch, rate_open=False)
+    message = _PlainMessage(await _owner_id(runner))
+
+    await _command_handler(runner, "_otprate")(message, _Command("Bangladesh"))
+
+    assert state["calls"] == []
+    assert "/otprate" in message.answers[-1]["text"]
+
+
+async def test_otprate_is_in_the_help(runner):
+    from app.telegram.bot import HELP_TEXT
+
+    assert "/otprate" in HELP_TEXT
 

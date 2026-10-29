@@ -414,6 +414,64 @@ def test_otpbot_requires_auth(client):
     assert client.post("/api/otpbot/start").status_code == 401
     assert client.post("/api/otpbot/stop").status_code == 401
     assert client.post("/api/otpbot/thread").status_code == 401
+    assert client.get("/api/otpbot/rates").status_code == 401
+
+
+def test_otpbot_config_carries_the_rate_settings(client):
+    headers = {"X-API-Token": "test-api-token"}
+
+    saved = client.post(
+        "/api/otpbot/config",
+        json={"default_rate": "0.0005", "ask_rate": False, "ask_start_time": True},
+        headers=headers,
+    )
+    assert saved.status_code == 200
+    cfg = client.get("/api/otpbot/config", headers=headers).json()
+    assert cfg["default_rate"] == "0.0005"
+    assert cfg["ask_rate"] is False
+    assert cfg["ask_start_time"] is True
+
+
+def test_otpbot_config_refuses_a_default_rate_that_is_not_a_rate(client):
+    headers = {"X-API-Token": "test-api-token"}
+    bad = client.post("/api/otpbot/config", json={"default_rate": "cheap"}, headers=headers)
+    assert bad.status_code == 400
+    assert client.get("/api/otpbot/config", headers=headers).json()["default_rate"] != "cheap"
+
+
+def test_otpbot_per_country_rate_is_settable_and_clearable(client):
+    headers = {"X-API-Token": "test-api-token"}
+
+    set_zero = client.post(
+        "/api/otpbot/country/Senegal/settings", json={"rate": "0"}, headers=headers
+    )
+    assert set_zero.status_code == 200
+    assert set_zero.json()["settings"]["rate"] == "0"
+    assert set_zero.json()["effective"]["rate"] == "0"
+
+    bad = client.post(
+        "/api/otpbot/country/Senegal/settings", json={"rate": "lots"}, headers=headers
+    )
+    assert bad.status_code == 400
+
+    # Blank from the form = null = back to the default.
+    cleared = client.post(
+        "/api/otpbot/country/Senegal/settings", json={"rate": ""}, headers=headers
+    )
+    assert cleared.status_code == 200
+    assert not cleared.json()["settings"].get("rate")
+
+
+def test_otpbot_rates_lists_every_country_with_the_default(client):
+    headers = {"X-API-Token": "test-api-token"}
+    client.post("/api/otpbot/config", json={"default_rate": "0.001"}, headers=headers)
+
+    listed = client.get("/api/otpbot/rates", headers=headers)
+    assert listed.status_code == 200
+    body = listed.json()
+    assert body["default_rate"] == "0.001"
+    assert isinstance(body["countries"], list)
+    assert isinstance(body["text"], str) and body["text"]
 
 
 def test_otpbot_queue_lifecycle(client, monkeypatch):

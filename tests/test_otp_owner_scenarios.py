@@ -79,6 +79,15 @@ def _no_sleep_and_reset_userbot(monkeypatch):
     set_userbot(None)
 
 
+@pytest.fixture(autouse=True)
+async def _only_the_global_start_time_applies(environment):
+    """These scenarios are about the GLOBAL 04:00 default and what reaches
+    the bot. The per-upload rate and start-time questions (covered in
+    test_otp_rate_and_start_questions.py) are off, so "whatsapp 20h" still
+    starts by itself the way these scenarios were written."""
+    await otp_bot.save_config({"ask_rate": False, "ask_start_time": False})
+
+
 # --------------------------------------------------------------------------- #
 # Fake @PBDxbot
 # --------------------------------------------------------------------------- #
@@ -858,11 +867,11 @@ async def test_the_v3_migration_moves_everyone_to_one_check(clock):
     cfg = await otp_bot.get_config()
 
     assert cfg["interval_minutes"] == 1
-    assert cfg["config_version"] == 3
+    assert cfg["config_version"] == otp_bot.CONFIG_VERSION
     assert "cleanup_command" not in cfg
     async with session_scope() as session:
         stored = await repo.get_setting(session, otp_bot.SETTING_KEY)
-    assert stored["config_version"] == 3 and "cleanup_command" not in stored
+    assert stored["config_version"] == otp_bot.CONFIG_VERSION and "cleanup_command" not in stored
     for country in THREE:
         assert "interval_minutes" not in await otp_schedule.get_country_settings(country)
     # The staggered per-country timers are gone; one shared check, due now.

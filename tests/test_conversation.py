@@ -76,9 +76,12 @@ async def test_otp_tag_answer_intercepted_before_router(environment, monkeypatch
     uploads.mkdir(parents=True, exist_ok=True)
     (uploads / "plain_numbers.txt").write_text("+880***1111\n", encoding="utf-8")
     await otp_bot.ensure_thread(CHAT_ID)
-    # Caption states the run length, so the only question left is the tag -
-    # which is what this test is about.
-    await otp_bot.enqueue_file("uploads/plain_numbers.txt", "plain_numbers.txt", "20h")
+    # Caption states the run length, the rate and the start time, so the
+    # only question left is the tag - which is what this test is about.
+    await otp_bot.enqueue_file(
+        "uploads/plain_numbers.txt", "plain_numbers.txt",
+        "20h, rate default, ekhoni shuru",
+    )
     await handle_message(CHAT_ID, USER_ID, "start")  # arms the tag prompt
 
     async def _no_sleep(seconds):
@@ -108,6 +111,90 @@ async def test_otp_tag_answer_intercepted_before_router(environment, monkeypatch
         assert (await otp_bot.get_config())["enabled"] is True
     finally:
         set_userbot(None)
+
+
+def _stub_rate_questions(monkeypatch, *, rate_open: bool, start_open: bool) -> list:
+    """The otp_bot rate/start contract, stubbed so the routing is tested on
+    its own (raising=False: works before the core lands and after)."""
+    from app.automation import otp_bot
+
+    calls: list = []
+
+    async def get_rate():
+        return {"countries": ["Bangladesh"]} if rate_open else None
+
+    async def get_start():
+        return {"countries": ["Bangladesh"]} if start_open else None
+
+    async def rate_answer(text):
+        calls.append(("rate", text))
+        return f"\U0001F4B5 Bangladesh: rate {text}"
+
+    async def start_answer(text):
+        calls.append(("start", text))
+        return f"▶️ Bangladesh starts at {text}"
+
+    monkeypatch.setattr(otp_bot, "get_awaiting_rate", get_rate, raising=False)
+    monkeypatch.setattr(otp_bot, "get_awaiting_start", get_start, raising=False)
+    monkeypatch.setattr(otp_bot, "handle_rate_answer", rate_answer, raising=False)
+    monkeypatch.setattr(otp_bot, "handle_start_answer", start_answer, raising=False)
+    return calls
+
+
+async def test_otp_rate_answer_intercepted_before_router(environment, monkeypatch):
+    """A bare "0.0005" while the rate question is open is that answer - never
+    small talk, never a task, and it works with every LLM down."""
+    from app.automation import otp_bot
+
+    await otp_bot.ensure_thread(CHAT_ID)
+    calls = _stub_rate_questions(monkeypatch, rate_open=True, start_open=False)
+    before = await _task_count()
+
+    reply = await handle_message(CHAT_ID, USER_ID, "0.0005")
+
+    assert calls == [("rate", "0.0005")]
+    assert "0.0005" in reply.text
+    assert reply.intent is Intent.CONTROL
+    assert await _task_count() == before
+
+
+async def test_otp_start_answer_intercepted_before_router(environment, monkeypatch):
+    from app.automation import otp_bot
+
+    await otp_bot.ensure_thread(CHAT_ID)
+    calls = _stub_rate_questions(monkeypatch, rate_open=False, start_open=True)
+
+    reply = await handle_message(CHAT_ID, USER_ID, "21:00")
+
+    assert calls == [("start", "21:00")]
+    assert "21:00" in reply.text
+    assert reply.intent is Intent.CONTROL
+
+
+async def test_the_rate_question_comes_before_the_start_question(environment, monkeypatch):
+    """Both open at once (an odd state, but a stale one is possible): the
+    rate is asked first, so the answer goes to the rate."""
+    from app.automation import otp_bot
+
+    await otp_bot.ensure_thread(CHAT_ID)
+    calls = _stub_rate_questions(monkeypatch, rate_open=True, start_open=True)
+
+    await handle_message(CHAT_ID, USER_ID, "default")
+
+    assert calls == [("rate", "default")]
+
+
+async def test_stop_still_wins_over_the_open_rate_question(environment, monkeypatch):
+    from app.automation import otp_bot
+
+    await otp_bot.ensure_thread(CHAT_ID)
+    calls = _stub_rate_questions(monkeypatch, rate_open=True, start_open=False)
+
+    reply = await handle_message(CHAT_ID, USER_ID, "stop")
+
+    assert calls == []
+    assert reply.intent is Intent.CONTROL
+    assert "stop" in reply.text.lower() or "off" in reply.text.lower()
 
 
 async def test_otp_stop_trigger_intercepted_before_router(environment):

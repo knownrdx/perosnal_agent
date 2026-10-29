@@ -76,6 +76,7 @@ Commands:
 /memory <query> - search long-term memory
 /otpchat - open the dedicated OTP-bot thread (send number files there)
 /otpset  - view/change OTP-bot settings (global or per country)
+/otprate - rates: list them, or /otprate <country> <rate> (0, a number, or default)
 /otpbot  - status of the OTP-number automation (just say "start"/"stop" to run it)
 
 AI model:
@@ -152,11 +153,23 @@ class AgentBot:
         that everything started. Only the question needs a keyboard, and it
         has to carry the id of whichever entry is now pending - re-reading it
         here keeps the buttons and the prompt describing the same file.
+
+        The questions come in a fixed order - service, rate, start time, run
+        length - so whichever one is open now is the one the reply just asked,
+        and that is the keyboard that goes under it.
         """
         from app.automation import otp_bot
 
+        markup = None
         pending = await otp_bot.get_awaiting_tag_entry()
-        markup = otp_panel.service_keyboard(pending["id"]) if pending else None
+        if pending:
+            markup = otp_panel.service_keyboard(pending["id"])
+        elif await otp_bot.get_awaiting_rate():
+            markup = otp_panel.rate_keyboard()
+        elif await otp_bot.get_awaiting_start():
+            markup = otp_panel.start_at_keyboard()
+        elif await otp_bot.get_awaiting_runtime():
+            markup = otp_panel.runtime_keyboard()
         with contextlib.suppress(Exception):
             # The reply can be a whole start report - one line per country
             # plus the bot's own replies - which outgrows a single message.
@@ -1203,6 +1216,65 @@ class AgentBot:
                     )
                 return
 
+            # --- rate and start time for a fresh upload --------------------- #
+            # Answer to "what rate for <country>?". The core applies it to
+            # every country in the batch, remembers it for next time, and
+            # moves on to the next question (or starts) in its reply.
+            if action == "rate":
+                if not await otp_bot.get_awaiting_rate():
+                    await query.answer("That question is already closed.", show_alert=True)
+                    return
+                await query.answer(f"Rate: {otp_panel.rate_label(rest)}")
+                reply = await otp_bot.handle_rate_answer(rest)
+                await self._send_next_prompt(query, reply)
+                return
+
+            if action == "ratec":
+                if not await otp_bot.get_awaiting_rate():
+                    await query.answer("That question is already closed.", show_alert=True)
+                    return
+                # Field "rate" with no country: the next message is the rate
+                # for the upload being asked about (handle_pending_input
+                # routes it to handle_rate_answer), from Telegram or the web.
+                await otp_bot.set_pending_input("rate", None)
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        "\U0001F4B5 What rate should it get?\n"
+                        "\n"
+                        "• Type a number like 0.0005, or 0 for free\n"
+                        "• Type \"default\" to use the usual rate\n"
+                        + _SKIP_HINT
+                    )
+                return
+
+            if action == "startat":
+                if not await otp_bot.get_awaiting_start():
+                    await query.answer("That question is already closed.", show_alert=True)
+                    return
+                await query.answer("Start: " + ("now" if rest == "now" else rest))
+                reply = await otp_bot.handle_start_answer(rest)
+                await self._send_next_prompt(query, reply)
+                return
+
+            if action == "startatc":
+                if not await otp_bot.get_awaiting_start():
+                    await query.answer("That question is already closed.", show_alert=True)
+                    return
+                clock = otp_schedule.clock_now()
+                # No pending-input field: the start question is still open,
+                # so the next message reaches handle_start_answer by itself.
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        "▶️ When should it start?\n"
+                        "\n"
+                        "• Type a time as HH:MM (Dubai time), or \"now\"\n"
+                        f"• Now: {clock['dubai']} Dubai / {clock['utc']} UTC\n"
+                        "• Type \"default\" to use the usual start time"
+                    )
+                return
+
             # Answer to the "how long should this upload run?" question.
             if action == "rt":
                 pending = await otp_bot.get_awaiting_runtime()
@@ -1318,6 +1390,15 @@ class AgentBot:
                 ]
                 if current.get("stop_at"):
                     lines.append(f"\u2022 Stops at {current['stop_at']} (Dubai)")
+                own_rate = str(current.get("rate") or "").strip()
+                if own_rate:
+                    lines.append(f"\u2022 Rate: {otp_panel.rate_label(own_rate)}")
+                elif cfg.get("default_rate"):
+                    lines.append(
+                        f"\u2022 Rate: {otp_panel.rate_label(cfg['default_rate'])} (default)"
+                    )
+                else:
+                    lines.append("\u2022 Rate: bot default")
                 if current.get("paused"):
                     lines.append("\u2022 \u23F8 Paused right now")
                 with contextlib.suppress(Exception):
@@ -1326,6 +1407,64 @@ class AgentBot:
                         reply_markup=otp_panel.country_field_keyboard(
                             otp_panel.country_key(country), country, bool(current.get("paused"))
                         ),
+                    )
+                return
+
+            # --- per-country rate ------------------------------------------ #
+            if action == "pickrate":
+                country = await pick_country(rest)
+                if country is None:
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                cfg = await otp_bot.get_config()
+                current = await otp_schedule.effective_config(country, cfg)
+                own_rate = str(current.get("rate") or "").strip()
+                if own_rate:
+                    now = otp_panel.rate_label(own_rate)
+                elif cfg.get("default_rate"):
+                    now = f"{otp_panel.rate_label(cfg['default_rate'])} (default)"
+                else:
+                    now = "bot default"
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        f"\U0001F4B5 What rate should {country} get?\n"
+                        "\n"
+                        f"• Now: {now}\n"
+                        "• Remembered for this country's next uploads too\n"
+                        "\n"
+                        "Pick a rate below, or Custom to type one.",
+                        reply_markup=otp_panel.country_rate_keyboard(
+                            otp_panel.country_key(country), own_rate
+                        ),
+                    )
+                return
+
+            if action == "crate":
+                index_raw, value_raw = rest.split(":", 1)
+                country = await pick_country(index_raw)
+                if country is None:
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                note = await otp_bot.handle_set_rate(country, value_raw)
+                await query.answer(f"{country}: {otp_panel.rate_label(value_raw)}")
+                await refresh_panel(note)
+                return
+
+            if action == "cratec":
+                country = await pick_country(rest)
+                if country is None:
+                    await query.answer("That country is gone.", show_alert=True)
+                    return
+                await otp_bot.set_pending_input("rate", country)
+                await query.answer()
+                with contextlib.suppress(Exception):
+                    await query.message.answer(
+                        f"\U0001F4B5 What rate should {country} get?\n"
+                        "\n"
+                        "• Type a number like 0.0005, or 0 for free\n"
+                        "• Type \"default\" to use the usual rate\n"
+                        + _SKIP_HINT
                     )
                 return
 
@@ -1507,6 +1646,43 @@ class AgentBot:
                 return
 
             await query.answer()
+
+        @dp.message(Command("otprate"))
+        async def _otprate(message: Message, command: CommandObject) -> None:
+            """Rates from Telegram.
+
+            /otprate                    -> every country's rate
+            /otprate <country> <value>  -> set one (0, a number, or default)
+            """
+            if not await self._guard(message):
+                return
+            from app.automation import otp_bot
+
+            args = (command.args or "").strip()
+            if not args:
+                await self._answer_long(message, await otp_bot.handle_rate_list())
+                return
+
+            parts = args.split()
+            if len(parts) < 2:
+                await message.answer(
+                    "\U0001F4B5 Which country, and what rate?\n"
+                    "\n"
+                    "• /otprate <country> <rate>\n"
+                    "• e.g. /otprate Bangladesh 0.0005\n"
+                    "• 0 = free, default = the usual rate\n"
+                    "\n"
+                    "Send /otprate on its own to see every rate."
+                )
+                return
+            # The value is the last word; the country is everything before
+            # it, which can be several words ("Central African Republic 0").
+            country = " ".join(parts[:-1])
+            try:
+                reply = await otp_bot.handle_set_rate(country, parts[-1])
+            except ValueError as exc:
+                reply = f"❌ {exc}"
+            await self._answer_long(message, reply)
 
         @dp.message(Command("otpset"))
         async def _otpset(message: Message, command: CommandObject) -> None:
@@ -1917,11 +2093,33 @@ class AgentBot:
                 lines += ["", otp_bot.tag_question(pending)]
                 markup = otp_panel.service_keyboard(pending["id"])
         else:
-            # Tags are all known; the one thing left to settle is how long
-            # this should run. Asked with the default stated, so a run can
-            # never become immortal just by not answering.
-            needing = await otp_bot.countries_needing_runtime(queue)
-            if needing:
+            # Tags are all known. What is left comes in a fixed order: the
+            # RATE (remembered per country, so it is asked once), the START
+            # time, then how long this should run. Each is asked with its
+            # default stated, so a run can never become immortal, free or
+            # mistimed just by not answering.
+            needing_rate = await otp_bot.countries_needing_rate(queue)
+            needing_start = [] if needing_rate else await otp_bot.countries_needing_start(queue)
+            needing = (
+                []
+                if needing_rate or needing_start
+                else await otp_bot.countries_needing_runtime(queue)
+            )
+            if needing_rate:
+                await otp_bot.set_awaiting_rate(needing_rate)
+                lines += [
+                    "",
+                    otp_bot.rate_question(needing_rate, str(cfg.get("default_rate") or "")),
+                ]
+                markup = otp_panel.rate_keyboard()
+            elif needing_start:
+                await otp_bot.set_awaiting_start(needing_start)
+                lines += [
+                    "",
+                    otp_bot.start_question(needing_start, str(cfg.get("start_at") or "")),
+                ]
+                markup = otp_panel.start_at_keyboard()
+            elif needing:
                 await otp_bot.set_awaiting_runtime(needing)
                 lines += [
                     "",
