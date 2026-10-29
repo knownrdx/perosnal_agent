@@ -10,7 +10,6 @@ What a country can still have of its own (all optional - anything not set
 falls back to the global config, so a country the owner never touches keeps
 behaving exactly as before):
   - threshold, limit, count, service and wipe-before-add mode,
-  - its rate per OTP (remembered, so it is asked once per country),
   - its lifecycle: pause, start/stop time, run length, re-add limit.
 
 Presets are the same settings under a name. The target bot has genuinely
@@ -55,31 +54,7 @@ OVERRIDABLE = (
     # country sits in the active set doing nothing - the owner uploads during
     # the day for a run that should only touch the target bot at night.
     "start_at",
-    # Revenue per OTP the target bot should pay for this country's numbers,
-    # sent as "-r <rate>" on the add command. A string so the owner's exact
-    # figure is reproduced ("0.0005", never "5e-05"). "" means "the bot's own
-    # default rate" - the flag is omitted. A country with NO rate entry at
-    # all has never been asked, which is what triggers the rate question.
-    "rate",
 )
-
-
-def effective_rate(cfg: dict[str, Any]) -> str:
-    """The rate to send for a country, from its EFFECTIVE config.
-
-    A country's own "rate" (even an explicit "" = bot default) wins; a country
-    that never chose one falls back to the global default_rate. Returns ""
-    when no "-r" flag should be sent at all.
-    """
-    if "rate" in cfg:
-        return str(cfg.get("rate") or "").strip()
-    return str(cfg.get("default_rate") or "").strip()
-
-
-def rate_label(rate: str) -> str:
-    """How a rate reads in owner-facing text: "0.0005" or "bot default"."""
-    rate = str(rate or "").strip()
-    return rate if rate else "bot default"
 
 # Dubai is UTC+4 all year - no daylight saving - so a fixed offset is exact
 # and needs no tzdata in the container. Times the owner types are read in
@@ -325,6 +300,8 @@ async def set_country_settings(country: str, values: dict[str, Any]) -> dict[str
     current["display_name"] = country.strip()
     # Left over from per-country intervals; the interval is global now.
     current.pop("interval_minutes", None)
+    # Left over from config v4; the rate per OTP is the target bot's own now.
+    current.pop("rate", None)
 
     for field in OVERRIDABLE:
         if field not in values:
@@ -864,10 +841,6 @@ async def schedule_overview(
             "paused": bool(cfg.get("paused")),
             "stop_at": cfg.get("stop_at") or "",
             "start_at": cfg.get("start_at") or "",
-            # Effective: the country's own rate, else the global default.
-            # "" means the bot's own default rate (no -r flag is sent).
-            "rate": effective_rate(cfg),
-            "rate_remembered": "rate" in overrides,
             # Null once running, so a UI can show "waiting until X" without
             # having to recompute the wall-clock arithmetic itself.
             "starts_at": begins.isoformat() if begins else None,

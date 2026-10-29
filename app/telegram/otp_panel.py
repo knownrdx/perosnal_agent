@@ -34,6 +34,11 @@ MESSAGE_LIMIT = 4000
 # still sit in chat history; tapping one answers with this instead of failing.
 INTERVAL_IS_GLOBAL = "The check interval is now the same for all countries"
 
+# The agent once kept a rate per country (buttons "rate", "ratec",
+# "pickrate", "crate", "cratec"). Rates are set in the number bot itself now;
+# an old button in chat history is answered with this rather than erroring.
+RATES_IN_NUMBER_BOT = "Rates are managed in the number bot now"
+
 
 def country_key(country: str) -> str:
     """A short, stable id for one country, for use in callback_data.
@@ -354,10 +359,6 @@ def country_field_keyboard(country_index: int | str, country: str, paused: bool 
                 text="\u23F3 Run time",
                 callback_data=f"{PREFIX}:pickrt:{country_index}",
             ),
-            InlineKeyboardButton(
-                text="\U0001F4B5 Rate",
-                callback_data=f"{PREFIX}:pickrate:{country_index}",
-            ),
         ],
         [
             InlineKeyboardButton(
@@ -472,29 +473,7 @@ def runtime_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# --- rate and start time, asked once per upload ---------------------------- #
-# "0.0005" is six characters; "def" stands in for the default rate.
-_RATE_WIDTH = 7
-
-
-def rate_label(value: Any) -> str:
-    """A rate as the owner reads it: '' / None / 'default' -> 'default'."""
-    text = str(value or "").strip()
-    if not text or text.casefold() == "default":
-        return "default"
-    if text == "0":
-        return "0 (free)"
-    return text
-
-
-def rate_cell(value: Any) -> str:
-    """The same, squeezed into one status-table column ('def' for default)."""
-    text = str(value or "").strip()
-    if not text or text.casefold() == "default":
-        return "def"
-    return text[:_RATE_WIDTH]
-
-
+# --- start time, asked once per upload ------------------------------------- #
 def _start_label(choice: str, current: str = "") -> str:
     tick = "\u2705 " if current and choice == current else ""
     if choice == "now":
@@ -502,22 +481,6 @@ def _start_label(choice: str, current: str = "") -> str:
     if choice == "default":
         return tick + "Default"
     return tick + choice
-
-
-def rate_keyboard(current: str = "") -> InlineKeyboardMarkup:
-    """What rate a fresh upload should get: the usual values, or type one."""
-    buttons = [
-        InlineKeyboardButton(
-            text=("\u2705 " if current and choice == current else "") + rate_label(choice),
-            callback_data=f"{PREFIX}:rate:{choice}",
-        )
-        for choice in otp_bot.RATE_CHOICES
-    ]
-    rows = _rows(buttons, per_row=3)
-    rows.append([
-        InlineKeyboardButton(text="\u270F\uFE0F Custom", callback_data=f"{PREFIX}:ratec:"),
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def start_at_keyboard(current: str = "") -> InlineKeyboardMarkup:
@@ -532,24 +495,6 @@ def start_at_keyboard(current: str = "") -> InlineKeyboardMarkup:
     rows = _rows(buttons, per_row=3)
     rows.append([
         InlineKeyboardButton(text="\u270F\uFE0F Custom", callback_data=f"{PREFIX}:startatc:"),
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def country_rate_keyboard(country_index: int | str, current: str = "") -> InlineKeyboardMarkup:
-    """The same rate choices, for one country from its settings panel."""
-    buttons = [
-        InlineKeyboardButton(
-            text=("\u2705 " if current and choice == current else "") + rate_label(choice),
-            callback_data=f"{PREFIX}:crate:{country_index}:{choice}",
-        )
-        for choice in otp_bot.RATE_CHOICES
-    ]
-    rows = _rows(buttons, per_row=3)
-    rows.append([
-        InlineKeyboardButton(
-            text="\u270F\uFE0F Custom", callback_data=f"{PREFIX}:cratec:{country_index}"
-        ),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -724,8 +669,7 @@ async def _country_rows(
         have = otp_bot._stock_for(stock, country) if stock else None
         rows.append((
             state, _short_country(country, bool(row.get("customised"))),
-            _number(entry.get("count") or 0), _number(have),
-            rate_cell(row.get("rate")), ends,
+            _number(entry.get("count") or 0), _number(have), ends,
         ))
     # The global timer gives every running country the same due time; min()
     # only matters while an older per-country timer is still winding down.
@@ -733,10 +677,9 @@ async def _country_rows(
 
 
 def _table_line(cells: tuple[str, ...], state_width: int = _STATE_WIDTH) -> str:
-    state, country, size, have, rate, ends = cells
+    state, country, size, have, ends = cells
     return (
-        f"{state:<{state_width}} {country:<{_COUNTRY_WIDTH}} {size:>7} {have:>7} "
-        f"{rate:>{_RATE_WIDTH}} {ends}"
+        f"{state:<{state_width}} {country:<{_COUNTRY_WIDTH}} {size:>7} {have:>7} {ends}"
     ).rstrip()
 
 
@@ -804,7 +747,7 @@ async def status_text() -> str:
     if last and last.get("error"):
         head.append(f"<b>Error:</b> {esc(str(last['error'])[:200])}")
 
-    header = ("St", "Country", "File", "Stock", "Rate", "Ends")
+    header = ("St", "Country", "File", "Stock", "Ends")
     state_width = max([_STATE_WIDTH] + [len(r[0]) for r in rows])
     legend = [f"{code} {meaning}" for code, meaning in STATE_LEGEND.items()
               if any(r[0].split()[0] == code for r in rows)]

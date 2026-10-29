@@ -117,47 +117,6 @@ _NOW_PHRASES = (
     "ekhuni", "sathe sathe", "shonge shonge",
 )
 
-# The rate per OTP, the way the owner writes it: "rate 0.0005", "rate: 0",
-# "-r 0.0005" (the bot's own flag), "r 0", "rate default". A bare "r" only
-# counts when it stands alone before the value, so "for 0" or "rat 9" are
-# never read as a rate. Words meaning "the bot's own default rate" map to "".
-_RATE_RE = re.compile(
-    r"(?<![A-Za-z0-9])(?:rate|-r|r)\s*[:=]?\s*"
-    r"(default|bot default|std|standard|\d*[.,]?\d+)(?![A-Za-z0-9.])",
-    re.IGNORECASE,
-)
-_RATE_DEFAULT_WORDS = frozenset({"default", "bot default", "std", "standard"})
-
-
-def normalise_rate(value: str) -> str:
-    """Canonical rate string: "0.0005", "0", or "" for "bot default".
-
-    Raises ValueError for anything that is not a non-negative number. Kept as
-    text rather than a float so the owner's "0.0005" is sent back exactly,
-    never as "5e-05", which the target bot would not read.
-    """
-    from decimal import Decimal, InvalidOperation
-
-    raw = " ".join(str(value or "").strip().casefold().split())
-    if raw in _RATE_DEFAULT_WORDS or raw in {"", "none", "skip", "bot"}:
-        return ""
-    if "." not in raw and raw.count(",") == 1:
-        raw = raw.replace(",", ".")            # "0,0005" typed on a Bengali keypad
-    try:
-        number = Decimal(raw)
-    except InvalidOperation:
-        raise ValueError(
-            "Please give the rate as a number, e.g. 0.0005 or 0 — "
-            "or say 'default' for the bot's own rate."
-        ) from None
-    if not number.is_finite() or number < 0:
-        raise ValueError("The rate can't be negative. Use 0 for a zero rate.")
-    if number > 1_000_000:
-        raise ValueError("That rate looks too large — check the number.")
-    text = format(number.normalize(), "f")
-    return text if text else "0"
-
-
 def _nearest(text: str, words: tuple[str, ...], start: int, end: int) -> float | None:
     """Distance from the match to the closest of ``words``, or None.
 
@@ -316,7 +275,6 @@ def parse_caption(text: str) -> dict[str, Any]:
         stop_at     str  - "HH:MM" Dubai, when it should end
         run_minutes int  - run this long from the start ("20h")
         no_stop     bool - explicitly asked for no stop time at all
-        rate        str  - rate per OTP ("0.0005", "0"); "" = bot default
     """
     from app.automation import phone_countries
 
@@ -331,20 +289,6 @@ def parse_caption(text: str) -> dict[str, Any]:
     from app.agent import language
 
     text = language.normalise(text).strip()
-
-    # The rate is read FIRST and then blanked out of the text: "rate 0.05"
-    # would otherwise be picked up below as a 00:05 stop time, and "-r 0"
-    # as a bare number. Invalid values are ignored rather than fatal - a
-    # caption is never the place to raise at the owner.
-    rate_match = _RATE_RE.search(text)
-    if rate_match:
-        try:
-            out["rate"] = normalise_rate(rate_match.group(1))
-        except ValueError:
-            pass
-        else:
-            start, end = rate_match.span()
-            text = text[:start] + " " * (end - start) + text[end:]
     lowered = " ".join(text.casefold().split())
 
     service = _find_service(text)
@@ -419,8 +363,6 @@ def describe(parsed: dict[str, Any]) -> str:
             parts.append(f"runs {minutes} min")
     if parsed.get("no_stop"):
         parts.append("no stop time")
-    if "rate" in parsed:
-        parts.append(f"rate {parsed['rate'] or 'bot default'}")
     if not parts:
         return ""
     return "\U0001F4DD From your caption: " + ", ".join(parts)

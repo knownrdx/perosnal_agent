@@ -82,10 +82,10 @@ def _no_sleep_and_reset_userbot(monkeypatch):
 @pytest.fixture(autouse=True)
 async def _only_the_global_start_time_applies(environment):
     """These scenarios are about the GLOBAL 04:00 default and what reaches
-    the bot. The per-upload rate and start-time questions (covered in
-    test_otp_rate_and_start_questions.py) are off, so "whatsapp 20h" still
+    the bot. The per-upload start-time question (covered in
+    test_otp_start_time_question.py) is off, so "whatsapp 20h" still
     starts by itself the way these scenarios were written."""
-    await otp_bot.save_config({"ask_rate": False, "ask_start_time": False})
+    await otp_bot.save_config({"ask_start_time": False})
 
 
 # --------------------------------------------------------------------------- #

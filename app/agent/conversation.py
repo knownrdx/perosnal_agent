@@ -282,15 +282,10 @@ async def handle_message(
             await _record_reply(chat_id, answer, thread_id=thread_id)
             return Reply(answer, Intent.CONTROL)
 
-        # After the service comes the RATE ("0", a number, or default), then
-        # the START time (now / HH:MM / default), then the run length - each
-        # answered by the next message, in the order the questions are asked,
-        # so a bare "0.0005" or "21:00" lands on the question that is open.
-        if await otp_bot.get_awaiting_rate():
-            answer = await otp_bot.handle_rate_answer(text)
-            await _record_reply(chat_id, answer, thread_id=thread_id)
-            return Reply(answer, Intent.CONTROL)
-
+        # After the service comes the START time (now / HH:MM / default),
+        # then the run length - each answered by the next message, in the
+        # order the questions are asked, so a bare "21:00" lands on the
+        # question that is open.
         if await otp_bot.get_awaiting_start():
             answer = await otp_bot.handle_start_answer(text)
             await _record_reply(chat_id, answer, thread_id=thread_id)

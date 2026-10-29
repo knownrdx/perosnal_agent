@@ -82,36 +82,29 @@ def test_a_spreadsheet_outside_the_otp_thread_is_still_just_saved(client):
 
 def test_an_upload_reports_which_question_is_open(client, monkeypatch):
     """The web upload asks the same questions in the same order as Telegram:
-    rate, then start time, then run length - and only the first open one.
+    start time, then run length - and only the first open one. There is no
+    rate question: rates are set in the number bot itself.
     """
     from app.automation import otp_bot
 
-    state: dict = {"rate": None, "start": None}
+    state: dict = {"start": None}
 
     async def _no_auto_start():
         return None
 
-    async def needing_rate(entries):
-        return ["Bangladesh"]
-
     async def needing_start(entries):
         return ["Bangladesh"]
 
-    async def set_rate(countries):
-        state["rate"] = list(countries)
+    async def needing_runtime(entries):
+        return ["Bangladesh"]
 
     async def set_start(countries):
         state["start"] = list(countries)
 
     monkeypatch.setattr(otp_bot, "maybe_auto_start", _no_auto_start)
-    monkeypatch.setattr(otp_bot, "countries_needing_rate", needing_rate, raising=False)
     monkeypatch.setattr(otp_bot, "countries_needing_start", needing_start, raising=False)
-    monkeypatch.setattr(otp_bot, "set_awaiting_rate", set_rate, raising=False)
+    monkeypatch.setattr(otp_bot, "countries_needing_runtime", needing_runtime)
     monkeypatch.setattr(otp_bot, "set_awaiting_start", set_start, raising=False)
-    monkeypatch.setattr(
-        otp_bot, "rate_question",
-        lambda countries, default: f"What rate for {', '.join(countries)}?", raising=False,
-    )
     monkeypatch.setattr(
         otp_bot, "start_question",
         lambda countries, default: f"When should {', '.join(countries)} start?", raising=False,
@@ -126,8 +119,9 @@ def test_an_upload_reports_which_question_is_open(client, monkeypatch):
     )
     assert up.status_code == 200
     body = up.json()
-    assert body["needs_rate"]["countries"] == ["Bangladesh"]
-    assert "What rate" in body["needs_rate"]["question"]
-    assert body["needs_start"] is None
+    assert "needs_rate" not in body
+    assert body["needs_start"]["countries"] == ["Bangladesh"]
+    assert "When should" in body["needs_start"]["question"]
+    # Only the first open question is asked; the run length waits its turn.
     assert body["needs_run_time"] is None
-    assert state == {"rate": ["Bangladesh"], "start": None}
+    assert state == {"start": ["Bangladesh"]}

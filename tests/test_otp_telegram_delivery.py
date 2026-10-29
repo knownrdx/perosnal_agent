@@ -265,9 +265,7 @@ async def test_every_country_keyboard_fits_the_64_byte_limit_with_long_names():
         otp_panel.stop_time_keyboard(-1, ""),
         otp_panel.start_time_keyboard(-1, ""),
         otp_panel.country_runtime_keyboard(-1, 0),
-        otp_panel.rate_keyboard(),
         otp_panel.start_at_keyboard(),
-        otp_panel.country_rate_keyboard(key, "0.0005"),
     ]
     for markup in markups:
         for row in markup.inline_keyboard:
@@ -602,28 +600,19 @@ async def test_bad_dao_with_nothing_open_is_answered_without_the_llm(environment
 
 
 # --------------------------------------------------------------------------- #
-# After the service: the rate, then the start time, then the run length
+# After the service: the start time, then the run length
 # --------------------------------------------------------------------------- #
-def _stub_rate_flow(monkeypatch, *, need_rate: list[str], need_start: list[str]) -> dict:
-    """Stand in for the otp_bot core's rate/start contract.
+def _stub_start_flow(monkeypatch, *, need_start: list[str]) -> dict:
+    """Stand in for the otp_bot core's start-time contract.
 
-    The questions are stateful: "needing" lists feed set_awaiting_*, and
-    get_awaiting_* reports what was set. raising=False so this works before
-    the core lands and keeps testing the glue after it does.
+    The question is stateful: the "needing" list feeds set_awaiting_start,
+    and get_awaiting_start reports what was set. raising=False so this
+    tests the glue on its own.
     """
-    state: dict[str, Any] = {"rate": None, "start": None, "calls": []}
-
-    async def needing_rate(entries):
-        return list(need_rate)
+    state: dict[str, Any] = {"start": None, "calls": []}
 
     async def needing_start(entries):
         return list(need_start)
-
-    async def set_rate(countries):
-        state["rate"] = {"countries": list(countries)} if countries else None
-
-    async def get_rate():
-        return state["rate"]
 
     async def set_start(countries):
         state["start"] = {"countries": list(countries)} if countries else None
@@ -631,62 +620,37 @@ def _stub_rate_flow(monkeypatch, *, need_rate: list[str], need_start: list[str])
     async def get_start():
         return state["start"]
 
-    def rate_question(countries, default_rate):
-        return f"\U0001F4B5 What rate for {', '.join(countries)}? (default: {default_rate or 'default'})"
-
     def start_question(countries, default_start):
         return f"▶️ When should {', '.join(countries)} start? (default: {default_start or 'now'})"
 
     for name, value in {
-        "countries_needing_rate": needing_rate,
         "countries_needing_start": needing_start,
-        "set_awaiting_rate": set_rate,
-        "get_awaiting_rate": get_rate,
         "set_awaiting_start": set_start,
         "get_awaiting_start": get_start,
-        "rate_question": rate_question,
         "start_question": start_question,
-        "RATE_CHOICES": ("0", "0.0001", "0.0005", "0.001", "default"),
         "START_CHOICES": ("now", "21:00", "00:00", "04:00", "default"),
     }.items():
         monkeypatch.setattr(otp_bot, name, value, raising=False)
     return state
 
 
-async def test_an_upload_with_its_service_known_asks_the_rate_first(runner, monkeypatch):
+async def test_an_upload_with_its_service_known_asks_the_start_time(runner, monkeypatch):
+    """No rate question in between: the service is known, so the next thing
+    asked is when it should start (rates live in the number bot)."""
     await otp_bot.ensure_thread(_owner(runner))
 
     async def _no_auto_start() -> None:
         return None
 
     monkeypatch.setattr(otp_bot, "maybe_auto_start", _no_auto_start)
-    state = _stub_rate_flow(monkeypatch, need_rate=["Bangladesh"], need_start=["Bangladesh"])
-    numbers = "\n".join(f"+8801711{i:06d}" for i in range(3)).encode()
-    message = await _upload(runner, "bd.txt", numbers, "whatsapp 20h")
-
-    last = message.answers[-1]
-    assert "What rate" in last["text"]
-    assert state["rate"] == {"countries": ["Bangladesh"]}
-    # The rate question comes before the start one.
-    assert state["start"] is None
-    data = [b.callback_data for row in last["markup"].inline_keyboard for b in row]
-    assert "otp:rate:0" in data and "otp:rate:default" in data and "otp:ratec:" in data
-
-
-async def test_an_upload_with_the_rate_remembered_asks_the_start_time(runner, monkeypatch):
-    await otp_bot.ensure_thread(_owner(runner))
-
-    async def _no_auto_start() -> None:
-        return None
-
-    monkeypatch.setattr(otp_bot, "maybe_auto_start", _no_auto_start)
-    state = _stub_rate_flow(monkeypatch, need_rate=[], need_start=["Bangladesh"])
+    state = _stub_start_flow(monkeypatch, need_start=["Bangladesh"])
     numbers = "\n".join(f"+8801711{i:06d}" for i in range(3)).encode()
     message = await _upload(runner, "bd.txt", numbers, "whatsapp 20h")
 
     last = message.answers[-1]
     assert "When should" in last["text"]
-    assert state["rate"] is None
+    assert "rate" not in last["text"].lower()
     assert state["start"] == {"countries": ["Bangladesh"]}
     data = [b.callback_data for row in last["markup"].inline_keyboard for b in row]
     assert "otp:startat:now" in data and "otp:startat:04:00" in data and "otp:startatc:" in data
+    assert not any(":rate" in d for d in data)

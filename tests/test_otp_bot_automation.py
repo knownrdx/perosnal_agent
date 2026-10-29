@@ -1137,12 +1137,12 @@ async def test_an_upload_starts_by_itself_when_the_tag_is_known(environment):
     question that would otherwise still be open.
     """
     set_userbot(FakeUserbot([{"text": "\u2705 2 added", "out": False}] * 4))
-    # Rate and start time stated in the caption too: every question has
-    # its answer, so nothing is left to ask (the chain itself is covered in
-    # test_otp_rate_and_start_questions.py).
+    # Start time stated in the caption too: every question has its answer,
+    # so nothing is left to ask (the chain itself is covered in
+    # test_otp_start_time_question.py).
     await otp_bot.save_config({"default_tag": "WA"})
     rel = await _write_numbers_file("bd.txt", "+880")
-    await otp_bot.enqueue_file(rel, "bd.txt", "20h, rate default, ekhoni shuru")
+    await otp_bot.enqueue_file(rel, "bd.txt", "20h, ekhoni shuru")
 
     started = await otp_bot.maybe_auto_start()
 
@@ -1874,9 +1874,9 @@ async def test_stop_trigger_word_detection():
 async def test_handle_start_trigger_asks_one_tag_at_a_time(environment):
     rel1 = await _write_numbers_file("plain1.txt")
     rel2 = await _write_numbers_file("plain2.txt")
-    # Timing stated up front, rate and start-time questions off, so this
-    # test stays about the TAG questions.
-    await otp_bot.save_config({"ask_rate": False, "ask_start_time": False})
+    # Timing stated up front, start-time question off, so this test stays
+    # about the TAG questions.
+    await otp_bot.save_config({"ask_start_time": False})
     await otp_bot.enqueue_file(rel1, "plain1.txt", "20h")
     await otp_bot.enqueue_file(rel2, "plain2.txt", "20h")
 
@@ -1905,10 +1905,10 @@ async def test_the_run_length_is_asked_once_and_then_it_starts(environment):
     """
     rel = await _write_numbers_file("numbers_BD.txt")
     await otp_bot.enqueue_file(rel, "numbers_BD.txt")
-    # Rate and start time are asked BEFORE the run length (see
-    # test_otp_rate_and_start_questions.py); off here, so the run-length
+    # The start time is asked BEFORE the run length (see
+    # test_otp_start_time_question.py); off here, so the run-length
     # question is the one that comes up.
-    await otp_bot.save_config({"ask_rate": False, "ask_start_time": False})
+    await otp_bot.save_config({"ask_start_time": False})
 
     asked = await otp_bot.handle_start_trigger()
     assert "How long should" in asked
@@ -1929,7 +1929,7 @@ async def test_no_limit_stays_expressible(environment):
     """Some runs genuinely should go until stopped by hand."""
     rel = await _write_numbers_file("numbers_BD.txt")
     await otp_bot.enqueue_file(rel, "numbers_BD.txt")
-    await otp_bot.save_config({"ask_rate": False, "ask_start_time": False})
+    await otp_bot.save_config({"ask_start_time": False})
     await otp_bot.handle_start_trigger()
 
     set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
@@ -1944,7 +1944,7 @@ async def test_skipping_the_run_length_question_takes_the_default(environment):
     """An unanswered question must not silently become the riskier option."""
     rel = await _write_numbers_file("numbers_BD.txt")
     await otp_bot.enqueue_file(rel, "numbers_BD.txt")
-    await otp_bot.save_config({"ask_rate": False, "ask_start_time": False})
+    await otp_bot.save_config({"ask_start_time": False})
     await otp_bot.handle_start_trigger()
 
     set_userbot(FakeUserbot([{"text": "Added.", "out": False}]))
